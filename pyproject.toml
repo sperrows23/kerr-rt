@@ -1,0 +1,21 @@
+[project]
+name = "kerr-black-hole-renderer"
+version = "0.1.0"
+description = "Offline renderer for a Kerr black hole (Taichi geodesic tracer + Blender pipeline)"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "pyyaml>=6.0",
+    "pytest>=8.0",
+    "pytest-regressions>=2.5",
+    "pandas>=2.0",
+]
+
+# This repo is a src-layout workspace, not a distributable wheel. Tell uv not to
+# try to build/install it as a package; tests pick up `renderer` via pythonpath.
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

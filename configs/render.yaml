@@ -1,0 +1,29 @@
+black_hole:
+  spin: 0.999
+  r_isco: 1.182
+  r_plus: 0.0447   # = 1 - sqrt(1 - a^2)
+
+render:
+  width: 3840
+  height: 2160
+  thumb_width: 256
+  thumb_height: 256
+  max_steps_pipe_a: 250
+  max_steps_pipe_b: 200
+  r_max: 50.0
+  device_memory_gb: 6.0
+
+disk:
+  r_inner: 1.182
+  r_outer: 25.0
+  theta_half_width: 0.15   # |θ - π/2| < this for bounding box
+
+camera:
+  default_radius: 6.03
+  default_fov_deg: 90.0
+
+output:
+  blackhole_dir: render_blackhole/
+  spaceship_dir: render_spaceship/
+  blackhole_prefix: bh_
+  spaceship_prefix: ship_
