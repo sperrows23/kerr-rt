@@ -42,7 +42,11 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from renderer.geodesic import integrate_null_geodesic  # noqa: E402
+from renderer.geodesic import (  # noqa: E402
+    carter_Q,
+    integrate_null_geodesic,
+    radial_turning_point,
+)
 from renderer.metric import metric_bl  # noqa: E402
 from renderer.disk import (  # noqa: E402
     blackbody_rgb,
@@ -162,16 +166,26 @@ def trace_pixel(r_cam, theta_cam, phi_cam, a, n, n_steps, d_lambda,
     r_finite = r_series[finite]
     if r_finite.size == 0:
         return "captured", r_plus, disk_color, transmittance
-    r_min = float(np.min(r_finite))
+
+    # Closest-approach radius for the photon-ring glow: use the ANALYTIC radial
+    # turning point (root of Formula-6 R(r)), not the min over discrete samples.
+    # The sampled min aliases near perihelion and beads the glow along the polar
+    # axis; the analytic root is smooth in the ray parameters. Only computed for
+    # non-captured rays (captured pixels render black, so r_min is unused).
+    E = -p_cov[T]
+    L_z = p_cov[PH]
+    Q = carter_Q(theta_cam, p_cov[TH], E, L_z, a)
 
     if np.any(r_finite >= r_max):
+        r_min = radial_turning_point(E, L_z, Q, a, r_cam, r_plus)
         return "escaped", r_min, disk_color, transmittance
 
     r_last = float(r_finite[-1])
     # The integrator stops when Delta < its horizon threshold; a small final r
     # means the photon plunged through the horizon.
     if r_last < 2.0:
-        return "captured", r_min, disk_color, transmittance
+        return "captured", r_plus, disk_color, transmittance
+    r_min = radial_turning_point(E, L_z, Q, a, r_cam, r_plus)
     return "undecided", r_min, disk_color, transmittance
 
 
@@ -194,6 +208,10 @@ def ring_glow(r_min, peak, sigma, gain, color):
 # Pipe B — volumetric accretion disk
 # --------------------------------------------------------------------------- #
 def march_disk(x, p_cov, dp):
+    # KNOWN ARTIFACT: near-polar-axis seam caused by discrete λ-step
+    # aliasing at the θ=π/2 disk-plane crossing. Fix for Taichi renderer:
+    # detect θ=π/2 crossing analytically (bisect between steps where
+    # sign(θ-π/2) flips) and sample exactly at the crossing point.
     """Accumulate disk emission along an already-traced geodesic.
 
     Implements Formulas 5/3 (gas velocity), 8 (g-factor) and 9 (emission) of

@@ -58,10 +58,40 @@ def _radial_potential_deriv(r: float, E: float, L_z: float, Q: float, a: float) 
     return 4.0 * E * r * P - (2.0 * r - 2.0) * B
 
 
+def radial_turning_point(E, L_z, Q, a, r_start, r_floor, n_scan=160):
+    """Outermost radial turning point (perihelion) of a null geodesic.
+
+    The photon's closest approach is where the radial potential R(r) (Formula 6)
+    vanishes. Scanning inward from ``r_start`` (where R > 0), the first sign
+    change of R(r) is the perihelion; it is refined by bisection. Returns
+    ``r_floor`` if R stays positive all the way down — a plunging ray with no
+    turning point.
+
+    This gives the renderer a smooth, sampling-free closest-approach radius. The
+    discretely sampled trajectory minimum aliases near perihelion and beads the
+    photon-ring glow (the polar-axis seam); the analytic root does not.
+    """
+    rs = np.linspace(r_start, r_floor, n_scan)
+    R_prev = _radial_potential(rs[0], E, L_z, Q, a)
+    for k in range(1, n_scan):
+        R_cur = _radial_potential(rs[k], E, L_z, Q, a)
+        if R_prev * R_cur <= 0.0:
+            lo, hi = rs[k], rs[k - 1]          # R(hi) > 0, R(lo) <= 0
+            for _ in range(48):
+                mid = 0.5 * (lo + hi)
+                if _radial_potential(mid, E, L_z, Q, a) > 0.0:
+                    hi = mid
+                else:
+                    lo = mid
+            return 0.5 * (lo + hi)
+        R_prev = R_cur
+    return r_floor
+
+
 def _theta_potential(theta: float, E: float, L_z: float, Q: float, a: float) -> float:
     """Θ(θ), Formula 6 (null form)."""
     cos2 = np.cos(theta) ** 2
-    sin2 = np.sin(theta) ** 2
+    sin2 = np.maximum(np.sin(theta) ** 2, 1e-10)  # polar-axis safety clamp (denominator)
     return Q - cos2 * (-(a * a) * E * E + L_z * L_z / sin2)
 
 
@@ -71,9 +101,10 @@ def _theta_potential_deriv(theta: float, E: float, L_z: float, a: float) -> floa
     Θ = Q + a²E²cos²θ − L_z²cos²θ/sin²θ, so
     dΘ/dθ = −a²E²·sin(2θ) + 2 L_z² cosθ / sin³θ.
     """
-    s = np.sin(theta)
+    sin2 = np.maximum(np.sin(theta) ** 2, 1e-10)  # polar-axis safety clamp (denominator)
     c = np.cos(theta)
-    return -(a * a) * E * E * np.sin(2.0 * theta) + 2.0 * L_z * L_z * c / (s ** 3)
+    # sin^3 theta = (sin^2 theta)^1.5; clamp the sin^2 factor of the denominator.
+    return -(a * a) * E * E * np.sin(2.0 * theta) + 2.0 * L_z * L_z * c / sin2 ** 1.5
 
 
 def carter_Q(theta: float, p_theta: float, E: float, L_z: float, a: float) -> float:
@@ -82,7 +113,7 @@ def carter_Q(theta: float, p_theta: float, E: float, L_z: float, a: float) -> fl
         Q = p_θ² + cos²θ · (−a²E² + L_z²/sin²θ)
     """
     cos2 = np.cos(theta) ** 2
-    sin2 = np.sin(theta) ** 2
+    sin2 = np.maximum(np.sin(theta) ** 2, 1e-10)  # polar-axis safety clamp (denominator)
     return p_theta ** 2 + cos2 * (-(a * a) * E * E + L_z * L_z / sin2)
 
 
@@ -147,6 +178,7 @@ def integrate_null_geodesic(x0, p0, a, n_steps, d_lambda):
         r, th, _phi, _t, vr, vth = state
         Delta = _delta(r, a)
         sin2 = np.sin(th) ** 2
+        sin2_safe = np.maximum(sin2, 1e-10)  # polar-axis safety clamp (denominator)
         P = E * (r * r + a * a) - a * L_z
 
         dr = vr
@@ -154,7 +186,7 @@ def integrate_null_geodesic(x0, p0, a, n_steps, d_lambda):
         dvr = 0.5 * _radial_potential_deriv(r, E, L_z, Q, a)
         dvth = 0.5 * _theta_potential_deriv(th, E, L_z, a)
         # Formula 6 verbatim:
-        dphi = -(a * E - L_z / sin2) + a * P / Delta
+        dphi = -(a * E - L_z / sin2_safe) + a * P / Delta
         dt = -a * (a * E * sin2 - L_z) + (r * r + a * a) * P / Delta
         return np.array([dr, dth, dphi, dt, dvr, dvth], dtype=float)
 
