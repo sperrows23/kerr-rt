@@ -9,6 +9,7 @@ dependencies = [
     "pytest>=8.0",
     "pytest-regressions>=2.5",
     "pandas>=2.0",
+    "pillow>=10.0",
 ]
 
 # This repo is a src-layout workspace, not a distributable wheel. Tell uv not to

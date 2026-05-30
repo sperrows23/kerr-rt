@@ -12,6 +12,7 @@ render:
   max_steps_pipe_b: 200
   r_max: 50.0
   device_memory_gb: 6.0
+  d_lambda_pipe_a: 0.01   # Mino-time step for Pipe A geodesic integration
 
 disk:
   r_inner: 1.182
@@ -21,6 +22,24 @@ disk:
 camera:
   default_radius: 6.03
   default_fov_deg: 90.0
+
+# Thumbnail preview renderer (scripts/thumb.py) — Pipe A only, no gas disk.
+# Pure visualization parameters: they control look, not physics.
+thumb:
+  # Preview framing: the cinematic camera (camera.default_radius=6.03, fov=90)
+  # sits so close that the capture cone over-fills a 90 deg frame and the photon
+  # ring falls outside it. For verification we pull back and narrow the FOV so
+  # the whole shadow + ring fit with background margin.
+  camera_radius: 15.0             # preview camera Boyer-Lindquist r (M)
+  fov_deg: 60.0                   # preview field of view
+  camera_theta_deg: 85.0          # camera polar angle (inclination); ~edge-on
+  background_top: [0.015, 0.02, 0.05]    # linear RGB at top of frame
+  background_bottom: [0.0, 0.0, 0.0]     # linear RGB at bottom of frame
+  ring_color: [1.0, 0.94, 0.80]   # photon-ring glow tint (linear RGB)
+  ring_gain: 1.4                  # photon-ring glow brightness
+  ring_r_peak: 1.6                # r (M) of peak ring glow ~ photon sphere
+  ring_r_sigma: 0.6               # width (M) of the ring glow falloff
+  gamma: 2.2                      # display gamma for sRGB-ish output
 
 output:
   blackhole_dir: render_blackhole/
