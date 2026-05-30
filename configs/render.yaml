@@ -18,12 +18,16 @@ disk:
   r_inner: 1.182
   r_outer: 25.0
   theta_half_width: 0.15   # |θ - π/2| < this for bounding box
+  T_0: 1.0e4               # inner reference temperature (Decision B: T = T_0·(6/r)^0.75)
+  emission_coeff: 8.0      # volumetric emission scale (visualization)
+  absorption_coeff: 1.5    # volumetric absorption scale (visualization)
+  vertical_sigma_frac: 0.5 # gaussian scale height as fraction of theta_half_width
 
 camera:
   default_radius: 6.03
   default_fov_deg: 90.0
 
-# Thumbnail preview renderer (scripts/thumb.py) — Pipe A only, no gas disk.
+# Thumbnail preview renderer (scripts/thumb.py) display/framing parameters.
 # Pure visualization parameters: they control look, not physics.
 thumb:
   # Preview framing: the cinematic camera (camera.default_radius=6.03, fov=90)
@@ -39,6 +43,7 @@ thumb:
   ring_gain: 1.4                  # photon-ring glow brightness
   ring_r_peak: 1.6                # r (M) of peak ring glow ~ photon sphere
   ring_r_sigma: 0.6               # width (M) of the ring glow falloff
+  exposure: 1.0                   # linear pre-tonemap exposure multiplier
   gamma: 2.2                      # display gamma for sRGB-ish output
 
 output:
