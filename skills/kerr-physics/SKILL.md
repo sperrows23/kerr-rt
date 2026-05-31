@@ -366,11 +366,11 @@ and selects the appropriate mipmap level to blur it away.
 #   Initial direction: shift u by +1/WIDTH (one pixel step)
 #   → record exit direction (θ_exit + δθ, φ_exit + δφ)
 
-# Step 3: Compute Jacobian on celestial sphere
-J = sqrt( (δθ/δu)² + sin²(θ_exit) · (δφ/δu)² )
+# Step 3: Compute Jacobian on celestial sphere (raw per-pixel exit deltas)
+J = sqrt( δθ² + sin²(θ_exit) · δφ² )
 
-# Step 4: Mipmap level (starmap_width = 16384)
-L = clamp(log2(16384.0 * J),  0.0,  log2(16384.0))
+# Step 4: Mipmap level (starmap_width = 16384; /2π maps angle → texels)
+L = clamp(log2(16384.0 * J / (2π)),  0.0,  log2(16384.0))
 
 # Step 5: Sample mipmap pyramid trilinearly at level L
 color = sample_starmap_mip(θ_exit, φ_exit, L)
@@ -448,6 +448,7 @@ configs/render.yaml              ← a, r_isco, WIDTH, HEIGHT, step counts
 | v1.0 | Initial release |
 | v1.1 | **F6:** Corrected Carter constant to null geodesic form (−a²E², not a²(1−E²)). **F7:** Corrected lapse α to exact form using A = (r²+a²)²−a²Δsin²θ. **F9:** Documented that blackbody_rgb returns chromaticity only; clarified g⁴ is not double-counted, but will be if a physical Planck spectrum is substituted. |
 | v1.2 | **F6:** Removed the leftover massive-particle `μ²r²` term from the radial potential `R(r)`; the null (μ=0) form drops it. The previous form gave `g^{μν}p_μp_ν = −r²/Σ`, breaking the null-condition conservation test. |
+| v1.3 | **F10:** Added 2π normalization to the LOD formula — φ spans 2π radians across the 16384-texel starmap width, so dividing by 2π correctly maps the angular footprint to a texel footprint. Also switched to raw per-pixel exit deltas (δθ, δφ) rather than dividing by δu=1/WIDTH. The missing factor caused LOD to saturate at max mip for all background pixels, collapsing the LOD-on render to near-black. |
 
 *Last verified: 2026-05. Do not update formulas without re-verifying against
 primary sources listed in each section.*

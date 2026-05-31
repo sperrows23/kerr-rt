@@ -23,6 +23,11 @@ disk:
   absorption_coeff: 1.5    # volumetric absorption scale (visualization)
   vertical_sigma_frac: 0.5 # gaussian scale height as fraction of theta_half_width
 
+# Background starmap for Pipe A escaped-ray lookup (Formula 10 differential mip LOD).
+starmap:
+  path: star_image/starmap_2020_16k.exr
+  width: 16384             # equirect map width; LOD uses log2(width)
+
 camera:
   default_radius: 6.03
   default_fov_deg: 90.0

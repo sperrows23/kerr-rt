@@ -10,6 +10,14 @@ dependencies = [
     "pytest-regressions>=2.5",
     "pandas>=2.0",
     "pillow>=10.0",
+    # Phase 2 (Taichi GPU tracer). taichi 1.7.4 is the version confirmed working
+    # on the RTX 5060 (sm_120 / Blackwell) via CUDA JIT — see CLAUDE.md.
+    "taichi==1.7.4",
+    # OpenEXR 3.x: multi-part EXR output (beauty + disk parts) and starmap read.
+    "openexr>=3.0",
+    # OpenImageIO: preferred 16K starmap loader. If no Windows wheel resolves for
+    # this Python version, we fall back to reading the starmap via openexr.
+    "openimageio",
 ]
 
 # This repo is a src-layout workspace, not a distributable wheel. Tell uv not to

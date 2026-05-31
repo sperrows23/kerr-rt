@@ -4,3 +4,12 @@ __pycache__/
 .pytest_cache/
 tests/**/test_*/
 
+# Pipeline render outputs and large/downloaded assets (regenerated, never committed)
+render_blackhole/
+render_spaceship/
+star_image/
+*.exr
+camera_matrix.json
+# Preview / diagnostic / GPU-test images
+scripts/*.png
+
