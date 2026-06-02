@@ -389,6 +389,99 @@ while loop, compute J at exit, pass L to the sampler. This simultaneously
 fixes aliasing AND improves texture cache locality (reducing VRAM bandwidth
 pressure).
 
+### Amendment v1.4 — screen-space Jacobian (offset ray eliminated)
+
+**Source:** DNGR §4 ray-bundle, screen-space finite-difference variant. Approved
+2026-06-02 for the 4K performance budget.
+
+The Jacobian `J` may equivalently be estimated **in screen space** by
+finite-differencing the stored exit directions of the pixel's 4-neighborhood,
+instead of integrating a second (offset) ray:
+
+```
+# Kernel 1 (physics) writes per-pixel exit state to a field:
+#   exit[py, px] = (u_exit = cosθ_exit,  φ_exit,  outcome)
+#
+# Kernel 2 (shading) reads neighbors and differences them:
+δθ = θ(py, px+1) − θ(py, px)          # θ = acos(clamp(u,−1,1))
+δφ = wrap_pi( φ(py, px+1) − φ(py, px) )
+J  = sqrt( δθ² + sin²(θ) · δφ² )       # identical to the offset-ray J
+L  = clamp(log2(16384.0 * J / (2π)), 0.0, log2(16384.0))
+```
+
+`J`, `L`, and the 2π texel normalization are **unchanged** from the offset-ray
+method above — only the source of the (δθ, δφ) pair differs.
+
+**Boundary rule (mandatory):** if any neighbor used in the difference did **not**
+ESCAPE (it was CAPTURED, or fell off the screen edge), clamp `L = max_lod`. This
+mirrors the offset-ray method's `out_o != ESCAPED → L = max_lod` branch and
+prevents the escaped/captured discontinuity at the photon ring from producing a
+spurious tiny footprint (over-sharp aliasing at the shadow edge).
+
+This eliminates the per-pixel offset ray (halving the geodesic workload) at the
+cost of one extra (cheap) shading pass over a 2D field.
+
+---
+
+## Formula 11 — FP32-stable factored discriminant (variable transform)
+
+**Source:** algebraic identity of Formula 1's Δ. Added 2026-06-02 for FP32
+horizon stability (guid.md Phase 1.2/1.3). **Not new physics** — a factoring that
+removes catastrophic cancellation in `r²−2r+a²` near the horizon.
+
+```
+k   = sqrt(1 − a²)                 # k_horizon
+r±  = 1 ± k                        # outer/inner horizon radii (r₊ = config r_plus)
+y   = r − r₊                       # horizon-relative radial coordinate
+
+Δ   = (r − r₊)(r − r₋) = y·(y + 2k)    # ≡ r² − 2r + a², zero cancellation
+```
+
+**Verification:** since `r₊ + r₋ = 2` and `r₊·r₋ = a²`,
+`y(y+2k) = (r−r₊)(r−r₋) = r² − (r₊+r₋)r + r₊r₋ = r² − 2r + a²`. ✓
+
+Use `_delta_y(y, k) = y*(y + 2.0*k)` wherever Δ is needed in the y-state
+integrator. Recover `r = y + r₊` for potentials that need `r` explicitly.
+
+---
+
+## Formula 12 — Singularity-free polar potential (u = cosθ substitution of F6 Θ)
+
+**Source:** Mino-time μ = cosθ substitution of the verbatim Formula 6 Θ(θ).
+Standard reduction (cf. DNGR Appendix A; Carter 1968). Added 2026-06-02 for the
+North-pole FP32 blowout fix (guid.md Phase 1.3). **This is a coordinate
+substitution of an existing formula, not a new physical law** — but it is entered
+here per the project rule that any new factored/substituted form gets a number.
+
+```
+u   = cosθ,   sin²θ = 1 − u²
+v_u ≡ du/dλ = −sinθ · (dθ/dλ) = −sqrt(1−u²) · v_θ
+
+# Multiply Formula 6's (dθ/dλ)² = Θ(θ) by sin²θ; the 1/sin²θ pole CANCELS:
+(du/dλ)² = sin²θ · Θ(θ) = (1 − u²)·(Q + a²E²u²) − L_z²·u²   ≡   Θ_u(u)
+
+# Second-order equation of motion (matches the geodesic.py R'/Θ' pattern):
+d²u/dλ² = ½ · dΘ_u/du
+dΘ_u/du = −2u·(Q + a²E²u²) + 2a²E²u·(1 − u²) − 2L_z²·u
+
+# Covariant momentum recovery (for the Formula 8 g-factor in the disk march):
+p_θ = v_θ = −v_u / sqrt(1 − u²)
+```
+
+**State-vector migration (Key Invariant `v_r = Δ·p_r`):** the state becomes
+`[y, u, φ, t, v_y, v_u]`. Because `dy/dλ = dr/dλ`, the invariant is **renamed not
+broken**: `v_y = Δ·p_r` (Δ via Formula 11), so `p_r = v_y/Δ` (NOT `v_y/Δ²` —
+Formula 8 known bug still applies). The θ-side recovery changes to
+`p_θ = −v_u/√(1−u²)` as above.
+
+**⚠ Polar guard (approved 2026-06-02):** Θ_u(u) itself is singularity-free, so the
+`_SIN2_MIN` clamp is dropped from the angular potential. BUT the Formula 6
+`dφ/dλ` and `dt/dλ` equations still contain `L_z/sin²θ = L_z/(1−u²)`, which
+diverges as `u→±1` for rays that pass *near* but do not reach the axis. **Keep a
+numerical clamp `sin²θ = max(1−u², ε)` on the dφ/dλ and dt/dλ denominators only**
+(not on Θ_u) to prevent NaN during RK4 overshoots. Rays that truly cross the axis
+have `L_z→0`, making the term removable there.
+
 ---
 
 ## Conservation test requirements
@@ -449,6 +542,7 @@ configs/render.yaml              ← a, r_isco, WIDTH, HEIGHT, step counts
 | v1.1 | **F6:** Corrected Carter constant to null geodesic form (−a²E², not a²(1−E²)). **F7:** Corrected lapse α to exact form using A = (r²+a²)²−a²Δsin²θ. **F9:** Documented that blackbody_rgb returns chromaticity only; clarified g⁴ is not double-counted, but will be if a physical Planck spectrum is substituted. |
 | v1.2 | **F6:** Removed the leftover massive-particle `μ²r²` term from the radial potential `R(r)`; the null (μ=0) form drops it. The previous form gave `g^{μν}p_μp_ν = −r²/Σ`, breaking the null-condition conservation test. |
 | v1.3 | **F10:** Added 2π normalization to the LOD formula — φ spans 2π radians across the 16384-texel starmap width, so dividing by 2π correctly maps the angular footprint to a texel footprint. Also switched to raw per-pixel exit deltas (δθ, δφ) rather than dividing by δu=1/WIDTH. The missing factor caused LOD to saturate at max mip for all background pixels, collapsing the LOD-on render to near-black. |
+| v1.4 | **F10:** Added the screen-space Jacobian amendment (eliminate the offset ray; difference exit directions of neighbor pixels in a second shading kernel; same J/L; captured-neighbor ⇒ max_lod). **F11 (new):** FP32-stable factored discriminant Δ = y(y+2k). **F12 (new):** singularity-free polar potential Θ_u(u) for the u=cosθ state transform, with the `v_r=Δ·p_r → v_y=Δ·p_r` invariant migration, `p_θ=−v_u/√(1−u²)` recovery, and the approved polar guard on dφ/dt only. All three approved by the project owner 2026-06-02 for the guid.md optimization. |
 
 *Last verified: 2026-05. Do not update formulas without re-verifying against
 primary sources listed in each section.*
