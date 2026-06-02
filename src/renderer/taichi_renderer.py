@@ -442,7 +442,12 @@ def _gas_four_velocity(r, theta, a, r_isco, E_I, L_I):
         # Formula 5 — plunging region (frozen E_I, L_I; u^r must be infalling).
         cos2 = ti.cos(theta) ** 2
         Sigma = r * r + a * a * cos2
-        Delta = _delta(r, a)
+        # Review #5: factored Δ=(r−r₊)(r−r₋) (Formula 11) instead of the
+        # cancellation-prone r²−2r+a², matching the migrated integrator. (Dead
+        # for r_inner==r_isco today, but keeps the inner-disk gas FP32-stable if
+        # disk.r_inner is ever lowered below the ISCO.)
+        kk = ti.sqrt(ti.max(1.0 - a * a, 0.0))
+        Delta = (r - (1.0 + kk)) * (r - (1.0 - kk))
         X = E_I * (r * r + a * a) - a * L_I
         u_r = -(1.0 / Sigma) * ti.sqrt(
             ti.max(0.0, X * X - Delta * (r * r + (L_I - a * E_I) ** 2))
@@ -1103,7 +1108,14 @@ def render_beauty_frame(cfg: dict, cam_frame: dict, width: int, height: int,
     render_beauty_shade(width, height, 1 if lod_enabled else 0)
     ti.sync()
     if return_depth:
-        return frame_pixels.to_numpy(), depth_pixels.to_numpy()
+        # Review #3: a non-finite disk sample (RK4 overshoot at the inner edge)
+        # could leave NaN/±inf in the Z pass, which nothing downstream guards
+        # (export_exr only nan_to_num's beauty). Map any non-finite depth to the
+        # no-hit sentinel so a poisoned pixel reads as "empty", never as a finite
+        # garbage Z the compositor would trust.
+        depth = np.nan_to_num(depth_pixels.to_numpy(), nan=depth_infinity,
+                              posinf=depth_infinity, neginf=depth_infinity)
+        return frame_pixels.to_numpy(), depth
     return frame_pixels.to_numpy()
 
 
@@ -1134,8 +1146,10 @@ def render_beauty_frame_mb(cfg: dict, cam_frame: dict, width: int, height: int,
         return render_beauty_frame(cfg, cam_frame, width, height,
                                    with_disk, lod_enabled, return_depth)
 
+    depth_inf = float(cfg["render"]["depth_infinity"])
     acc = None
-    depth_acc = None
+    depth_sum = None   # Σ of finite (disk-hit) depths only
+    depth_hits = None  # per-pixel count of sub-frames that hit the disk
     for i in range(samples):
         # Symmetric jitter across the shutter window: [−arc/2, +arc/2].
         frac = (i + 0.5) / samples - 0.5
@@ -1150,11 +1164,26 @@ def render_beauty_frame_mb(cfg: dict, cam_frame: dict, width: int, height: int,
         hdr = out[0] if return_depth else out
         acc = hdr.astype(np.float64) if acc is None else acc + hdr
         if return_depth:
-            depth_acc = out[1].astype(np.float64) if depth_acc is None else depth_acc + out[1]
+            # Review #1: NEVER arithmetic-mean the depth_infinity no-hit sentinel
+            # with real depths — averaging 1e5 with a finite Z yields a garbage
+            # "finite" value the compositor trusts. Accumulate only the sub-frames
+            # that actually hit the disk; pixels never hit keep the +∞ sentinel.
+            d = out[1].astype(np.float64)
+            hit = d < depth_inf
+            if depth_sum is None:
+                depth_sum = np.where(hit, d, 0.0)
+                depth_hits = hit.astype(np.float64)
+            else:
+                depth_sum += np.where(hit, d, 0.0)
+                depth_hits += hit
 
     hdr_mean = (acc / samples).astype(np.float32)
     if return_depth:
-        return hdr_mean, (depth_acc / samples).astype(np.float32)
+        # Masked mean over hit sub-frames; sentinel where the disk was never hit.
+        depth_mean = np.where(depth_hits > 0.0,
+                              depth_sum / np.maximum(depth_hits, 1.0),
+                              depth_inf)
+        return hdr_mean, depth_mean.astype(np.float32)
     return hdr_mean
 
 

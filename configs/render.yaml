@@ -1,7 +1,7 @@
 black_hole:
   spin: 0.999
   r_isco: 1.182
-  r_plus: 0.0447   # = 1 - sqrt(1 - a^2)
+  r_plus: 1.0447   # outer horizon r+ = 1 + sqrt(1 - a^2), a=0.999 (true horizon radius)
 
 render:
   width: 3840
