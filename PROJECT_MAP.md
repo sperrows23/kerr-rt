@@ -55,7 +55,14 @@ Black/
 │       ├── geodesic.py          ← Mino-time RK4 null geodesic integrator (Formula 6)
 │       ├── disk.py              ← Accretion disk gas physics (Formulas 3/4/5/8/9)
 │       ├── starmap.py           ← 16K HDRI loader, mip pyramid, UV mapping
-│       └── taichi_renderer.py   ← GPU renderer: Pipe A + Pipe B (1042 lines)
+│       └── taichi_renderer.py   ← GPU renderer: Pipe A + Pipe B, split kernels (1297 lines)
+│
+├── scripts/
+│   └── export_exr.py            ← Phase 5: multi-channel RGBAZ EXR writer (OpenImageIO)
+│
+├── IMPLEMENTATION_PLAN.md       ← 5-phase optimization plan + execution status
+├── AGENTS.md                    ← mirror of CLAUDE.md for the Codex/Agents harness
+├── .codex/config.toml           ← Codex MCP config (Context7)
 │
 ├── tests/
 │   ├── cuda_smoke_test.py       ← confirms CUDA backend JIT on RTX 5060
@@ -87,11 +94,11 @@ here via `yaml.safe_load`.
 
 | Section | Key fields |
 |---------|-----------|
-| `black_hole` | `spin` (a=0.999), `r_isco` (1.182 M), `r_plus` (0.0447 M) |
-| `render` | `width`/`height` (4K target), `thumb_width` (256), `max_steps_pipe_a` (250), `d_lambda_pipe_a` (0.01), `r_max` (50 M), `device_memory_gb` (6) |
-| `disk` | `r_inner`, `r_outer`, `theta_half_width`, `T_0`, `emission_coeff`, `absorption_coeff`, `vertical_sigma_frac` |
+| `black_hole` | `spin` (a=0.999), `r_isco` (1.182 M), `r_plus` (1.0447 M — true outer horizon r₊=1+√(1−a²); consumed only by `thumb.py`, the renderer derives r₊ in `_horizon_constants`) |
+| `render` | `width`/`height` (4K target), `thumb_width/height` (256), `max_steps_pipe_a` (250), `max_steps_pipe_b` (200 — **declared but currently unused**, see taichi_renderer note), `d_lambda_pipe_a` (0.01), `r_max` (50 M), `device_memory_gb` (6), `horizon_epsilon` (0.05 Δ-capture stop), `adaptive_step_floor` (0.005), `sin2_min` (1e-10 polar guard), `motion_blur_samples` (4), `projection_mode` (perspective\|equirect), `depth_infinity` (1e5 no-disk Z sentinel) |
+| `disk` | `r_inner`, `r_outer`, `theta_half_width`, `T_0`, `emission_coeff`, `absorption_coeff`, `vertical_sigma_frac`, `bounding_sin_theta_half` (=sin(theta_half_width); bbox early-out) |
 | `starmap` | `path` (relative to repo root), `width` (16384 — used to compute LOD) |
-| `camera` | `default_radius` (6.03 M), `default_fov_deg` (90°) |
+| `camera` | `default_radius` (6.03 M), `default_fov_deg` (90°), `shutter_fraction` (1/48 s — motion-blur shutter; **note: `export_exr._shutter_arc` hardcodes a 0.5 factor and does not yet read this key**) |
 | `thumb` | Preview-only framing overrides: `camera_radius`, `fov_deg`, `camera_theta_deg`, background colors, ring glow, exposure, gamma |
 | `output` | Directory names and filename prefixes for EXR sequences |
 
@@ -113,7 +120,9 @@ a number and is referenced by that number throughout the codebase.
 | 7 | ZAMO tetrad photon momentum initialization; exact A = (r²+a²)² − a²Δsin²θ |
 | 8 | g-factor = −1/(p_t·u^t + p_r·u^r + p_θ·u^θ + p_φ·u^φ); p_r is covariant |
 | 9 | g⁴ volumetric beaming (3D emitter); `blackbody_rgb` is chromaticity-only (no T⁴) |
-| 10 | Differential-ray mip LOD: J = √(δθ² + sin²θ·δφ²); L = log₂(W·J / 2π) |
+| 10 | Differential-ray mip LOD: J = √(δθ² + sin²θ·δφ²); L = log₂(W·J / 2π). **Amendment (v1.4):** J may equivalently be estimated in screen space from the 4-neighbourhood exit directions (kernel-split LOD) instead of an offset ray |
+| 11 | FP32-stable factored discriminant: Δ = (r−r₊)(r−r₋) = y(y+2k), y=r−r₊, k=√(1−a²) (kills catastrophic cancellation near the horizon) |
+| 12 | Singularity-free polar potential under u=cosθ: Θ_u(u) = (1−u²)(Q+a²E²u²) − L_z²u²; the 1/sin²θ pole cancels analytically (dφ/dλ, dt/dλ keep a `sin2_min` guard) |
 
 ---
 
@@ -185,8 +194,11 @@ Used by: `src/renderer/taichi_renderer.py` (upload to GPU), `tests/test_starmap.
 
 ### `src/renderer/taichi_renderer.py`
 
-**Role:** The GPU renderer — Phase 2 core (1042 lines). Ports the CPU physics
-to Taichi `@ti.func` / `@ti.kernel` functions and runs both pipes on CUDA.
+**Role:** The GPU renderer — Phase 2 core (1297 lines). Ports the CPU physics
+to Taichi `@ti.func` / `@ti.kernel` functions and runs both pipes on CUDA. The
+production beauty path is split into a **physics kernel** + a **shading kernel**
+(Formula 10 screen-space-Jacobian LOD) and integrates in the horizon-stable
+`[y, u, φ, t, v_y, v_u]` state (y=r−r₊, u=cosθ).
 
 **Backend:** Locked to `ti.init(arch=ti.cuda)` — never `ti.gpu`.
 
@@ -195,22 +207,24 @@ to Taichi `@ti.func` / `@ti.kernel` functions and runs both pipes on CUDA.
 |-------|---------|
 | `star_flat`, `star_off`, `star_w`, `star_h` | Mip pyramid packed as flat f16 buffer + metadata |
 | `pixels` | Square output buffer for `render_pipe_a` |
-| `frame_pixels` | Non-square output buffer for `render_beauty` |
+| `frame_pixels` | Non-square output buffer for `render_beauty_*` |
+| `exit_buf`, `disk_buf`, `depth_pixels` | Kernel-split hand-off: physics kernel writes exit dirs/outcome + accumulated disk RGBA + transmittance-weighted Z; shade kernel reads them |
 
 #### Physics `@ti.func` functions
 
 | Function | Formula | Notes |
 |----------|---------|-------|
-| `_delta(r, a)` | — | Δ = r²−2r+a² |
-| `_radial_potential` / `_theta_potential` | 6 | R(r), Θ(θ) potentials |
-| `_radial_potential_deriv` / `_theta_potential_deriv` | 6 | ½R′, ½Θ′ for second-order ODE |
-| `_deriv(s, E, Lz, Q, a)` | 6 | Mino-time ds/dλ |
-| `_project(s, E, Lz, Q, a)` | 6 | Re-impose (dr/dλ)²=R, (dθ/dλ)²=Θ after RK4 |
-| `_rk4_step(s, E, Lz, Q, a, h)` | 6 | One RK4 step + project |
-| `_zamo_init(r, theta, a, n_r, n_th, n_ph)` | 7 | ZAMO tetrad → (E, Lz, Q, v_r0, v_θ0) |
-| `_gas_four_velocity(r, theta, a, r_isco, E_I, L_I)` | 3/5 | GPU port of `renderer.disk.gas_four_velocity` |
+| `_horizon_constants(a)` (host) | 11 | Derives k=√(1−a²), r₊=1+k in Python (not a hardcoded literal) |
+| `_delta_y(y, k)` | 11 | Δ = y(y+2k) factored form — FP32-stable near horizon |
+| `_radial_potential_y` / `_radial_potential_deriv_y` | 6/11 | R(y), ½R′ in horizon-relative y |
+| `_theta_potential` (Θ_u) / its deriv | 6/12 | Singularity-free polar potential Θ_u(u), ½Θ_u′ |
+| `_deriv(s, E, Lz, Q, a, k, r_plus)` | 6/12 | Mino-time ds/dλ in `[y,u,…]` state |
+| `_project(s, …)` | 6 | Re-impose (dy/dλ)²=R, (du/dλ)²=Θ_u after RK4 |
+| `_rk4_step(s, …, h)` | 6 | One adaptive RK4 step (Kahan-compensated) + project |
+| `_zamo_init(r, theta, a, k, r_plus, n_r, n_th, n_ph)` | 7 | ZAMO tetrad → (E, Lz, Q, v_y0, v_u0) |
+| `_gas_four_velocity(r, theta, a, r_isco, E_I, L_I)` | 3/5 | GPU port of `renderer.disk.gas_four_velocity` (plunging branch uses factored Δ) |
 | `_blackbody_rgb(temp)` | 9 | Chromaticity only, no T⁴ |
-| `_disk_emit(r, th, vr, vth, E, Lz, ...)` | 8/9 | One volumetric disk sample → `vec4(emitRGB, dτ)` |
+| `_disk_emit(y, u, vy, vu, E, Lz, a, k, r_plus, r_isco, E_I, L_I, …)` | 8/9 | One volumetric disk sample → `vec4(emitRGB, dτ)`; recovers p_r=v_y/Δ, p_θ=−v_u/√(1−u²) |
 
 #### Starmap `@ti.func` functions
 
@@ -225,8 +239,9 @@ to Taichi `@ti.func` / `@ti.kernel` functions and runs both pipes on CUDA.
 
 | Kernel | Purpose |
 |--------|---------|
-| `render_pipe_a(res, ...)` | Pipe A only (square, ZAMO-aligned camera). Primary + offset ray traced in shared loop; Formula 10 LOD; lensed starmap. |
-| `render_beauty(width, height, ...)` | **Production kernel.** Arbitrary camera basis via ZAMO triad components. Pipe A + Pipe B front-to-back: disk accumulated, then attenuated background composited behind it. |
+| `render_pipe_a(res, ...)` | Pipe A only (square, ZAMO-aligned camera). **Retains the offset ray** as the LOD reference (dev/`_gate2_lod_test` path, not 4K production). |
+| `render_beauty_physics(width, height, ...)` | **Production kernel 1.** Arbitrary camera basis via ZAMO triad. Traces the geodesic, accumulates Pipe B disk RGBA, writes exit dir/outcome + transmittance-weighted Z to `exit_buf`/`disk_buf`/`depth_pixels`. |
+| `render_beauty_shade(width, height, lod_enabled)` | **Production kernel 2.** Reads the 4-neighbourhood exit dirs, computes the Formula-10 screen-space Jacobian → LOD, samples the lensed starmap, composites it behind the disk. |
 | `render_starmap_raw` | Diagnostic 1: equirect sky dump at fixed LOD, no geodesic |
 | `render_fixed_lod` | Diagnostic 2: geodesic lensing, LOD pinned (no Jacobian) |
 | `dump_phi_exit` | Diagnostic 3: per-column raw φ exit dump for seam root-cause analysis |
@@ -240,8 +255,16 @@ to Taichi `@ti.func` / `@ti.kernel` functions and runs both pipes on CUDA.
 | `_alloc_output(res)` | Allocate square `pixels` field if size changed |
 | `_alloc_frame(width, height)` | Allocate `frame_pixels` field for non-square renders |
 | `render_pipe_a_image(cfg, res, lod_enabled)` | Render square Pipe A frame, return float32 HDR |
-| `render_beauty_frame(cfg, cam_frame, width, height, with_disk, lod_enabled)` | **Main entry point.** Converts Blender world Cartesian → BL, projects camera axes onto local (r̂, θ̂, φ̂) triad, calls `render_beauty`, returns float32 HDR. |
+| `render_beauty_frame(cfg, cam_frame, width, height, with_disk, lod_enabled, return_depth)` | **Main entry point.** Converts Blender world Cartesian → BL, projects camera axes onto local (r̂, θ̂, φ̂) triad, runs the physics+shade kernels; optionally returns the (NaN-guarded) Z pass. |
+| `render_beauty_frame_mb(cfg, cam_frame, width, height, shutter_arc, ...)` | Temporal motion-blur variant: averages N camera-rotated sub-frames; depth uses masked per-pixel averaging (sentinel-safe). |
 | `tonemap(hdr, exposure, gamma)` | Reinhard tonemap + gamma → uint8 |
+
+**Consumed by:** `scripts/gpu_test.py` (smoke render), `scripts/export_exr.py`
+(Phase 5 RGBAZ writer).
+
+**Note — `max_steps_pipe_b`:** declared in `render.yaml` but not read by any
+kernel; disk marching is tied to the Pipe A geodesic loop (`max_steps_pipe_a`).
+The key is currently inert (see fix plan).
 
 #### Camera conversion in `render_beauty_frame`
 
@@ -437,7 +460,7 @@ src/blender/export_camera.py  (run inside Blender)
 | GPU backend = `ti.cuda`, never `ti.gpu` | `taichi_renderer.py:99`, `cuda_smoke_test.py:21`, `CLAUDE.md` |
 | All formulas from `SKILL.md`, no re-derivation | `CLAUDE.md` physics policy |
 | All parameters from `configs/render.yaml` | All source files; no numeric literals for physics |
-| State vector `v_r = Δ·p_r` | `geodesic.py:173`, `taichi_renderer.py:270`, `_disk_emit` comment |
+| State vector `v_r = Δ·p_r` (CPU); renamed `v_y = dy/dλ = Δ·p_r` in GPU `[y,u,…]` state | `geodesic.py` (CPU `[r,θ,…]`), `taichi_renderer.py` `_zamo_init`/`_disk_emit` (GPU `[y,u,…]`, value preserved) |
 | `p_r` covariant recovery = `v_r / Δ` (not `v_r / Δ²`) | `disk.py:84-87` (Formula-8 known bug note), `_disk_emit:420` |
 | `blackbody_rgb` is chromaticity-only | `disk.py:91-102`, `_blackbody_rgb:387-397` |
 | g⁴ beaming is correct and not double-counted | `disk.py:277`, `_disk_emit:433` |

@@ -400,12 +400,23 @@ tightens, drop to a 3-channel texture format or keep the manual pyramid.
   `render_blackhole/bh_####.exr`. **Verified:** channels + depth confirmed with
   `oiio` read-back.
 
-**Note (config bug surfaced):** `configs/render.yaml black_hole.r_plus = 0.0447`
-is mislabeled — it is `k=√(1−a²)`, not the outer horizon (true r₊=1.0447), and
-its comment (`= 1 − √(1−a²)` = 0.955) is also wrong. It is consumed by
-`scripts/thumb.py` as an `r_floor`, so it was **left untouched**; the true r₊ is
-derived in `_horizon_constants(a)`. Recommend a separate fix to rename/clarify
-that key.
+- [x] **Review-fix commit `c45d24b`** (post-Phase-5 code review). Four findings fixed:
+  (1) motion-blur Z corruption — `render_beauty_frame_mb` averaged the `depth_infinity`
+  sentinel into the Z channel; now masked per-pixel averaging. (2) `r_plus` config
+  mislabel — corrected `0.0447`→`1.0447` (see note below). (3) depth NaN — `nan_to_num`
+  guard at the `render_beauty_frame` depth source. (4) split-brain Δ — plunging branch
+  of `_gas_four_velocity` switched to the Formula-11 factored Δ. **Verified:** pytest
+  12/12; Doppler 7.77×; MB depth corruption band empty.
+
+**Note (config bug — FIXED in c45d24b, regressed in working tree):**
+`black_hole.r_plus` was originally `0.0447` (mislabeled: that value is `k=√(1−a²)`,
+not the outer horizon; the true r₊=1.0447). It is consumed by `scripts/thumb.py`
+as an `r_floor`. **Commit c45d24b corrected it to `1.0447`** with the right comment.
+⚠️ An external Codex review run (commit `d307768` artifacts) **reverted the working
+tree back to `0.0447`** — this regression is currently UNCOMMITTED and is fix-plan
+item #1 (restore via `git checkout -- configs/render.yaml`). The renderer itself is
+unaffected either way: the true r₊ is derived in `_horizon_constants(a)`, not read
+from this key; only the CPU `thumb.py` preview path consumes it.
 
 render_pipe_a (the 256² dev LOD test kernel used by `_gate2_lod_test`) was
 migrated to the `[y,u,…]` state but intentionally **retains its offset ray** —
