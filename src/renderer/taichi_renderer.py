@@ -49,6 +49,10 @@ def load_config(path: Path = _CONFIG_PATH) -> dict:
 #   _SIN2_MIN  ← render.sin2_min         (polar guard on dφ/dλ, dt/dλ ONLY; Formula 12)
 _DELTA_MIN = 0.05
 _SIN2_MIN = 1e-10
+# Background-fold LOD saturation: an escaped pixel whose screen-space exit
+# footprint J (rad) exceeds this is straddling a lensing fold (the spin-axis
+# meridian caustic) and is collapsed to the coarsest mip. From render.j_fold.
+_J_FOLD = 0.15
 
 # State vector layout (Phase 1.3, Formula 12): [y, u, φ, t, v_y, v_u] where
 #   y = r − r₊   (horizon-relative radius; Formula 11)
@@ -102,11 +106,12 @@ def setup_renderer(cfg: dict) -> Starmap:
     """
     global star_flat, star_off, star_w, star_h
     global _N_LEVELS, _MAX_LOD, _STARMAP_WIDTH
-    global _DELTA_MIN, _SIN2_MIN
+    global _DELTA_MIN, _SIN2_MIN, _J_FOLD
 
     # Integration-scheme constants from config (baked into kernels at first JIT).
     _DELTA_MIN = float(cfg["render"]["horizon_epsilon"])
     _SIN2_MIN = float(cfg["render"]["sin2_min"])
+    _J_FOLD = float(cfg["render"].get("j_fold", 0.15))
 
     mem_gb = float(cfg["render"]["device_memory_gb"])
     # LOCKED backend — ti.cuda, never ti.gpu (CLAUDE.md / SKILL.md).
@@ -757,6 +762,19 @@ def render_beauty_physics(width: int, height: int,
                 sp, c_sp = _rk4_step_kahan(sp, c_sp, Ep, Lp, Qp, a,
                                            k_horizon, r_plus, local_h)
                 ray_length += local_h
+                # Axisymmetry wrap (restores the original bounded-φ behaviour).
+                # φ is cyclic — it never appears on the RHS of `_deriv` (Kerr is
+                # axisymmetric) — so folding it into (−π, π] every step is an
+                # exact coordinate identity, not a physics change. A near-pole
+                # passage drives dφ/dλ = Lz/sin²θ toward Lz/_SIN2_MIN (~1e10),
+                # inflating the raw accumulated φ to ~1e6 rad; at that magnitude
+                # f32 retains no fractional precision, so the exit azimuth — the
+                # only physically meaningful part — collapses to noise and flips
+                # sign across the symmetric center column (the "static" seam).
+                # Keeping φ in (−π, π] preserves full f32 precision throughout.
+                phi_w = sp[2] - _TWO_PI * ti.round(sp[2] / _TWO_PI)
+                sp = vec6(sp[0], sp[1], phi_w, sp[3], sp[4], sp[5])
+                c_sp = vec6(c_sp[0], c_sp[1], 0.0, c_sp[3], c_sp[4], c_sp[5])
                 if _delta_y(sp[0], k_horizon) < _DELTA_MIN or sp[0] < r_capture:
                     out_p = _CAPTURED
                 elif sp[0] >= y_escape:
@@ -777,7 +795,13 @@ def render_beauty_physics(width: int, height: int,
                         frac = (y_escape - y_prev) / denom
                     frac = ti.min(ti.max(frac, 0.0), 1.0)
                     u_p_exit = u_prev + frac * (sp[1] - u_prev)
-                    ph_p_exit = ph_prev + frac * (sp[2] - ph_prev)
+                    # Shortest-arc φ delta: ph_prev and the per-step-wrapped sp[2]
+                    # can land on opposite sides of the ±π fold, so interpolate
+                    # along the wrapped increment (the geodesic turns < π over one
+                    # far-field step at r≈r_max, so the short arc is the true one).
+                    dph = sp[2] - ph_prev
+                    dph = dph - _TWO_PI * ti.round(dph / _TWO_PI)
+                    ph_p_exit = ph_prev + frac * dph
             step += 1
 
         exit_buf[py, px, 0] = u_p_exit
@@ -827,7 +851,19 @@ def _screen_jacobian_lod(py, px, height, width, th_p, ph_p):
         Jy = ti.sqrt((th_y - th_p) ** 2 + sin_th * sin_th * dphy * dphy)
 
         J = ti.max(Jx, Jy)
-        lod = ti.log(_STARMAP_WIDTH * J / (2.0 * math.pi)) / ti.log(2.0)
+        # Fold saturation (restores the original offset-ray behaviour). Near the
+        # spin-axis meridian the lensing folds: neighbour pixels exit on opposite
+        # sides of the pole, ~π apart in azimuth, so a single scalar-LOD trilinear
+        # fetch lands on unrelated coarse-mip texels → the "static" seam. The old
+        # offset-ray Jacobian forced _MAX_LOD whenever the companion ray dived into
+        # that chaotic region; with screen-space differencing the equivalent signal
+        # is a footprint J spanning a large fraction of the sky. Above _J_FOLD the
+        # pixel genuinely integrates that whole fan, so collapse it to the uniform
+        # coarsest mip (smooth grey) rather than an aliased mid-mip fetch.
+        if J > _J_FOLD:
+            lod = _MAX_LOD
+        else:
+            lod = ti.log(_STARMAP_WIDTH * J / (2.0 * math.pi)) / ti.log(2.0)
     return lod
 
 

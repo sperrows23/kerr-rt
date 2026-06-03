@@ -16,7 +16,9 @@ render:
   horizon_epsilon: 0.05        # Δ-capture stop before the horizon (was hardcoded _DELTA_MIN)
   adaptive_step_floor: 0.005   # guid 2.2: lower bound on the y-scaled adaptive step factor
   sin2_min: 1.0e-10            # polar guard on dφ/dλ, dt/dλ denominators only (Formula 12)
+  j_fold: 0.15                 # background LOD fold-saturation: escaped pixels whose screen-space exit footprint J(rad) exceeds this straddle the spin-axis meridian caustic -> collapse to coarsest mip (kills the center "static" seam)
   motion_blur_samples: 4       # guid 4.2: temporal jitter samples per pixel
+  fps: 24.0                    # animation frame rate; shutter arc = dphi*fps*shutter_fraction (guid 4.2)
   projection_mode: perspective # perspective | equirect (guid 4.1; perspective keeps the Doppler check valid)
   depth_infinity: 1.0e5        # guid 3.4: Z value written to pixels with no disk emission
 

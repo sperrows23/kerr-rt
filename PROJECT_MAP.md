@@ -55,12 +55,15 @@ Black/
 │       ├── geodesic.py          ← Mino-time RK4 null geodesic integrator (Formula 6)
 │       ├── disk.py              ← Accretion disk gas physics (Formulas 3/4/5/8/9)
 │       ├── starmap.py           ← 16K HDRI loader, mip pyramid, UV mapping
-│       └── taichi_renderer.py   ← GPU renderer: Pipe A + Pipe B, split kernels (1297 lines)
+│       └── taichi_renderer.py   ← GPU renderer: Pipe A + Pipe B, split kernels (1359 lines)
 │
 ├── scripts/
 │   └── export_exr.py            ← Phase 5: multi-channel RGBAZ EXR writer (OpenImageIO)
 │
 ├── IMPLEMENTATION_PLAN.md       ← 5-phase optimization plan + execution status
+├── REMAINING_WORK_PLAN.md       ← backlog: open items, fix order, dependencies
+├── PIPELINE_OVERVIEW.md         ← end-to-end Stage 1–4 production workflow reference
+├── BACKGROUND_DNGR_PLAN.md      ← proposal: DNGR-style point-star background rearchitecture
 ├── AGENTS.md                    ← mirror of CLAUDE.md for the Codex/Agents harness
 ├── .codex/config.toml           ← Codex MCP config (Context7)
 │
@@ -68,6 +71,7 @@ Black/
 │   ├── cuda_smoke_test.py       ← confirms CUDA backend JIT on RTX 5060
 │   ├── test_geodesic.py         ← conservation law tests (E, Lz, Q, null norm)
 │   ├── test_starmap.py          ← polar punch-through / UV normalization tests
+│   ├── test_gpu_regression.py   ← automated GPU Doppler / NaN / disk-peak guard (CUDA-gated)
 │   └── test_geodesic/
 │       └── test_conserved_quantities_regression.csv   ← golden values
 │
@@ -95,10 +99,10 @@ here via `yaml.safe_load`.
 | Section | Key fields |
 |---------|-----------|
 | `black_hole` | `spin` (a=0.999), `r_isco` (1.182 M), `r_plus` (1.0447 M — true outer horizon r₊=1+√(1−a²); consumed only by `thumb.py`, the renderer derives r₊ in `_horizon_constants`) |
-| `render` | `width`/`height` (4K target), `thumb_width/height` (256), `max_steps_pipe_a` (250), `max_steps_pipe_b` (200 — **declared but currently unused**, see taichi_renderer note), `d_lambda_pipe_a` (0.01), `r_max` (50 M), `device_memory_gb` (6), `horizon_epsilon` (0.05 Δ-capture stop), `adaptive_step_floor` (0.005), `sin2_min` (1e-10 polar guard), `motion_blur_samples` (4), `projection_mode` (perspective\|equirect), `depth_infinity` (1e5 no-disk Z sentinel) |
+| `render` | `width`/`height` (4K target), `thumb_width/height` (256), `max_steps_pipe_a` (250), `max_steps_pipe_b` (200 — **declared but currently unused**, see taichi_renderer note), `d_lambda_pipe_a` (0.01), `r_max` (50 M), `device_memory_gb` (6), `horizon_epsilon` (0.05 Δ-capture stop), `adaptive_step_floor` (0.005), `sin2_min` (1e-10 polar guard), `j_fold` (0.15 — background LOD fold-saturation; collapses spin-axis meridian-caustic pixels to the coarsest mip to kill the center "static" seam), `motion_blur_samples` (4), `fps` (24.0 — animation frame rate; motion-blur shutter arc = Δφ·fps·shutter_fraction), `projection_mode` (perspective\|equirect), `depth_infinity` (1e5 no-disk Z sentinel) |
 | `disk` | `r_inner`, `r_outer`, `theta_half_width`, `T_0`, `emission_coeff`, `absorption_coeff`, `vertical_sigma_frac`, `bounding_sin_theta_half` (=sin(theta_half_width); bbox early-out) |
 | `starmap` | `path` (relative to repo root), `width` (16384 — used to compute LOD) |
-| `camera` | `default_radius` (6.03 M), `default_fov_deg` (90°), `shutter_fraction` (1/48 s — motion-blur shutter; **note: `export_exr._shutter_arc` hardcodes a 0.5 factor and does not yet read this key**) |
+| `camera` | `default_radius` (6.03 M), `default_fov_deg` (90°), `shutter_fraction` (1/48 s — motion-blur shutter time; `export_exr._shutter_arc` reads this with `render.fps` as `arc = Δφ·fps·shutter_fraction`, = the 180° shutter at 24 fps) |
 | `thumb` | Preview-only framing overrides: `camera_radius`, `fov_deg`, `camera_theta_deg`, background colors, ring glow, exposure, gamma |
 | `output` | Directory names and filename prefixes for EXR sequences |
 
@@ -194,7 +198,7 @@ Used by: `src/renderer/taichi_renderer.py` (upload to GPU), `tests/test_starmap.
 
 ### `src/renderer/taichi_renderer.py`
 
-**Role:** The GPU renderer — Phase 2 core (1297 lines). Ports the CPU physics
+**Role:** The GPU renderer — Phase 2 core (1359 lines). Ports the CPU physics
 to Taichi `@ti.func` / `@ti.kernel` functions and runs both pipes on CUDA. The
 production beauty path is split into a **physics kernel** + a **shading kernel**
 (Formula 10 screen-space-Jacobian LOD) and integrates in the horizon-stable
@@ -240,8 +244,8 @@ production beauty path is split into a **physics kernel** + a **shading kernel**
 | Kernel | Purpose |
 |--------|---------|
 | `render_pipe_a(res, ...)` | Pipe A only (square, ZAMO-aligned camera). **Retains the offset ray** as the LOD reference (dev/`_gate2_lod_test` path, not 4K production). |
-| `render_beauty_physics(width, height, ...)` | **Production kernel 1.** Arbitrary camera basis via ZAMO triad. Traces the geodesic, accumulates Pipe B disk RGBA, writes exit dir/outcome + transmittance-weighted Z to `exit_buf`/`disk_buf`/`depth_pixels`. |
-| `render_beauty_shade(width, height, lod_enabled)` | **Production kernel 2.** Reads the 4-neighbourhood exit dirs, computes the Formula-10 screen-space Jacobian → LOD, samples the lensed starmap, composites it behind the disk. |
+| `render_beauty_physics(width, height, ...)` | **Production kernel 1.** Arbitrary camera basis via ZAMO triad. Traces the geodesic, accumulates Pipe B disk RGBA, writes exit dir/outcome + transmittance-weighted Z to `exit_buf`/`disk_buf`/`depth_pixels`. Wraps φ into (−π, π] every step (axisymmetry identity) so a near-pole passage cannot inflate φ past f32 precision; escape angle uses a shortest-arc φ interpolation. (Seam fix.) |
+| `render_beauty_shade(width, height, lod_enabled)` | **Production kernel 2.** Reads the 4-neighbourhood exit dirs, computes the Formula-10 screen-space Jacobian → LOD, samples the lensed starmap, composites it behind the disk. `_screen_jacobian_lod` saturates LOD to `_MAX_LOD` when the exit footprint `J > render.j_fold` (spin-axis meridian-caustic fold → coarsest mip, the seam fix that replaces the static band with smooth grey). |
 | `render_starmap_raw` | Diagnostic 1: equirect sky dump at fixed LOD, no geodesic |
 | `render_fixed_lod` | Diagnostic 2: geodesic lensing, LOD pinned (no Jacobian) |
 | `dump_phi_exit` | Diagnostic 3: per-column raw φ exit dump for seam root-cause analysis |
@@ -260,7 +264,7 @@ production beauty path is split into a **physics kernel** + a **shading kernel**
 | `tonemap(hdr, exposure, gamma)` | Reinhard tonemap + gamma → uint8 |
 
 **Consumed by:** `scripts/gpu_test.py` (smoke render), `scripts/export_exr.py`
-(Phase 5 RGBAZ writer).
+(Phase 5 RGBAZ writer), `tests/test_gpu_regression.py` (automated Doppler/NaN/disk-peak guard).
 
 **Note — `max_steps_pipe_b`:** declared in `render.yaml` but not read by any
 kernel; disk marching is tied to the Pipe A geodesic loop (`max_steps_pipe_a`).
@@ -358,6 +362,21 @@ test.
 and `direction_to_uv`. Verifies that θ < 0 (from integrator overshoot past the
 north pole) is reflected to a genuine UV row instead of being clamped to v=0 (the
 old streak bug), and that the normalization preserves the physical direction vector.
+
+---
+
+### `tests/test_gpu_regression.py`
+
+**Role:** Automated GPU beauty-render regression — the pytest form of the manual
+`gpu_test.py` Doppler smoke check. Drives the **production** `render_beauty_frame`
+(frame 0, 1920×1080, disk on) and asserts: no NaN pixels; the right/left Doppler
+luminance ratio stays in `[7.0, 8.5]` (baseline ≈7.77×) with the approaching
+(right) edge brighter; and the peak HDR (beamed disk edge) matches the pinned
+`_DISK_MAX_REF = 12.7707` within 5%. Marked `pytest.mark.gpu` and **skips cleanly**
+when no CUDA backend is present (Taichi init is deferred into a module-scoped
+fixture, so collection stays hardware-independent). Does not re-implement physics.
+
+Used by: CI / `pytest tests/` on a CUDA host. Closes backlog item F3.
 
 ---
 

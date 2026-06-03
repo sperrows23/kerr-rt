@@ -408,15 +408,33 @@ tightens, drop to a 3-channel texture format or keep the manual pyramid.
   of `_gas_four_velocity` switched to the Formula-11 factored Δ. **Verified:** pytest
   12/12; Doppler 7.77×; MB depth corruption band empty.
 
-**Note (config bug — FIXED in c45d24b, regressed in working tree):**
-`black_hole.r_plus` was originally `0.0447` (mislabeled: that value is `k=√(1−a²)`,
-not the outer horizon; the true r₊=1.0447). It is consumed by `scripts/thumb.py`
-as an `r_floor`. **Commit c45d24b corrected it to `1.0447`** with the right comment.
-⚠️ An external Codex review run (commit `d307768` artifacts) **reverted the working
-tree back to `0.0447`** — this regression is currently UNCOMMITTED and is fix-plan
-item #1 (restore via `git checkout -- configs/render.yaml`). The renderer itself is
-unaffected either way: the true r₊ is derived in `_horizon_constants(a)`, not read
-from this key; only the CPU `thumb.py` preview path consumes it.
+- [x] **F3 — GPU regression harness (committed).** `tests/test_gpu_regression.py`
+  drives the production `render_beauty_frame` (frame 0, FHD, disk on) and asserts
+  no-NaN, Doppler ratio ∈ [7.0, 8.5] (right > left), and disk-peak ≈ `12.7707` ±5%.
+  `pytest.mark.gpu`, skips cleanly without CUDA. Closes backlog F3.
+
+- [~] **Center "static" seam fix + F2 shutter (working tree, pending commit).**
+  Seam fix in `taichi_renderer.py`: per-step φ-wrap into (−π, π] (exact axisymmetry
+  identity — prevents f32 precision loss when φ winds to ~1e6 rad near the pole),
+  shortest-arc escape-angle interpolation, and `_screen_jacobian_lod` LOD
+  fold-saturation to the coarsest mip when `J > render.j_fold` (new config key
+  `j_fold: 0.15`) — collapses the spin-axis meridian lensing caustic to smooth grey.
+  **F2:** `scripts/export_exr._shutter_arc` now reads `camera.shutter_fraction` with
+  the new `render.fps: 24.0` as `arc = Δφ·fps·shutter_fraction` (byte-identical to
+  the legacy `Δφ·0.5` at 24 fps). **Verified:** pytest green (incl. F3 GPU regression
+  on CUDA); Doppler 7.77×; disk-on/off renders show the static band replaced by a
+  smooth faint line; `j_fold` saturates only ~1.2% of escaped pixels.
+  See `REMAINING_WORK_PLAN.md` (F2 done, F3 done) and `BACKGROUND_DNGR_PLAN.md`
+  (proposed background rearchitecture, planning only).
+
+**Note (config bug — RESOLVED):** `black_hole.r_plus` was originally `0.0447`
+(mislabeled: that value is `k=√(1−a²)`, not the outer horizon; the true r₊=1.0447).
+It is consumed by `scripts/thumb.py` as an `r_floor`. **Commit c45d24b corrected it
+to `1.0447`**; an external Codex review run briefly reverted the working tree to
+`0.0447`, and it has since been **restored to `1.0447`** (current value in
+`configs/render.yaml`). No longer an open item. The renderer itself is unaffected
+either way: the true r₊ is derived in `_horizon_constants(a)`, not read from this
+key; only the CPU `thumb.py` preview path consumes it.
 
 render_pipe_a (the 256² dev LOD test kernel used by `_gate2_lod_test`) was
 migrated to the `[y,u,…]` state but intentionally **retains its offset ray** —

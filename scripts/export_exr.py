@@ -37,15 +37,22 @@ def _azimuth(pos) -> float:
     return math.atan2(float(pos[1]), float(pos[0]))
 
 
-def _shutter_arc(frames, idx: float, shutter_fraction: float) -> float:
-    """Azimuthal travel during the shutter (guid 4.2): Δφ to the next frame times
-    a 0.5 (180°) shutter factor. Returns 0 if there is no neighbor frame."""
+def _shutter_arc(frames, idx: float, shutter_fraction: float, fps: float) -> float:
+    """Azimuthal travel during the shutter (guid 4.2).
+
+    ``Δφ`` between adjacent ``camera_matrix.json`` frames is the per-inter-frame
+    arc, i.e. ω·(1/fps). The shutter arc is ω·shutter_fraction (see
+    ``render_beauty_frame_mb``), where ``shutter_fraction`` is the shutter *time*
+    in seconds (config ``camera.shutter_fraction`` = 1/48 s). Converting the
+    per-frame Δφ to ω via ``×fps`` gives ``arc = Δφ·fps·shutter_fraction``. At
+    24 fps and a 1/48 s shutter this is ``Δφ·0.5`` — the legacy 180° shutter.
+    Returns 0 if there is no neighbor frame."""
     if idx + 1 >= len(frames):
         return 0.0
     dphi = _azimuth(frames[idx + 1]["pos"]) - _azimuth(frames[idx]["pos"])
     # wrap into [-pi, pi]
     dphi = (dphi + math.pi) % (2.0 * math.pi) - math.pi
-    return dphi * 0.5
+    return dphi * fps * shutter_fraction
 
 
 def write_rgbaz_exr(filename: str, beauty_rgb: np.ndarray, depth_z: np.ndarray) -> None:
@@ -102,7 +109,9 @@ def main(argv=None):
           f"  motion_blur={'on' if args.motion_blur else 'off'} ...")
     t0 = time.time()
     if args.motion_blur:
-        arc = _shutter_arc(frames, args.frame, float(cfg["camera"]["shutter_fraction"]))
+        arc = _shutter_arc(frames, args.frame,
+                           float(cfg["camera"]["shutter_fraction"]),
+                           float(cfg["render"]["fps"]))
         beauty, depth = tr.render_beauty_frame_mb(
             cfg, cam, width, height, shutter_arc=arc,
             with_disk=not args.no_disk, lod_enabled=True, return_depth=True)
