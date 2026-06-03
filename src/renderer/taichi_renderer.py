@@ -412,6 +412,13 @@ def _sample_trilinear(u, v, lod):
     l1 = ti.min(l0 + 1, _N_LEVELS - 1)
     l0 = ti.min(l0, _N_LEVELS - 1)
     f = L - ti.floor(L)
+    # Smoothstep the inter-level blend weight so the reconstruction is C1 (not
+    # just C0) across integer LOD boundaries. Linear f has slope 1 on both sides
+    # of an integer, where the active mip pair switches, so the blend rate jumps
+    # — a Mach-band kink that the smooth radial LOD field paints as concentric
+    # rings. smoothstep's derivative 6f(1-f) vanishes at f=0 and f=1, matching
+    # the slope across each boundary. Endpoints are unchanged (0->0, 1->1).
+    f = f * f * (3.0 - 2.0 * f)
     c0 = _sample_level(l0, u, v)
     c1 = _sample_level(l1, u, v)
     return c0 * (1.0 - f) + c1 * f
@@ -744,6 +751,9 @@ def render_beauty_physics(width: int, height: int,
             if _delta_y(sp[0], k_horizon) < _DELTA_MIN:
                 out_p = _CAPTURED
             else:
+                y_prev = sp[0]          # pre-step state, for escape event location
+                u_prev = sp[1]
+                ph_prev = sp[2]
                 sp, c_sp = _rk4_step_kahan(sp, c_sp, Ep, Lp, Qp, a,
                                            k_horizon, r_plus, local_h)
                 ray_length += local_h
@@ -751,8 +761,23 @@ def render_beauty_physics(width: int, height: int,
                     out_p = _CAPTURED
                 elif sp[0] >= y_escape:
                     out_p = _ESCAPED
-                    u_p_exit = sp[1]
-                    ph_p_exit = sp[2]
+                    # Linear event location: interpolate the exit angles back to
+                    # the escape surface y = y_escape (r = r_max). Far out, a
+                    # single Mino step advances r by ~r²·h (tens of units near
+                    # r_max), so neighbor pixels overshoot the sphere by
+                    # different amounts. Recording the raw overshot angle injects
+                    # that step-quantization jitter into the screen-space
+                    # Jacobian (Formula 10), over-coarsening the background mip.
+                    # Interpolating to the exact surface removes it. (Numerical
+                    # event location of the integrated geodesic — no GR formula
+                    # is re-derived; SKILL.md formulas are untouched.)
+                    denom = sp[0] - y_prev
+                    frac = 1.0
+                    if denom > 1e-12:
+                        frac = (y_escape - y_prev) / denom
+                    frac = ti.min(ti.max(frac, 0.0), 1.0)
+                    u_p_exit = u_prev + frac * (sp[1] - u_prev)
+                    ph_p_exit = ph_prev + frac * (sp[2] - ph_prev)
             step += 1
 
         exit_buf[py, px, 0] = u_p_exit
