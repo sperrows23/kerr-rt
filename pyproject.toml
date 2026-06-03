@@ -28,3 +28,6 @@ package = false
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "gpu: GPU/CUDA regression tests; skipped automatically when CUDA is unavailable",
+]
