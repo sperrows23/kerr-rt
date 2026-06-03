@@ -421,6 +421,52 @@ spurious tiny footprint (over-sharp aliasing at the shadow edge).
 This eliminates the per-pixel offset ray (halving the geodesic workload) at the
 cost of one extra (cheap) shading pass over a 2D field.
 
+### Fidelity note — texture-mip LOD vs. DNGR ray bundles (FLAGGED, no code change)
+
+**Logged 2026-06-04 after comparing the implementation against `pdf.md` (DNGR,
+James et al. 2015, Appendix A.2 ray bundles + A.3.1 spatial filtering). This is
+an architectural caveat for human review — it does NOT change Formula 10, which
+is correctly implemented and faithful to the paper *as a single-ray AA filter*.**
+
+What matches the paper (confirmed correct, do not "fix"):
+
+- Our celestial coordinate is the Boyer-Lindquist exit angle pair {θ′, φ′}.
+  That is exactly the paper's local-sky→celestial-sphere map (their step v).
+  There is no separate "asymptotic direction" to recover — the BL exit angles
+  *are* the celestial coordinate.
+- `J = √(δθ² + sin²θ·δφ²)`, `L = log2(W·J/2π)` is a faithful scalar reduction of
+  the ray bundle's solid-angle change, and is the correct filter for **extended**
+  background (the paper filters disks / nebulae / dust this way — A.3.1 bullet 3,
+  A.6).
+
+Where our architecture structurally diverges from DNGR (the part to review):
+
+1. **Point stars must not blur.** DNGR's #1 stated benefit (A.3.1): *"images of
+   our unresolved stars remain small; they don't stretch when magnified by
+   gravitational lensing"* — magnification is converted to **brightness**, not
+   blur (bullet 2), by keeping a **point-star catalog** and collecting each star
+   into a finite beam. We bake stars into a 16K equirect **texture** and mip-blur
+   it, so magnification necessarily smears stars into arcs and dims them (visible
+   as arc-smearing of the lensed star field). This is a data-model choice
+   (baked texture vs. point catalog), NOT a Formula-10 error.
+2. **Anisotropy.** DNGR tracks the full beam ellipse (major δ⁺, minor δ⁻,
+   orientation µ). We collapse to the scalar `J = max(Jx, Jy)`. Near critical
+   curves magnification is highly anisotropic (large tangential, tiny radial),
+   so the scalar over-blurs radially. The within-architecture analog is an
+   anisotropic / EWA texture filter — but note EWA still blurs point stars, so
+   it only helps extended structure, not point-star fidelity (item 1).
+3. **Finite `r_max`.** We read exit angles at `r = r_max` (50); the paper's
+   celestial sphere is `r = ∞`. Small truncation residual; raise `r_max` or
+   extrapolate if {θ′, φ′} convergence ever matters. Not the dominant effect.
+
+Verified separately: the brown "starless" wash in `scripts/gpu_test_disk.png`
+is the **lensed/embedded accretion disk** (camera at `r=18`, inside `r_outer=25`,
+near the equatorial plane → nearly every ray accumulates disk emission), NOT
+LOD-coarsened stars. Disk-off renders show the full lensed star field is present.
+The exit-interpolation fix (see `_screen_jacobian_lod` / `render_beauty_physics`
+escape branch) removed step-overshoot jitter and brought the undeflected-corner
+LOD from ≈4.2 down to ≈2.3 (≈ ideal 1.74 + real geometric magnification).
+
 ---
 
 ## Formula 11 — FP32-stable factored discriminant (variable transform)
