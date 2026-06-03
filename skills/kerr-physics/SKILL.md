@@ -423,7 +423,8 @@ cost of one extra (cheap) shading pass over a 2D field.
 
 ### Fidelity note — texture-mip LOD vs. DNGR ray bundles (FLAGGED, no code change)
 
-**Logged 2026-06-04 after comparing the implementation against `pdf.md` (DNGR,
+**Logged 2026-06-04 after comparing the implementation against
+`REFERENCE_dngr_paper.md` (DNGR,
 James et al. 2015, Appendix A.2 ray bundles + A.3.1 spatial filtering). This is
 an architectural caveat for human review — it does NOT change Formula 10, which
 is correctly implemented and faithful to the paper *as a single-ray AA filter*.**
@@ -472,7 +473,7 @@ LOD from ≈4.2 down to ≈2.3 (≈ ideal 1.74 + real geometric magnification).
 ## Formula 11 — FP32-stable factored discriminant (variable transform)
 
 **Source:** algebraic identity of Formula 1's Δ. Added 2026-06-02 for FP32
-horizon stability (guid.md Phase 1.2/1.3). **Not new physics** — a factoring that
+horizon stability (optimization Phase 1.2/1.3; see PROJECT.md §6). **Not new physics** — a factoring that
 removes catastrophic cancellation in `r²−2r+a²` near the horizon.
 
 ```
@@ -495,7 +496,7 @@ integrator. Recover `r = y + r₊` for potentials that need `r` explicitly.
 
 **Source:** Mino-time μ = cosθ substitution of the verbatim Formula 6 Θ(θ).
 Standard reduction (cf. DNGR Appendix A; Carter 1968). Added 2026-06-02 for the
-North-pole FP32 blowout fix (guid.md Phase 1.3). **This is a coordinate
+North-pole FP32 blowout fix (optimization Phase 1.3; see PROJECT.md §6). **This is a coordinate
 substitution of an existing formula, not a new physical law** — but it is entered
 here per the project rule that any new factored/substituted form gets a number.
 
@@ -588,7 +589,7 @@ configs/render.yaml              ← a, r_isco, WIDTH, HEIGHT, step counts
 | v1.1 | **F6:** Corrected Carter constant to null geodesic form (−a²E², not a²(1−E²)). **F7:** Corrected lapse α to exact form using A = (r²+a²)²−a²Δsin²θ. **F9:** Documented that blackbody_rgb returns chromaticity only; clarified g⁴ is not double-counted, but will be if a physical Planck spectrum is substituted. |
 | v1.2 | **F6:** Removed the leftover massive-particle `μ²r²` term from the radial potential `R(r)`; the null (μ=0) form drops it. The previous form gave `g^{μν}p_μp_ν = −r²/Σ`, breaking the null-condition conservation test. |
 | v1.3 | **F10:** Added 2π normalization to the LOD formula — φ spans 2π radians across the 16384-texel starmap width, so dividing by 2π correctly maps the angular footprint to a texel footprint. Also switched to raw per-pixel exit deltas (δθ, δφ) rather than dividing by δu=1/WIDTH. The missing factor caused LOD to saturate at max mip for all background pixels, collapsing the LOD-on render to near-black. |
-| v1.4 | **F10:** Added the screen-space Jacobian amendment (eliminate the offset ray; difference exit directions of neighbor pixels in a second shading kernel; same J/L; captured-neighbor ⇒ max_lod). **F11 (new):** FP32-stable factored discriminant Δ = y(y+2k). **F12 (new):** singularity-free polar potential Θ_u(u) for the u=cosθ state transform, with the `v_r=Δ·p_r → v_y=Δ·p_r` invariant migration, `p_θ=−v_u/√(1−u²)` recovery, and the approved polar guard on dφ/dt only. All three approved by the project owner 2026-06-02 for the guid.md optimization. |
+| v1.4 | **F10:** Added the screen-space Jacobian amendment (eliminate the offset ray; difference exit directions of neighbor pixels in a second shading kernel; same J/L; captured-neighbor ⇒ max_lod). **F11 (new):** FP32-stable factored discriminant Δ = y(y+2k). **F12 (new):** singularity-free polar potential Θ_u(u) for the u=cosθ state transform, with the `v_r=Δ·p_r → v_y=Δ·p_r` invariant migration, `p_θ=−v_u/√(1−u²)` recovery, and the approved polar guard on dφ/dt only. All three approved by the project owner 2026-06-02 for the renderer optimization (PROJECT.md §6). |
 
 *Last verified: 2026-05. Do not update formulas without re-verifying against
 primary sources listed in each section.*
