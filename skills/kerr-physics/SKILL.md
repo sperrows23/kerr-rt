@@ -669,7 +669,7 @@ src/renderer/geodesic.py         ← Formulas 1, 6, 7
 src/renderer/disk.py             ← Formulas 2, 3, 4, 5, 8, 9
 src/renderer/starmap.py          ← Formula 10
 src/renderer/taichi_renderer.py  ← Formulas 10, 13 (screen-space Jacobian, μ, star splat)
-scripts/ingest_stars.py          ← Formula 13 catalog pre-processing (BSC → I_base, T, θ′, φ′)
+scripts/ingest_stars.py          ← Formula 13 catalog pre-processing (BSC5 → {θ′, φ′, flux_rgb}.npy; I_base·chroma folded into flux)
 tests/test_geodesic.py           ← Conservation tests (Formula 6 conserved quantities)
 configs/render.yaml              ← a, r_isco, WIDTH, HEIGHT, step counts, stars:*
 ```

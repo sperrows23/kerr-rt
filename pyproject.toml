@@ -27,7 +27,7 @@ package = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "scripts"]  # scripts/ exposes ingest_stars transforms for tests
 markers = [
     "gpu: GPU/CUDA regression tests; skipped automatically when CUDA is unavailable",
 ]

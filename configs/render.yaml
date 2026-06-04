@@ -36,6 +36,15 @@ starmap:
   path: star_image/starmap_2020_16k.exr
   width: 16384             # equirect map width; LOD uses log2(width)
 
+# Point-star catalog (Formula 13 / PROJECT.md §8 Layer A). Part A = offline ingest
+# only: scripts/ingest_stars.py reads source_catalog and writes catalog_path. The
+# DNGR GPU star-gather render path (§8 Phases 2-5) is not wired up yet.
+starfield:
+  source_catalog: assets/bsc5.dat    # raw Yale Bright Star Catalogue (V/50 bsc5.dat, ascii)
+  catalog_path: assets/stars_bsc.npy # ingest output: float32 [N,5] = theta', phi', flux_r, flux_g, flux_b
+  mag_limit: 6.5                     # drop stars fainter than this apparent V mag (~naked-eye limit)
+  mag_zero_point: 0.0                # linear flux = 10^(-0.4*(Vmag - mag_zero_point)); sets overall scale
+
 camera:
   default_radius: 6.03
   default_fov_deg: 90.0

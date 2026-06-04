@@ -8,6 +8,8 @@ tests/**/test_*/
 render_blackhole/
 render_spaceship/
 star_image/
+# Point-star ingest I/O: raw BSC5 catalogue + generated .npy (scripts/ingest_stars.py)
+assets/
 *.exr
 camera_matrix.json
 # Preview / diagnostic / GPU-test images
