@@ -150,7 +150,7 @@ def setup_renderer(cfg: dict) -> Starmap:
 
 
 def _horizon_constants(a: float) -> tuple[float, float]:
-    """Precompute FP32-stable horizon constants (guid 1.1 / Formula 11).
+    """Precompute FP32-stable horizon constants (optimization Phase 1.1 / Formula 11).
 
     Returns ``(k_horizon, r_plus)`` with ``k_horizon = √(1−a²)`` and the *true*
     outer horizon ``r₊ = 1 + k_horizon``. NOTE: this is derived from ``a`` in
@@ -267,7 +267,7 @@ def _project(s, E, Lz, Q, a, k, r_plus):
 @ti.func
 def _rk4_delta(s, E, Lz, Q, a, k, r_plus, h):
     # RK4 increment Δs (before projection); split out so the loop can apply
-    # Kahan compensated summation to the state accumulation (guid 1.4).
+    # Kahan compensated summation to the state accumulation (optimization Phase 1.4).
     k1 = _deriv(s, E, Lz, Q, a, k, r_plus)
     k2 = _deriv(s + 0.5 * h * k1, E, Lz, Q, a, k, r_plus)
     k3 = _deriv(s + 0.5 * h * k2, E, Lz, Q, a, k, r_plus)
@@ -284,7 +284,7 @@ def _rk4_step(s, E, Lz, Q, a, k, r_plus, h):
 
 @ti.func
 def _rk4_step_kahan(s, c, E, Lz, Q, a, k, r_plus, h):
-    """Compensated (Kahan) RK4 step (guid 1.4). Returns ``(s_next, c_next)``.
+    """Compensated (Kahan) RK4 step (optimization Phase 1.4). Returns ``(s_next, c_next)``.
 
     Kahan summation on the state accumulation keeps the slowly-growing position
     components (y, u, φ, t) from losing low-order bits over hundreds of small
@@ -388,26 +388,6 @@ def _sample_level(level, u, v):
     top = c00 * (1.0 - du) + c10 * du
     bot = c01 * (1.0 - du) + c11 * du
     return top * (1.0 - dv) + bot * dv
-
-
-@ti.func
-def _normalize_sphere(theta, phi):
-    """Fold raw integrator (θ, φ) onto the standard sphere: θ ∈ [0, π].
-
-    Mirrors ``renderer.starmap.normalize_sphere_angles`` (the host single source
-    of truth). Rays with near-zero L_z on the center column push θ slightly
-    negative (polar punch-through); reflecting across the pole
-    (θ→|θ|, φ→φ+π) maps that back to the same physical direction in canonical
-    form, so neither the UV lookup nor the Formula 10 Jacobian sees a θ outside
-    [0, π]. Pure coordinate identity — no physics, no formula re-derivation.
-    """
-    th = theta - _TWO_PI * ti.floor(theta / _TWO_PI)   # → [0, 2π)
-    ph = phi
-    if th > math.pi:
-        th = _TWO_PI - th                              # reflect across nearer pole
-        ph = ph + math.pi                              # ... + half turn in azimuth
-    ph = ph - _TWO_PI * ti.floor(ph / _TWO_PI)         # → [0, 2π)
-    return vec2(th, ph)
 
 
 @ti.func
@@ -575,7 +555,7 @@ def render_pipe_a(res: int, tan_half_fov: float, r_cam: float,
 
         sp = vec6(y_cam, u_cam, phi_cam, 0.0, vy_p, vu_p)
         so = vec6(y_cam, u_cam, phi_cam, 0.0, vy_o, vu_o)
-        c_sp = vec6(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)   # Kahan compensation (guid 1.4)
+        c_sp = vec6(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)   # Kahan compensation (optimization Phase 1.4)
         c_so = vec6(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
         out_p = _RUNNING
@@ -672,15 +652,15 @@ def render_beauty_physics(width: int, height: int,
 
     Writes the per-pixel exit state to ``exit_buf`` (u_exit, φ_exit, outcome), the
     front-to-back disk accumulation to ``disk_buf`` (disk_rgb, transmittance), and
-    the transmittance-weighted Mino-affine Z to ``depth_pixels`` (guid 3.4). The
+    the transmittance-weighted Mino-affine Z to ``depth_pixels`` (optimization Phase 3.4). The
     Formula-10 LOD + background lookup are deferred to ``render_beauty_shade``,
     which differences neighbor exit directions in screen space (SKILL.md F10
     amendment v1.4). Eliminating the offset ray halves the geodesic workload.
 
-    Adaptive Mino step (guid 2.2): ``h = d_lambda·max(adaptive_floor, y/(y+2))`` —
+    Adaptive Mino step (optimization Phase 2.2): ``h = d_lambda·max(adaptive_floor, y/(y+2))`` —
     full steps far out, shrinking toward the horizon (y→0).
 
-    ``projection_mode`` (guid 4.1): 0 = perspective (camera basis + FOV), 1 =
+    ``projection_mode`` (optimization Phase 4.1): 0 = perspective (camera basis + FOV), 1 =
     equirectangular 360° (px→lon, py→lat in the local ZAMO frame, for VR output).
 
     State is [y, u, φ, t, v_y, v_u] (Formula 11/12): y = r − r₊, u = cosθ.
@@ -689,14 +669,14 @@ def render_beauty_physics(width: int, height: int,
     u_cam = ti.cos(theta_cam)
     r_capture = 2.0 - r_plus      # r < 2 ⇔ y < 2 − r₊
     y_escape = r_max - r_plus     # r ≥ r_max ⇔ y ≥ r_max − r₊
-    y_inner = r_inner - r_plus    # disk bbox in y (guid 3.3)
+    y_inner = r_inner - r_plus    # disk bbox in y (optimization Phase 3.3)
     y_outer = r_outer - r_plus
     for py, px in ti.ndrange(height, width):
         npr_r = fwd_r
         npr_th = fwd_th
         npr_ph = fwd_ph
         if projection_mode == 1:
-            # Equirectangular 360° ray-gen (guid 4.1): screen → (lon, lat) →
+            # Equirectangular 360° ray-gen (optimization Phase 4.1): screen → (lon, lat) →
             # local ZAMO-frame direction. No tan_half_fov perspective math.
             lon = (px + 0.5) / width * 2.0 * math.pi          # azimuth ∈ [0, 2π)
             lat = (py + 0.5) / height * math.pi               # polar ∈ [0, π]
@@ -719,7 +699,7 @@ def render_beauty_physics(width: int, height: int,
                                             npr_r, npr_th, npr_ph)
 
         sp = vec6(y_cam, u_cam, phi_cam, 0.0, vy_p, vu_p)
-        c_sp = vec6(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)   # Kahan compensation (guid 1.4)
+        c_sp = vec6(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)   # Kahan compensation (optimization Phase 1.4)
 
         out_p = _RUNNING
         u_p_exit = u_cam
@@ -728,17 +708,17 @@ def render_beauty_physics(width: int, height: int,
         disk_col = vec3(0.0, 0.0, 0.0)
         transm = 1.0
         ray_length = 0.0          # accumulated Mino-affine path length (depth proxy)
-        weighted_depth = 0.0      # Σ ray_length·contribution  (guid 3.4)
+        weighted_depth = 0.0      # Σ ray_length·contribution  (optimization Phase 3.4)
         total_emission = 0.0      # Σ contribution
 
         step = 0
         while step < n_steps and out_p == _RUNNING:
-            # Adaptive step (guid 2.2): shrink toward the horizon (y→0). Computed
+            # Adaptive step (optimization Phase 2.2): shrink toward the horizon (y→0). Computed
             # BEFORE the disk emit so the same h is used as the emission path
             # element ds — otherwise the variable step desyncs the Riemann sum.
             local_h = d_lambda * ti.max(adaptive_floor, sp[0] / (sp[0] + 2.0))
             # Pipe B: accumulate disk emission at the current point (front-to-back).
-            # guid 3.3 bounding-box early-out: skip the disk math entirely unless the
+            # optimization Phase 3.3 bounding-box early-out: skip the disk math entirely unless the
             # sample is inside the equatorial slab (|u|<sin θ_half) and radial band.
             if disk_enabled == 1 and ti.abs(sp[1]) < bound_sin_half \
                     and sp[0] >= y_inner and sp[0] <= y_outer:
@@ -748,7 +728,7 @@ def render_beauty_physics(width: int, height: int,
                                 theta_half, sigma_frac, T_0, emis_c, absb_c,
                                 local_h)
                 disk_col += transm * vec3(ev[0], ev[1], ev[2])
-                # guid 3.4: transmittance-weighted depth (contribution = T·emission).
+                # optimization Phase 3.4: transmittance-weighted depth (contribution = T·emission).
                 contribution = transm * (ev[0] + ev[1] + ev[2])
                 weighted_depth += ray_length * contribution
                 total_emission += contribution
@@ -811,7 +791,7 @@ def render_beauty_physics(width: int, height: int,
         disk_buf[py, px, 1] = disk_col[1]
         disk_buf[py, px, 2] = disk_col[2]
         disk_buf[py, px, 3] = transm
-        # guid 3.4: emission-weighted mean depth, or +∞ sentinel for empty pixels.
+        # optimization Phase 3.4: emission-weighted mean depth, or +∞ sentinel for empty pixels.
         if total_emission > 1e-6:
             depth_pixels[py, px] = weighted_depth / total_emission
         else:
@@ -899,162 +879,6 @@ def render_beauty_shade(width: int, height: int, lod_enabled: int):
         frame_pixels[py, px, 2] = col[2]
 
 
-# --------------------------------------------------------------------------- #
-# Seam-isolation diagnostics (Gate 2 follow-up — NOT part of the render path)
-# --------------------------------------------------------------------------- #
-@ti.kernel
-def render_starmap_raw(res: int, lod: ti.f32):
-    """Diagnostic 1: direct equirect sky dump at a FIXED mip LOD.
-
-    No geodesic, no lensing. Screen (px,py) maps straight to (u=φ/2π, v=θ/π)
-    and samples the pyramid. If a seam shows here it lives in the starmap data /
-    mip pyramid itself (the φ-wrap of the pyramid is at the u=0/1 image edges).
-    """
-    for py, px in ti.ndrange(res, res):
-        u = (ti.cast(px, ti.f32) + 0.5) / res
-        v = (ti.cast(py, ti.f32) + 0.5) / res
-        col = _sample_trilinear(u, v, lod)
-        pixels[py, px, 0] = col[0]
-        pixels[py, px, 1] = col[1]
-        pixels[py, px, 2] = col[2]
-
-
-@ti.kernel
-def render_fixed_lod(res: int, tan_half_fov: float, r_cam: float,
-                     theta_cam: float, phi_cam: float, a: float,
-                     k_horizon: float, r_plus: float,
-                     r_max: float, n_steps: int, d_lambda: float,
-                     lod_fixed: ti.f32):
-    """Diagnostic 2: full geodesic lensing (primary ray only) with mip LOD
-    PINNED to ``lod_fixed`` for every escaped pixel.
-
-    Removes the Jacobian entirely. If a seam appears here but not in
-    Diagnostic 1, it is a ray-classification boundary (escaped vs captured),
-    not a starmap/mip issue.
-    """
-    y_cam = r_cam - r_plus
-    u_cam = ti.cos(theta_cam)
-    r_capture = 2.0 - r_plus
-    y_escape = r_max - r_plus
-    for py, px in ti.ndrange(res, res):
-        npr_r, npr_th, npr_ph = _ray_dir(ti.cast(px, ti.f32), ti.cast(py, ti.f32),
-                                         ti.cast(res, ti.f32), tan_half_fov)
-        Ep, Lp, Qp, vy_p, vu_p = _zamo_init(r_cam, theta_cam, a, k_horizon, r_plus,
-                                            npr_r, npr_th, npr_ph)
-        sp = vec6(y_cam, u_cam, phi_cam, 0.0, vy_p, vu_p)
-        out_p = _RUNNING
-        u_p_exit = u_cam
-        ph_p_exit = phi_cam
-        step = 0
-        while step < n_steps and out_p == _RUNNING:
-            if _delta_y(sp[0], k_horizon) < _DELTA_MIN:
-                out_p = _CAPTURED
-            else:
-                sp = _rk4_step(sp, Ep, Lp, Qp, a, k_horizon, r_plus, d_lambda)
-                if _delta_y(sp[0], k_horizon) < _DELTA_MIN or sp[0] < r_capture:
-                    out_p = _CAPTURED
-                elif sp[0] >= y_escape:
-                    out_p = _ESCAPED
-                    u_p_exit = sp[1]
-                    ph_p_exit = sp[2]
-            step += 1
-        col = vec3(0.0, 0.0, 0.0)
-        if out_p == _ESCAPED:
-            # u = cosθ keeps θ_exit ∈ [0, π]; recover θ and wrap φ (no polar fold).
-            th_p_n = ti.acos(ti.min(ti.max(u_p_exit, -1.0), 1.0))
-            u = ph_p_exit / (2.0 * math.pi)
-            u = u - ti.floor(u)
-            v = ti.min(ti.max(th_p_n / math.pi, 0.0), 1.0)
-            col = _sample_trilinear(u, v, lod_fixed)
-        pixels[py, px, 0] = col[0]
-        pixels[py, px, 1] = col[1]
-        pixels[py, px, 2] = col[2]
-
-
-# Per-column exit-state dump buffer: [phi_exit_raw, theta_exit, outcome].
-phi_dump: ti.Field = None          # type: ignore[assignment]
-
-
-@ti.kernel
-def dump_phi_exit(res: int, row_y: int, tan_half_fov: float, r_cam: float,
-                  theta_cam: float, phi_cam: float, a: float,
-                  k_horizon: float, r_plus: float,
-                  r_max: float, n_steps: int, d_lambda: float):
-    """Diagnostic 3: trace the PRIMARY ray for every column of a single screen row
-    and record the *raw accumulated* exit azimuth ``phi_exit`` (no mod/frac), the
-    exit ``theta`` (= acos(u_exit)), and the outcome code. Reveals whether adjacent
-    columns wind by different multiples of 2π (the branch-cut hypothesis)."""
-    y_cam = r_cam - r_plus
-    u_cam = ti.cos(theta_cam)
-    r_capture = 2.0 - r_plus
-    y_escape = r_max - r_plus
-    for px in range(res):
-        npr_r, npr_th, npr_ph = _ray_dir(ti.cast(px, ti.f32), ti.cast(row_y, ti.f32),
-                                         ti.cast(res, ti.f32), tan_half_fov)
-        Ep, Lp, Qp, vy_p, vu_p = _zamo_init(r_cam, theta_cam, a, k_horizon, r_plus,
-                                            npr_r, npr_th, npr_ph)
-        sp = vec6(y_cam, u_cam, phi_cam, 0.0, vy_p, vu_p)
-        out_p = _RUNNING
-        u_p_exit = u_cam
-        ph_p_exit = phi_cam
-        step = 0
-        while step < n_steps and out_p == _RUNNING:
-            if _delta_y(sp[0], k_horizon) < _DELTA_MIN:
-                out_p = _CAPTURED
-            else:
-                sp = _rk4_step(sp, Ep, Lp, Qp, a, k_horizon, r_plus, d_lambda)
-                if _delta_y(sp[0], k_horizon) < _DELTA_MIN or sp[0] < r_capture:
-                    out_p = _CAPTURED
-                elif sp[0] >= y_escape:
-                    out_p = _ESCAPED
-                    u_p_exit = sp[1]
-                    ph_p_exit = sp[2]
-            step += 1
-        phi_dump[px, 0] = ph_p_exit
-        phi_dump[px, 1] = ti.acos(ti.min(ti.max(u_p_exit, -1.0), 1.0))
-        phi_dump[px, 2] = ti.cast(out_p, ti.f32)
-
-
-def _phi_dump() -> None:
-    """Gate-2 root-cause probe: dump per-column exit azimuth across a screen row."""
-    global phi_dump
-
-    cfg = load_config()
-    setup_renderer(cfg)
-
-    res = int(cfg["render"]["thumb_width"])
-    th = cfg["thumb"]
-    a = float(cfg["black_hole"]["spin"])
-    cam = cfg["camera"]
-    r_cam = float(th.get("camera_radius", cam["default_radius"]))
-    fov_deg = float(th.get("fov_deg", cam["default_fov_deg"]))
-    theta_cam = math.radians(float(th["camera_theta_deg"]))
-    n_steps = int(cfg["render"]["max_steps_pipe_a"])
-    d_lambda = float(cfg["render"]["d_lambda_pipe_a"])
-    r_max = float(cfg["render"]["r_max"])
-    tan_half_fov = math.tan(math.radians(fov_deg) / 2.0)
-    row_y = res // 2
-
-    k_horizon, r_plus = _horizon_constants(a)
-    phi_dump = ti.field(dtype=ti.f32, shape=(res, 3))
-    dump_phi_exit(res, row_y, tan_half_fov, r_cam, theta_cam, 0.0, a,
-                  k_horizon, r_plus, r_max, n_steps, d_lambda)
-    ti.sync()
-    d = phi_dump.to_numpy()
-
-    two_pi = 2.0 * math.pi
-    names = {0: "RUN", 1: "ESC", 2: "CAP"}
-    print(f"phi_exit dump  row y={row_y}  (res={res})")
-    print(f"{'col':>4} {'out':>4} {'phi_raw':>10} {'phi/2pi':>9} "
-          f"{'frac_u':>8} {'atan2_u':>8} {'theta':>8}")
-    for px in range(183, 193):
-        ph = float(d[px, 0]); th_e = float(d[px, 1]); out = int(round(d[px, 2]))
-        frac_u = ph / two_pi - math.floor(ph / two_pi)
-        atan2_u = (math.atan2(math.sin(ph), math.cos(ph)) + math.pi) / two_pi
-        print(f"{px:>4} {names.get(out, '?'):>4} {ph:>10.4f} {ph/two_pi:>9.4f} "
-              f"{frac_u:>8.4f} {atan2_u:>8.4f} {th_e:>8.4f}")
-
-
 def render_pipe_a_image(cfg: dict, res: int, lod_enabled: bool) -> np.ndarray:
     """Render one Pipe A frame at ``res×res`` and return a float32 (res,res,3) HDR."""
     bh = cfg["black_hole"]
@@ -1111,7 +935,10 @@ def render_beauty_frame(cfg: dict, cam_frame: dict, width: int, height: int,
     # is ~0.1% at r≈18 and is neglected for the camera placement only).
     x, y, z = float(pos[0]), float(pos[1]), float(pos[2])
     r_cam = math.sqrt(x * x + y * y + z * z)
-    theta_cam = math.acos(z / r_cam)
+    # Clamp the cosine to [-1, 1]: fp rounding can push z/r_cam slightly out of
+    # domain at the poles, which would make acos return NaN. Matches the clamping
+    # already applied to every in-kernel acos.
+    theta_cam = math.acos(min(1.0, max(-1.0, z / r_cam)))
     phi_cam = math.atan2(y, x)
 
     st, ct = math.sin(theta_cam), math.cos(theta_cam)
@@ -1190,7 +1017,7 @@ def _rotate_z(vec, dphi: float):
 def render_beauty_frame_mb(cfg: dict, cam_frame: dict, width: int, height: int,
                            shutter_arc: float, with_disk: bool = True,
                            lod_enabled: bool = True, return_depth: bool = False):
-    """Temporal motion blur (guid 4.2) by host-side averaging of jittered sub-frames.
+    """Temporal motion blur (optimization Phase 4.2) by host-side averaging of jittered sub-frames.
 
     Renders ``render.motion_blur_samples`` copies of the frame with the camera
     rotated about the spin axis across the shutter arc ``shutter_arc`` (radians of
@@ -1255,104 +1082,3 @@ def tonemap(hdr: np.ndarray, exposure: float, gamma: float) -> np.ndarray:
     img = np.clip(img, 0.0, 1.0)
     img = np.power(img, 1.0 / gamma)
     return (img * 255.0 + 0.5).astype(np.uint8)
-
-
-def _gate2_lod_test() -> None:
-    """Render the two Gate-2 LOD comparison images at 256×256."""
-    from PIL import Image
-
-    cfg = load_config()
-    setup_renderer(cfg)
-
-    res = int(cfg["render"]["thumb_width"])
-    th = cfg["thumb"]
-    exposure = float(th.get("exposure", 1.0)) * 3.0  # lift the LDR starmap nebulae
-    gamma = float(th["gamma"])
-
-    out_dir = _ROOT / "scripts"
-    for lod_on, name in ((False, "test_lod_off.png"), (True, "test_lod_on.png")):
-        hdr = render_pipe_a_image(cfg, res, lod_enabled=lod_on)
-        finite = np.isfinite(hdr)
-        nan_count = int((~finite).sum())
-        img = tonemap(np.nan_to_num(hdr), exposure, gamma)
-        Image.fromarray(img, mode="RGB").save(out_dir / name)
-        nonblack = float((hdr.sum(axis=2) > 1e-6).mean())
-        print(f"{name}: lod={'on' if lod_on else 'off(L=0)'}  "
-              f"hdr[min={hdr.min():.4g} max={hdr.max():.4g}]  "
-              f"non-black px={nonblack*100:.1f}%  NaN={nan_count}")
-    print(f"Saved both LOD test images to {out_dir}")
-
-
-def _probe_columns(img: np.ndarray, res: int):
-    """Find the strongest interior column-to-column luma jump (the 'seam') and
-    return (seam_col, jump_magnitude). img is uint8 (res,res,3)."""
-    luma = img.astype(np.float32).mean(axis=2).mean(axis=0)   # per-column mean over rows
-    d = np.abs(np.diff(luma))                                  # len res-1
-    lo, hi = 5, res - 6
-    k = lo + int(np.argmax(d[lo:hi]))                          # jump between col k and k+1
-    return k + 1, float(d[k])
-
-
-def _seam_diag() -> None:
-    """Gate-2 seam isolation: render the two diagnostic frames and report
-    where (if anywhere) a vertical seam appears."""
-    from PIL import Image
-
-    cfg = load_config()
-    setup_renderer(cfg)
-
-    res = int(cfg["render"]["thumb_width"])
-    th = cfg["thumb"]
-    exposure = float(th.get("exposure", 1.0)) * 3.0
-    gamma = float(th["gamma"])
-    out_dir = _ROOT / "scripts"
-    y = res // 2
-
-    def _save_and_probe(name: str, hdr: np.ndarray) -> None:
-        img = tonemap(np.nan_to_num(hdr), exposure, gamma)
-        Image.fromarray(img, mode="RGB").save(out_dir / name)
-        sx, jump = _probe_columns(img, res)
-        print(f"{name}: hdr[min={hdr.min():.4g} max={hdr.max():.4g}]  "
-              f"seam@col={sx} (jump={jump:.1f} luma)")
-        print(f"    y={y}  col{sx-1}={tuple(int(v) for v in img[y, sx-1])}  "
-              f"col{sx}={tuple(int(v) for v in img[y, sx])}  "
-              f"col{sx+1}={tuple(int(v) for v in img[y, sx+1])}")
-        print(f"    y={y}  wrap-edges: col0={tuple(int(v) for v in img[y, 0])}  "
-              f"col1={tuple(int(v) for v in img[y, 1])}  "
-              f"col{res-1}={tuple(int(v) for v in img[y, res-1])}")
-
-    _alloc_output(res)
-
-    # Diagnostic 1: raw equirect starmap at fixed L=3 (no geodesic, no lensing).
-    render_starmap_raw(res, 3.0)
-    ti.sync()
-    _save_and_probe("test_starmap_raw.png", pixels.to_numpy())
-
-    # Diagnostic 2: geodesic lensing, primary ray only, LOD pinned to L=3.
-    a = float(cfg["black_hole"]["spin"])
-    cam = cfg["camera"]
-    r_cam = float(th.get("camera_radius", cam["default_radius"]))
-    fov_deg = float(th.get("fov_deg", cam["default_fov_deg"]))
-    theta_cam = math.radians(float(th["camera_theta_deg"]))
-    n_steps = int(cfg["render"]["max_steps_pipe_a"])
-    d_lambda = float(cfg["render"]["d_lambda_pipe_a"])
-    r_max = float(cfg["render"]["r_max"])
-    tan_half_fov = math.tan(math.radians(fov_deg) / 2.0)
-    k_horizon, r_plus = _horizon_constants(a)
-    render_fixed_lod(res, tan_half_fov, r_cam, theta_cam, 0.0, a,
-                     k_horizon, r_plus, r_max, n_steps, d_lambda, 3.0)
-    ti.sync()
-    _save_and_probe("test_fixed_lod.png", pixels.to_numpy())
-
-    print(f"Saved seam diagnostics to {out_dir}")
-
-
-if __name__ == "__main__":
-    import sys
-
-    if len(sys.argv) > 1 and sys.argv[1] == "seam":
-        _seam_diag()
-    elif len(sys.argv) > 1 and sys.argv[1] == "phidump":
-        _phi_dump()
-    else:
-        _gate2_lod_test()

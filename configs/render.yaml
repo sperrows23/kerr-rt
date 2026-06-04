@@ -8,19 +8,18 @@ render:
   height: 2160
   thumb_width: 256
   thumb_height: 256
-  max_steps_pipe_a: 250
-  max_steps_pipe_b: 200
+  max_steps_pipe_a: 250        # Pipe B (volumetric disk march) shares this same trace loop / step cap
   r_max: 50.0
   device_memory_gb: 6.0
   d_lambda_pipe_a: 0.01        # Mino-time step for Pipe A geodesic integration
   horizon_epsilon: 0.05        # Δ-capture stop before the horizon (was hardcoded _DELTA_MIN)
-  adaptive_step_floor: 0.005   # guid 2.2: lower bound on the y-scaled adaptive step factor
+  adaptive_step_floor: 0.005   # optimization Phase 2.2: lower bound on the y-scaled adaptive step factor
   sin2_min: 1.0e-10            # polar guard on dφ/dλ, dt/dλ denominators only (Formula 12)
   j_fold: 0.15                 # background LOD fold-saturation: escaped pixels whose screen-space exit footprint J(rad) exceeds this straddle the spin-axis meridian caustic -> collapse to coarsest mip (kills the center "static" seam)
-  motion_blur_samples: 4       # guid 4.2: temporal jitter samples per pixel
-  fps: 24.0                    # animation frame rate; shutter arc = dphi*fps*shutter_fraction (guid 4.2)
-  projection_mode: perspective # perspective | equirect (guid 4.1; perspective keeps the Doppler check valid)
-  depth_infinity: 1.0e5        # guid 3.4: Z value written to pixels with no disk emission
+  motion_blur_samples: 4       # optimization Phase 4.2: temporal jitter samples per pixel
+  fps: 24.0                    # animation frame rate; shutter arc = dphi*fps*shutter_fraction (optimization Phase 4.2)
+  projection_mode: perspective # perspective | equirect (optimization Phase 4.1; perspective keeps the Doppler check valid)
+  depth_infinity: 1.0e5        # optimization Phase 3.4: Z value written to pixels with no disk emission
 
 disk:
   r_inner: 1.182
@@ -30,7 +29,7 @@ disk:
   emission_coeff: 8.0      # volumetric emission scale (visualization)
   absorption_coeff: 1.5    # volumetric absorption scale (visualization)
   vertical_sigma_frac: 0.5 # gaussian scale height as fraction of theta_half_width
-  bounding_sin_theta_half: 0.14944  # = sin(theta_half_width=0.15); guid 3.3 |u| early-out
+  bounding_sin_theta_half: 0.14944  # = sin(theta_half_width=0.15); optimization Phase 3.3 |u| early-out
 
 # Background starmap for Pipe A escaped-ray lookup (Formula 10 differential mip LOD).
 starmap:
@@ -40,7 +39,7 @@ starmap:
 camera:
   default_radius: 6.03
   default_fov_deg: 90.0
-  shutter_fraction: 0.020833   # 1/48 s shutter interval for relativistic motion blur (guid 4.2)
+  shutter_fraction: 0.020833   # 1/48 s shutter interval for relativistic motion blur (optimization Phase 4.2)
 
 # Thumbnail preview renderer (scripts/thumb.py) display/framing parameters.
 # Pure visualization parameters: they control look, not physics.

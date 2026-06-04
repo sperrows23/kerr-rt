@@ -7,9 +7,9 @@ physics — it drives the *production* entrypoint ``render_beauty_frame`` (the s
 code path ``scripts/gpu_test.py`` and ``scripts/export_exr.py`` use) and asserts on
 the rendered HDR buffer.
 
-It automates the manual smoke check that IMPLEMENTATION_PLAN.md calls the "real
-physics regression guard" (``scripts/gpu_test.py``'s left/right Doppler-asymmetry
-test), turning it into a pytest that CI can run unattended.
+It automates the manual "real physics regression guard" (``scripts/gpu_test.py``'s
+left/right Doppler-asymmetry smoke check; see PROJECT.md §6), turning it into a
+pytest that CI can run unattended.
 
 What it guarantees, per frame (frame 0 of ``camera_matrix.json``, disk on):
 
@@ -22,6 +22,9 @@ What it guarantees, per frame (frame 0 of ``camera_matrix.json``, disk on):
   3. Disk emission peak — the brightest pixel (the beamed disk edge) must match a
      pinned reference within tolerance. Drift flags a change in the disk emission
      / redshift chain (Formulas 3/4/5/8/9).
+  4. Spin-axis seam (A4) — no sharp vertical luminance discontinuity at the center
+     column (the spin-axis meridian caustic). Guards the committed center-seam
+     fold-saturation fix against a silent regression from a future LOD change.
 
 CUDA is mandatory (the backend is LOCKED to ``ti.init(arch=ti.cuda)`` per
 CLAUDE.md). On a host without a working CUDA backend the whole module skips
@@ -68,6 +71,11 @@ _DOPPLER_RATIO_MIN = 7.0      # baseline 7.77× (matches gpu_test "≈7–8×" g
 _DOPPLER_RATIO_MAX = 8.5
 _DISK_MAX_REF = 12.7707       # peak HDR (disk emission edge); rel tol below
 _DISK_MAX_RTOL = 0.05
+
+# Spin-axis seam guard (A4): max tolerated ratio of the center-column luminance
+# jump to the median background jump. Measured ≈1.9× on the fixed code path; a
+# reintroduced static band is a dominant vertical discontinuity (many× median).
+_SEAM_JUMP_OVER_MEDIAN_MAX = 6.0
 
 
 @pytest.fixture(scope="module")
@@ -124,12 +132,32 @@ def beauty_frame() -> dict:
     # == disk_buf max), so hdr.max() guards the disk emission peak via public API.
     disk_max = float(np.nan_to_num(hdr).max())
 
+    # Spin-axis meridian seam guard (A4). The committed center-seam fix collapses
+    # escaped pixels straddling the spin-axis meridian caustic to the coarsest mip,
+    # killing the former center "static" band. Measure column-to-column smoothness
+    # at the center column in the TOP sky band (above the edge-on disk), averaging
+    # over rows so isolated point stars wash out while a persistent vertical seam
+    # survives. Reference: the center jump is ~1.9× the median background jump on
+    # the fixed code path; a reintroduced static band spikes far above that.
+    safe_lum = np.nan_to_num(lum)
+    top = safe_lum[: safe_lum.shape[0] // 5, :]
+    col_mean = top.mean(axis=0)
+    col_diff = np.abs(np.diff(col_mean))
+    c = w // 2
+    seam_center_jump = float(col_diff[c - 4:c + 4].max())
+    # Baseline background variation: interior columns, excluding the center
+    # neighborhood so the seam under test can't inflate its own reference.
+    interior = np.concatenate([col_diff[5:c - 4], col_diff[c + 4:-5]])
+    seam_bg_median = float(np.median(interior))
+
     return {
         "nan_count": nan_count,
         "doppler_ratio": doppler_ratio,
         "disk_max": disk_max,
         "left": left,
         "right": right,
+        "seam_center_jump": seam_center_jump,
+        "seam_bg_median": seam_bg_median,
     }
 
 
@@ -148,3 +176,13 @@ def test_disk_peak_matches_reference(beauty_frame):
     assert beauty_frame["disk_max"] == pytest.approx(
         _DISK_MAX_REF, rel=_DISK_MAX_RTOL
     )
+
+
+def test_no_spin_axis_seam(beauty_frame):
+    # The center "static" seam (spin-axis meridian caustic) would reappear as a
+    # sharp vertical luminance discontinuity at the center column if a future LOD
+    # change regressed the committed fold-saturation fix. Pin it to a smoothness
+    # bound relative to the surrounding sky.
+    jump = beauty_frame["seam_center_jump"]
+    baseline = max(beauty_frame["seam_bg_median"], 1e-9)
+    assert jump / baseline <= _SEAM_JUMP_OVER_MEDIAN_MAX
