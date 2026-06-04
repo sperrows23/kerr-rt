@@ -205,6 +205,7 @@ Black/
 ├── scripts/
 │   ├── thumb.py                 ← CPU preview renderer (development / QA)
 │   ├── gpu_test.py              ← FHD GPU beauty render smoke test
+│   ├── seam_diagnostics.py      ← spin-axis seam isolation tools (off the render path; ex-§7 C1)
 │   └── export_exr.py            ← Phase 5: multi-channel RGBAZ EXR writer (OpenImageIO)
 ├── skills/
 │   └── kerr-physics/
@@ -219,7 +220,7 @@ Black/
 │       ├── geodesic.py          ← Mino-time RK4 null geodesic integrator (Formula 6)
 │       ├── disk.py              ← Accretion disk gas physics (Formulas 3/4/5/8/9) — FROZEN
 │       ├── starmap.py           ← 16K HDRI loader, mip pyramid, UV mapping
-│       └── taichi_renderer.py   ← GPU renderer: Pipe A + Pipe B, split kernels (1358 lines)
+│       └── taichi_renderer.py   ← GPU renderer: Pipe A + Pipe B, split kernels (~1084 lines)
 ├── tests/
 │   ├── cuda_smoke_test.py       ← confirms CUDA backend JIT on RTX 5060
 │   ├── test_geodesic.py         ← conservation law tests (E, Lz, Q, null norm)
@@ -277,7 +278,7 @@ ground truth), `normalize_sphere_angles` (polar punch-through fold),
 `direction_to_uv`. Equirect convention `u = φ/2π` (col), `v = θ/π` (row, north pole
 at v=0). Used by `taichi_renderer.py` (GPU upload) and `test_starmap.py`.
 
-**`src/renderer/taichi_renderer.py`** — the GPU renderer (1358 lines). Ports the CPU
+**`src/renderer/taichi_renderer.py`** — the GPU renderer (~1084 lines). Ports the CPU
 physics to Taichi and runs both pipes on CUDA in the horizon-stable
 `[y, u, φ, t, v_y, v_u]` state. Backend locked to `ti.init(arch=ti.cuda)`.
 
@@ -291,15 +292,15 @@ physics to Taichi and runs both pipes on CUDA in the horizon-stable
   plunging branch uses factored Δ); `_blackbody_rgb` (F9); `_disk_emit` (F8/9,
   recovers p_r=v_y/Δ, p_θ=−v_u/√(1−u²)).
 - *Starmap `@ti.func`:* `_texel`, `_sample_level` (bilinear, φ-wrap + θ-clamp),
-  `_sample_trilinear`. *(`_normalize_sphere` at line 394 also exists but is now
-  unreferenced — see §7 C2.)*
+  `_sample_trilinear`. *(The formerly-unreferenced `_normalize_sphere` helper was
+  deleted — §7 C2, resolved 2026-06-04.)*
 - *Kernels:* `render_pipe_a` (Pipe A only, square; retains its offset ray as the
   dev LOD reference); **`render_beauty_physics`** (production K1 — traces, writes
   exit/outcome + weighted Z, wraps φ into (−π,π] each step, shortest-arc exit
   interp); **`render_beauty_shade`** (production K2 — screen-space Jacobian → LOD,
   composites; `_screen_jacobian_lod` saturates LOD to `_MAX_LOD` when J >
-  `render.j_fold`); diagnostics `render_starmap_raw`, `render_fixed_lod`,
-  `dump_phi_exit` *(see §7 C1)*.
+  `render.j_fold`). *(The `render_starmap_raw` / `render_fixed_lod` / `dump_phi_exit`
+  seam diagnostics now live in `scripts/seam_diagnostics.py` — §7 C1, resolved.)*
 - *Host:* `load_config` (UTF-8), `setup_renderer` (cuda init + starmap upload),
   `_alloc_output`/`_alloc_frame`, `render_pipe_a_image`,
   **`render_beauty_frame`** (main entry — Blender world→BL, camera triad, runs
@@ -388,7 +389,7 @@ export_camera.py(in Blender) ──▶ camera_matrix.json ──▶ gpu_test.py 
 | Section | Key fields |
 |---------|-----------|
 | `black_hole` | `spin` (a=0.999), `r_isco` (1.182 M), `r_plus` (1.0447 M — true outer horizon r₊=1+√(1−a²); consumed only by `thumb.py`, the renderer derives r₊ in `_horizon_constants`) |
-| `render` | `width`/`height` (4K), `thumb_width/height` (256), `max_steps_pipe_a` (250), `max_steps_pipe_b` (200 — **declared but unused**, see §7 F4), `d_lambda_pipe_a` (0.01), `r_max` (50 M), `device_memory_gb` (6), `horizon_epsilon` (0.05), `adaptive_step_floor` (0.005), `sin2_min` (1e-10 polar guard), `j_fold` (0.15 — background LOD fold-saturation; kills the center "static" seam), `fps` (24.0 — shutter arc = Δφ·fps·shutter_fraction), `projection_mode` (perspective\|equirect), `depth_infinity` (1e5 no-disk Z sentinel) |
+| `render` | `width`/`height` (4K), `thumb_width/height` (256), `max_steps_pipe_a` (250 — Pipe B shares this same trace loop / step cap; the dead `max_steps_pipe_b` key was removed, §7 F4), `d_lambda_pipe_a` (0.01), `r_max` (50 M), `device_memory_gb` (6), `horizon_epsilon` (0.05), `adaptive_step_floor` (0.005), `sin2_min` (1e-10 polar guard), `j_fold` (0.15 — background LOD fold-saturation; kills the center "static" seam), `fps` (24.0 — shutter arc = Δφ·fps·shutter_fraction), `projection_mode` (perspective\|equirect), `depth_infinity` (1e5 no-disk Z sentinel) |
 | `disk` | `r_inner`, `r_outer`, `theta_half_width`, `T_0`, `emission_coeff`, `absorption_coeff`, `vertical_sigma_frac`, `bounding_sin_theta_half` (=sin(theta_half_width); bbox early-out) |
 | `starmap` | `path` (relative to repo root), `width` (16384 — used to compute LOD) |
 | `camera` | `default_radius` (6.03 M), `default_fov_deg` (90°), `shutter_fraction` (1/48 s — `export_exr._shutter_arc` reads this with `render.fps` as `arc = Δφ·fps·shutter_fraction`) |
@@ -412,6 +413,7 @@ export_camera.py(in Blender) ──▶ camera_matrix.json ──▶ gpu_test.py 
 | 10 | Differential-ray mip LOD: J = √(δθ² + sin²θ·δφ²); L = log₂(W·J/2π). **v1.4 amendment:** J may be estimated in screen space from the 4-neighbourhood exit directions (kernel-split LOD) instead of an offset ray |
 | 11 | FP32-stable factored discriminant: Δ = (r−r₊)(r−r₋) = y(y+2k), y=r−r₊, k=√(1−a²) |
 | 12 | Singularity-free polar potential under u=cosθ: Θ_u(u) = (1−u²)(Q+a²E²u²) − L_z²u²; the 1/sin²θ pole cancels (dφ/dλ, dt/dλ keep a `sin2_min` guard) |
+| 13 | Hybrid DNGR (rev v1.5): screen-space 2×2 ray-bundle Jacobian J → point-star magnification μ = \|det J₀·sinθ′₀\|/\|det J·sinθ′\| → energy-conserving flux `I = I_base·μ·g⁴` with truncated-Gaussian PSF. Point stars **brighten**, don't smear. **Phase-0 only** (§8); 3 guards flagged pending owner approval; no renderer code yet |
 
 Decisions of record (from `CLAUDE.md`): Decision A = ZAMO tetrad (F7); Decision B =
 simple temperature model T = T₀·(6/r)^0.75.
@@ -453,6 +455,19 @@ The full 5-phase optimization from `guid.md` (the now-superseded source spec) is
   the legacy `Δφ·0.5` at 24 fps). *Verified:* pytest green incl. F3; Doppler 7.77×;
   the static band renders as a smooth faint line; j_fold saturates ~1.2% of escaped
   pixels.
+- **Code-review cleanup (2026-06-04):** landed the trivial/safe review findings —
+  **A3** (host `acos(z/r_cam)` clamped to [−1,1], NaN-safe at the poles), **C2**
+  (dead `_normalize_sphere` deleted), **C1** (seam diagnostics moved out to
+  `scripts/seam_diagnostics.py`; production module ~1358→1084 lines), and **F4**
+  (dead `render.max_steps_pipe_b` key removed; the shared-cap note now lives on
+  `max_steps_pipe_a`). No physics or render output changed. Remaining open findings:
+  F5, A1, A4 (see §7).
+- **Formula 13 — Hybrid DNGR (SKILL.md, 2026-06-04):** the screen-space ray-bundle
+  Jacobian / point-star magnification / truncated-Gaussian-PSF formulation was
+  verified against `REFERENCE_dngr_paper.md` and merged into `SKILL.md` (rev v1.5).
+  This is the Phase-0 physics deliverable of the §8 rearchitecture; **no renderer
+  code yet**, and three guards (μ normalization, boundary inheritance, g⁴ exponent)
+  remain flagged for owner approval before implementation.
 
 *Note — `render_pipe_a`* (the 256² dev LOD kernel for `_gate2_lod_test`) was
 migrated to `[y,u,…]` but **intentionally keeps its offset ray** as the offset-ray
@@ -471,51 +486,54 @@ re-derive. **`disk.py`, `geodesic.py`/`metric.py` CPU references, and any
 
 | ID | Item | State | Class |
 |----|------|-------|-------|
-| **F4** | `render.max_steps_pipe_b: 200` declared but read by no kernel (Pipe B shares the Pipe A loop) | Open — recommend **remove** the key + note that Pipe B shares `max_steps_pipe_a`; *wire* only with a real perf motive (behaviour change → Doppler + disk-max re-check) | Config |
+| **F4** | `render.max_steps_pipe_b` declared but read by no kernel (Pipe B shares the Pipe A loop) | ✅ **Resolved (2026-06-04)** — dead key removed from `render.yaml`; `max_steps_pipe_a`'s comment now records that Pipe B shares the same trace loop / step cap | Config |
 | **F5** | Docstring / cross-ref drift after the `[y,u,…]` migration (GPU side only; the CPU `[r,θ,…]` docstring in `geodesic.py` is correct, leave it) | Open — comments-only pass over `taichi_renderer.py`; copy from §3 of this file. Do **not** let it drift into a `disk.py`/physics edit | Docs |
 | **3.1/3.2** | Ship depth occlusion (early ray termination vs. Blender ship Z) | **Blocked** on a Blender ship Z-depth EXR asset. Sequence when unblocked: produce the asset → derive & document the Mino-affine ↔ camera-Z mapping → wire `ti.Texture(r32f)` + early-out behind an off-by-default flag → validate on a synthetic plane. **Biggest correctness trap:** `ray_length` is Mino-affine, not metric/Blender-Z | Asset + code |
 | **2.3** | Hardware `ti.Texture` starmap + `sample_lod` | **Deferred (external)** — Taichi 1.7.4 has no mip-upload API; revisit only after a Taichi upgrade is independently justified and re-validated on sm_120 (CLAUDE.md pins 1.7.4) | External |
 | **T3** | Moving-camera observer model (camera peculiar velocity, not just ZAMO) | **Roadmap, gated** — needs a new `SKILL.md` tetrad-boost formula approved (human review) before any code; high risk if rushed (sign/normalization) | Physics (gated) |
 
-### Code-review findings (open, verified against current code)
+### Code-review findings (verified against current code)
 
-From a comprehensive review; documented, not yet applied — confirmed present on
-inspection:
+From a comprehensive review. A3, C1 and C2 are **resolved** (2026-06-04); the rest
+are documented, not yet applied — confirmed present on inspection:
 
 - **A1 — camera FOV axis label.** `export_camera.py:33` writes `"fov": cam.angle`
   commented "vertical FOV in radians," but Blender's `cam.angle` is the
   **larger-dimension** FOV (horizontal for a landscape sensor). If the renderer
   treats it as vertical, the framing/scale is off. **Verify** against Blender's
   sensor-fit before changing; if confirmed, derive the vertical FOV explicitly.
-- **A3 — host `acos` domain.** `taichi_renderer.py:1114`
-  `theta_cam = math.acos(z / r_cam)` has **no clamp**; a slightly-out-of-range
-  `z/r_cam` (fp rounding at the poles) yields NaN. Every *in-kernel* `acos` is
-  already clamped — only this host line is exposed. Low-cost fix: clamp to [−1, 1].
+- **A3 — host `acos` domain.** ✅ **RESOLVED (2026-06-04).**
+  `taichi_renderer.py:941` now reads
+  `theta_cam = math.acos(min(1.0, max(-1.0, z / r_cam)))` — the input is clamped to
+  [−1, 1], so fp rounding at the poles can no longer yield NaN. (Matches the
+  in-kernel `acos(clamp(...))` pattern used everywhere else.)
 - **A4 — no automated seam regression.** The center-seam fix has no test pinning it;
   a future LOD change could silently reintroduce the static band. Consider extending
   `test_gpu_regression.py` with a spin-axis-meridian smoothness assertion.
-- **C1 — diagnostics in the production module.** `render_starmap_raw`,
-  `render_fixed_lod`, `dump_phi_exit` (and the `__main__` block) live in
-  `taichi_renderer.py` (~lines 906–1045, 1320+). Harmless but bloat the production
-  module; consider moving to `scripts/` or a `diagnostics` module.
-- **C2 — dead code.** `_normalize_sphere` (`taichi_renderer.py:394`) has **no call
-  sites** (the `[y,u,…]` migration made `acos(clamp(u))` the exit path). Safe to
-  delete.
+- **C1 — diagnostics in the production module.** ✅ **RESOLVED (2026-06-04).**
+  `render_starmap_raw`, `render_fixed_lod`, `dump_phi_exit` (and the `__main__`
+  block) were extracted from `taichi_renderer.py` to `scripts/seam_diagnostics.py`,
+  which imports the production `@ti.func` helpers by name (no physics re-implemented).
+  The production module is now ~1084 lines.
+- **C2 — dead code.** ✅ **RESOLVED (2026-06-04).** `_normalize_sphere` has been
+  deleted from `taichi_renderer.py` (no call sites remained — the `[y,u,…]`
+  migration made `acos(clamp(u))` the exit path).
 
 ### Recommended order (when approved)
 
-1. **F5** docstring refresh (zero risk, do while context is fresh).
-2. **A3** acos clamp · **C2** delete dead `_normalize_sphere` (trivial, safe).
-3. **F4** remove `max_steps_pipe_b` (dead key).
-4. **C1** move diagnostics out of the production module.
-5. **A1** confirm + fix the FOV axis (needs a Blender check first).
-6. **A4** add the seam regression assertion.
-7. **3.1/3.2** ship occlusion (blocked on the asset + unit mapping).
-8. **2.3** `ti.Texture` (external; after a justified Taichi upgrade).
-9. **T3** moving camera (gated on an approved SKILL formula).
+1. ~~**A3** acos clamp · **C2** delete dead `_normalize_sphere` · **C1** move
+   diagnostics to `scripts/seam_diagnostics.py` · **F4** remove `max_steps_pipe_b`~~
+   ✅ **done (2026-06-04).**
+2. **F5** docstring refresh (zero risk, do while context is fresh).
+3. **A1** confirm + fix the FOV axis (needs a Blender check first).
+4. **A4** add the seam regression assertion.
+5. **3.1/3.2** ship occlusion (blocked on the asset + unit mapping).
+6. **2.3** `ti.Texture` (external; after a justified Taichi upgrade).
+7. **T3** moving camera (gated on an approved SKILL formula).
 
 ```
-F3(done) ─┬─▶ F5 · A3 · C2 · F4 · C1 · A1 · A4
+A3 · C2 · C1 · F4 (done) ────────────────────────────────────
+F3(done) ─┬─▶ F5 · A1 · A4
           └─▶ 3.1/3.2  (also needs: ship-Z asset + unit-mapping note)
 2.3  ◀── (external) Taichi > 1.7.4 re-validated on sm_120
 T3   ◀── (gated)   new SKILL.md tetrad-boost formula approved
@@ -525,11 +543,14 @@ T3   ◀── (gated)   new SKILL.md tetrad-boost formula approved
 
 ## 8. Future proposal — DNGR background rearchitecture (gated)
 
-**Status: proposal, no code.** Replaces the baked-texture star field with the
-*Interstellar* DNGR treatment — **point stars stay sharp; gravitational lensing
-changes their brightness, not their size.** Every new lensing formula it introduces
-(magnification, ray-bundle ellipse) is routed through `SKILL.md` for human approval
-**first**, exactly as Formula 10 was. The just-landed `j_fold` seam fix is a
+**Status: Phase 0 formula merged (SKILL.md Formula 13, rev v1.5, 2026-06-04); no
+renderer code yet.** Replaces the baked-texture star field with the *Interstellar*
+DNGR treatment — **point stars stay sharp; gravitational lensing changes their
+brightness, not their size.** Every new lensing formula it introduces (magnification,
+ray-bundle Jacobian) is routed through `SKILL.md` for human approval **first**,
+exactly as Formula 10 was — the screen-space-Jacobian magnification + PSF are now
+**Formula 13** there, with three guards (μ normalization, boundary inheritance, g⁴
+exponent) still flagged for owner sign-off before Phase 1 coding begins. The just-landed `j_fold` seam fix is a
 **stopgap** that restores the "smooth faint line" look; it does not make the lensed
 star field correct — that is this proposal's job.
 
@@ -612,7 +633,7 @@ frames bit-for-bit; keep `pytest` green + a new `test_starfield_dngr.py`.
 
 | Phase | Deliverable | Risk |
 |---|---|---|
-| 0 | SKILL.md: `mag` + ellipse formulas, get approval | none (gate) |
+| 0 | SKILL.md: `mag` + Jacobian formulas, get approval | ✅ **merged as Formula 13** (v1.5); 3 guards pending owner sign-off |
 | 1 | Catalog ingest → `{θ′,φ′,flux_rgb}.npy`; B−V→RGB reuse | low |
 | 2 | FD beam Jacobian + `mag`; ellipse `(δ⁺,δ⁻,µ)` | med |
 | 3 | Layer A star gather (cell grid) + PSF splat | med |

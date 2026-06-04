@@ -9,6 +9,7 @@ Load this skill whenever the task involves:
 - Photon momentum initialization (tetrad)
 - Doppler beaming, redshift, or g-factor computation
 - Anti-aliasing / mipmap LOD for the starmap
+- Point-star magnification, ray-bundle Jacobian, or star PSF (Formula 13)
 - Any formula involving `r_isco`, `E_I`, `L_I`, `u^t`, `u^r`, `u^phi`, `g-factor`, `Carter Q`
 
 ---
@@ -531,6 +532,98 @@ have `L_z→0`, making the term removable there.
 
 ---
 
+## Formula 13 — Hybrid DNGR: ray-bundle Jacobian, magnification, and point-star PSF
+
+**Source:** Adapted from James et al. (2015) §2.2, Appendix A.2 (ray-bundle
+solid-angle propagation) and A.3.1 (point-star handling). The DNGR paper derives
+the bundle's solid angle from the geodesic-deviation ellipse `(δ⁺, δ⁻, µ)` via the
+Pineault–Roeder equations; this formula instead estimates the **same** solid-angle
+change with the **screen-space finite-difference Jacobian** already approved in
+Formula 10 amendment v1.4. **Not a re-derivation** — it is the 2×2 matrix
+generalization of Formula 10's scalar `J = max(Jx, Jy)`, and it resolves the two
+architectural divergences that the Formula 10 *fidelity note* flagged for review:
+(#1 point stars must brighten, not blur; #2 anisotropic magnification). Verified
+against `REFERENCE_dngr_paper.md` 2026-06-04.
+
+**Purpose:** Render background catalog stars as 0-D points whose **flux brightens**
+under gravitational lensing (rather than smearing into arcs as the baked-texture
+starmap of Formula 10 does). Stars use a point catalog; the equirect texture +
+mip-LOD of Formula 10 remains for *extended* background (galactic dust / nebulae).
+
+### 1. Screen-space lensing Jacobian J
+
+Reuse the stored per-pixel exit angles `(θ′, φ′)` (the celestial-sphere BL exit
+direction — Formula 7 / `exit_buf`). Finite-difference against the +x and +y
+neighbor pixels (identical source data to `_screen_jacobian_lod`):
+
+```
+        ⎡ ∂θ′/∂x   ∂θ′/∂y ⎤
+J  =    ⎢                  ⎥        # 2×2, columns = +x and +y neighbor deltas
+        ⎣ ∂φ′/∂x   ∂φ′/∂y ⎦
+
+∂θ′/∂x = θ′(py, px+1) − θ′(py, px)          θ′ = acos(clamp(u_exit, −1, 1))
+∂φ′/∂x = wrap_pi( φ′(py, px+1) − φ′(py, px) )    # wrap_pi as in Formula 10 v1.4
+   (and likewise the +y column with the (py+1, px) neighbor)
+```
+
+J maps a screen-pixel area element to its distorted footprint on the celestial
+sphere at `r = r_max` (the same finite-`r_max` truncation noted in Formula 10).
+
+### 2. Gravitational magnification μ
+
+The magnification is the ratio of image (camera-pixel) solid angle to source
+(celestial-sphere) solid angle. The source area element is `sinθ′·dθ′·dφ′`, so the
+source footprint per pixel is `sinθ′·|det J|`:
+
+```
+det J = (∂θ′/∂x)(∂φ′/∂y) − (∂θ′/∂y)(∂φ′/∂x)
+
+μ = |det J₀ · sinθ′₀|  /  |det J · sinθ′|        # ← normalized form (use this)
+```
+
+where `(det J₀, sinθ′₀)` is the **flat-space (undeflected) per-pixel footprint**.
+At critical curves `det J → 0` (paper's `δ⁻ → 0`) so `μ → ∞`; clamp `min(μ, MAG_MAX)`.
+
+**⚠ Refinement notes — FLAGGED 2026-06-04, pending owner approval:**
+
+- **Normalization (the `det J₀` term):** the bare `μ = 1/|det J·sinθ′|` of `plus.md`
+  equals 1 in flat space *only* if `(x, y)` carry true local-sky solid-angle units.
+  With raw **pixel-index** differences, `det J` carries a constant `(rad/pixel)²`
+  factor and a finite-FOV geometric baseline — the same effect Formula 10 records as
+  "undeflected-corner LOD ≈ 2.3 (≈ ideal 1.74 + geometric)". Divide by the flat-space
+  footprint so `μ → 1` undeflected. (Compute `det J₀·sinθ′₀` from an undeflected
+  reference render, or analytically from the pixel's local-sky solid angle.)
+- **Boundary rules (inherit Formula 10 v1.4 verbatim):** if any neighbor used in the
+  difference did **not** `ESCAPE`, or if the footprint straddles the spin-axis seam
+  (`J > j_fold`), `det J` is invalid → clamp `μ = 1` (do not brighten). This mirrors
+  the `outcome != ESCAPED → max_lod` and `J > _J_FOLD` guards already in the LOD path.
+
+### 3. Energy-conserving point flux and truncated Gaussian PSF
+
+```
+I_final     = I_base · μ · g⁴                       # bolometric point-source flux
+I_pixel(d)  = I_final · exp( −d² / (2σ²) )           # truncated Gaussian splat, |d| < d_max
+```
+
+- **`μ · g⁴` is not double-counted:** μ is the geometric solid-angle magnification
+  (lensing); `g⁴` is the relativistic Doppler/redshift beaming of bolometric
+  specific intensity (Formula 9, **volumetric** exponent — the correct one for an
+  unresolved point-source *flux*). They are physically independent, exactly as the
+  paper keeps frequency shift (ray-trace step vii) separate from beam solid angle
+  (A.2). For a **static** camera with stars at the celestial sphere, `g ≈ 1`; the
+  factor only bites under camera motion — keep it as a hook. *(g⁴ choice flagged
+  2026-06-04, pending owner approval.)*
+- **`d`** is the screen-space distance from the pixel center to the star's projected
+  center; `σ` is config-driven (paper sets the beam's initial radius to twice the
+  pixel separation, targeting a ≤2% peak-to-trough flicker). The truncation `|d| < d_max`
+  keeps the splat local. This is the A.3.1 anti-flicker filter, verbatim in intent.
+
+**Net effect:** stars stay sharp, circular, and point-like while their *brightness*
+tracks the lensing magnification — the A.3.1 / A.7 behavior the baked-texture
+Formula 10 path structurally cannot achieve for point stars.
+
+---
+
 ## Conservation test requirements
 
 The pytest harness must verify all three of the following along every
@@ -575,8 +668,10 @@ skills/kerr-physics/SKILL.md     ← this file
 src/renderer/geodesic.py         ← Formulas 1, 6, 7
 src/renderer/disk.py             ← Formulas 2, 3, 4, 5, 8, 9
 src/renderer/starmap.py          ← Formula 10
+src/renderer/taichi_renderer.py  ← Formulas 10, 13 (screen-space Jacobian, μ, star splat)
+scripts/ingest_stars.py          ← Formula 13 catalog pre-processing (BSC → I_base, T, θ′, φ′)
 tests/test_geodesic.py           ← Conservation tests (Formula 6 conserved quantities)
-configs/render.yaml              ← a, r_isco, WIDTH, HEIGHT, step counts
+configs/render.yaml              ← a, r_isco, WIDTH, HEIGHT, step counts, stars:*
 ```
 
 ---
@@ -590,6 +685,7 @@ configs/render.yaml              ← a, r_isco, WIDTH, HEIGHT, step counts
 | v1.2 | **F6:** Removed the leftover massive-particle `μ²r²` term from the radial potential `R(r)`; the null (μ=0) form drops it. The previous form gave `g^{μν}p_μp_ν = −r²/Σ`, breaking the null-condition conservation test. |
 | v1.3 | **F10:** Added 2π normalization to the LOD formula — φ spans 2π radians across the 16384-texel starmap width, so dividing by 2π correctly maps the angular footprint to a texel footprint. Also switched to raw per-pixel exit deltas (δθ, δφ) rather than dividing by δu=1/WIDTH. The missing factor caused LOD to saturate at max mip for all background pixels, collapsing the LOD-on render to near-black. |
 | v1.4 | **F10:** Added the screen-space Jacobian amendment (eliminate the offset ray; difference exit directions of neighbor pixels in a second shading kernel; same J/L; captured-neighbor ⇒ max_lod). **F11 (new):** FP32-stable factored discriminant Δ = y(y+2k). **F12 (new):** singularity-free polar potential Θ_u(u) for the u=cosθ state transform, with the `v_r=Δ·p_r → v_y=Δ·p_r` invariant migration, `p_θ=−v_u/√(1−u²)` recovery, and the approved polar guard on dφ/dt only. All three approved by the project owner 2026-06-02 for the renderer optimization (PROJECT.md §6). |
+| v1.5 | **F13 (new):** Hybrid DNGR point-star magnification — screen-space ray-bundle Jacobian J (2×2 generalization of F10's scalar J), magnification μ = \|det J₀·sinθ′₀\|/\|det J·sinθ′\|, and energy-conserving point flux `I_base·μ·g⁴` with a truncated-Gaussian PSF. Verified against `REFERENCE_dngr_paper.md` (James et al. 2015, A.2/A.3.1/A.7) on 2026-06-04. Resolves the F10 fidelity-note divergences #1 (point-star blur) and #2 (anisotropy). **⚠ Three guards FLAGGED pending owner approval:** (a) μ normalization by the flat-space footprint `det J₀·sinθ′₀`; (b) ESCAPE/`j_fold` boundary clamp `μ=1` (inherited from F10 v1.4); (c) g⁴ exponent choice for stars. |
 
-*Last verified: 2026-05. Do not update formulas without re-verifying against
-primary sources listed in each section.*
+*Last verified: 2026-06-04 (F13 against `REFERENCE_dngr_paper.md`). Do not update
+formulas without re-verifying against primary sources listed in each section.*
