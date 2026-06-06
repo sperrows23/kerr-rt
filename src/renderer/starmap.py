@@ -73,9 +73,7 @@ def build_mip_pyramid(base_rgb: np.ndarray) -> list[np.ndarray]:
         h2, w2 = h // 2, w // 2
         # Trim any odd row/col before the 2x2 fold (equirect dims here are powers of 2).
         c = cur[: 2 * h2, : 2 * w2, :]
-        folded = 0.25 * (
-            c[0::2, 0::2, :] + c[1::2, 0::2, :] + c[0::2, 1::2, :] + c[1::2, 1::2, :]
-        )
+        folded = 0.25 * (c[0::2, 0::2, :] + c[1::2, 0::2, :] + c[0::2, 1::2, :] + c[1::2, 1::2, :])
         levels.append(folded.astype(np.float16))
         cur = folded
 
@@ -86,13 +84,13 @@ def build_mip_pyramid(base_rgb: np.ndarray) -> list[np.ndarray]:
 class Starmap:
     """Loaded starmap with its mip pyramid and derived constants."""
 
-    levels: list[np.ndarray]   # level 0 = full res, each (Hk, Wk, 3) float16
-    width: int                 # base width (== levels[0].shape[1])
-    height: int                # base height
-    max_lod: float             # log2(width) — the LOD clamp ceiling (Formula 10)
+    levels: list[np.ndarray]  # level 0 = full res, each (Hk, Wk, 3) float16
+    width: int  # base width (== levels[0].shape[1])
+    height: int  # base height
+    max_lod: float  # log2(width) — the LOD clamp ceiling (Formula 10)
 
     @classmethod
-    def load(cls, path: str) -> "Starmap":
+    def load(cls, path: str) -> Starmap:
         base = load_equirect(path)
         levels = build_mip_pyramid(base)
         h, w = levels[0].shape[:2]
@@ -115,7 +113,7 @@ class Starmap:
         dv = fv - v0
 
         x0 = int(u0) % w
-        x1 = (x0 + 1) % w          # wrap in phi
+        x1 = (x0 + 1) % w  # wrap in phi
         y0 = min(max(int(v0), 0), h - 1)
         y1 = min(max(int(v0) + 1, 0), h - 1)  # clamp in theta
 
@@ -163,10 +161,10 @@ def celestial_to_uv(dx: float, dy: float, dz: float) -> tuple[float, float]:
     the phi-wrap below.
     """
     norm = math.sqrt(dx * dx + dy * dy + dz * dz)
-    if norm == 0.0:                       # degenerate guard (never happens for a ray)
+    if norm == 0.0:  # degenerate guard (never happens for a ray)
         return 0.0, 0.0
     theta = math.acos(min(max(dz / norm, -1.0), 1.0))
     phi = math.atan2(dy, dx)
-    u = (phi / TWO_PI) % 1.0              # wrap azimuth into [0, 1)
+    u = (phi / TWO_PI) % 1.0  # wrap azimuth into [0, 1)
     v = min(max(theta / math.pi, 0.0), 1.0)
     return u, v

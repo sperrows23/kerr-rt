@@ -62,6 +62,7 @@ from __future__ import annotations
 import argparse
 import csv
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
@@ -81,7 +82,7 @@ _TWO_PI = 2.0 * np.pi
 
 
 def load_config(path: Path = _CONFIG_PATH) -> dict:
-    with open(path, "r", encoding="utf-8") as fh:  # utf-8: Windows cp949 box
+    with open(path, encoding="utf-8") as fh:  # utf-8: Windows cp949 box
         return yaml.safe_load(fh)
 
 
@@ -146,7 +147,7 @@ def _f(text: str) -> float | None:
         return None
 
 
-def parse_bsc5_record(line: str):
+def parse_bsc5_record(line: str) -> tuple[float, float, float, float] | None:
     """Parse one BSC5 line -> (theta', phi', Vmag, B-V), or None to skip.
 
     Records with no position (e.g. nova/cluster placeholders) or no Vmag are
@@ -158,14 +159,13 @@ def parse_bsc5_record(line: str):
     rah, ram, ras = _f(line[75:77]), _f(line[77:79]), _f(line[79:83])
     de_sign = line[83:84]
     ded, dem, des = _f(line[84:86]), _f(line[86:88]), _f(line[88:90])
-    if (rah is None or ram is None or ras is None
-            or ded is None or dem is None or des is None):
+    if rah is None or ram is None or ras is None or ded is None or dem is None or des is None:
         return None  # no usable J2000 position
 
     vmag = _f(line[102:107]) if len(line) >= 107 else None
     if vmag is None:
         return None  # no photometry -> nothing to render
-    bv = (_f(line[109:114]) if len(line) >= 114 else None)
+    bv = _f(line[109:114]) if len(line) >= 114 else None
     if bv is None:
         bv = _DEFAULT_BV
 
@@ -183,7 +183,7 @@ def parse_bsc5_record(line: str):
 # --------------------------------------------------------------------------- #
 # HYG / ATHYG v3.2 CSV parser (header row; RA in hours, Dec in degrees)
 # --------------------------------------------------------------------------- #
-def parse_hyg_row(row: dict):
+def parse_hyg_row(row: dict) -> tuple[float, float, float, float] | None:
     """Parse one HYG/ATHYG CSV record -> (theta', phi', Vmag, B-V), or None to skip.
 
     Uses the named columns ``ra`` (hours), ``dec`` (deg), ``mag`` (apparent V) and
@@ -207,7 +207,7 @@ def parse_hyg_row(row: dict):
     if bv is None:
         bv = _DEFAULT_BV
 
-    ra_rad = np.deg2rad(ra_hours * 15.0)   # hours -> degrees -> radians
+    ra_rad = np.deg2rad(ra_hours * 15.0)  # hours -> degrees -> radians
     dec_rad = np.deg2rad(dec_deg)
     theta, phi = radec_to_theta_phi(ra_rad, dec_rad)
     return theta, phi, vmag, bv
@@ -224,16 +224,16 @@ def resolve_format(fmt: str, src_path: Path) -> str:
     return "hyg" if Path(src_path).suffix.lower() == ".csv" else "bsc5"
 
 
-def _iter_records(src_path: Path, fmt: str):
+def _iter_records(src_path: Path, fmt: str) -> Iterator[tuple[float, float, float, float]]:
     """Yield ``(theta', phi', Vmag, B-V)`` for every usable star in ``src_path``."""
     if fmt == "hyg":
-        with open(src_path, "r", encoding="utf-8", errors="replace", newline="") as fh:
+        with open(src_path, encoding="utf-8", errors="replace", newline="") as fh:
             for row in csv.DictReader(fh):
                 rec = parse_hyg_row(row)
                 if rec is not None:
                     yield rec
     elif fmt == "bsc5":
-        with open(src_path, "r", encoding="utf-8", errors="replace") as fh:
+        with open(src_path, encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 rec = parse_bsc5_record(line)
                 if rec is not None:
@@ -278,18 +278,33 @@ def main(argv: list[str] | None = None) -> int:
         description="Ingest a bright-star catalogue into a point-star flux table "
         "(Formula 13 / PROJECT.md §8 Layer A, Part A)."
     )
-    parser.add_argument("--config", type=Path, default=_CONFIG_PATH,
-                        help="render.yaml path (default: configs/render.yaml)")
-    parser.add_argument("--src", type=Path, default=None,
-                        help="override starfield.source_catalog (raw bsc5.dat)")
-    parser.add_argument("--out", type=Path, default=None,
-                        help="override starfield.catalog_path (output .npy)")
-    parser.add_argument("--mag-limit", type=float, default=None,
-                        help="override starfield.mag_limit (drop fainter stars)")
-    parser.add_argument("--format", choices=("auto", "hyg", "bsc5"), default=None,
-                        help="override starfield.format (auto = by file extension)")
-    parser.add_argument("-v", "--verbose", action="store_true",
-                        help="print a summary of the ingested catalog")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=_CONFIG_PATH,
+        help="render.yaml path (default: configs/render.yaml)",
+    )
+    parser.add_argument(
+        "--src", type=Path, default=None, help="override starfield.source_catalog (raw bsc5.dat)"
+    )
+    parser.add_argument(
+        "--out", type=Path, default=None, help="override starfield.catalog_path (output .npy)"
+    )
+    parser.add_argument(
+        "--mag-limit",
+        type=float,
+        default=None,
+        help="override starfield.mag_limit (drop fainter stars)",
+    )
+    parser.add_argument(
+        "--format",
+        choices=("auto", "hyg", "bsc5"),
+        default=None,
+        help="override starfield.format (auto = by file extension)",
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="print a summary of the ingested catalog"
+    )
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config)

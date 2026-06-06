@@ -2,7 +2,15 @@
 name = "kerr-black-hole-renderer"
 version = "0.1.0"
 description = "Offline renderer for a Kerr black hole (Taichi geodesic tracer + Blender pipeline)"
+readme = "README.md"
 requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Astronomy",
+    "Topic :: Multimedia :: Graphics :: 3D Rendering",
+]
 dependencies = [
     "numpy>=1.26",
     "pyyaml>=6.0",
@@ -30,4 +38,30 @@ testpaths = ["tests"]
 pythonpath = ["src", "scripts"]  # scripts/ exposes ingest_stars transforms for tests
 markers = [
     "gpu: GPU/CUDA regression tests; skipped automatically when CUDA is unavailable",
+]
+
+# Dev tooling only — not runtime deps. Install with `uv sync` (uv installs the
+# default group automatically) or `uv run --group dev ...`.
+[dependency-groups]
+dev = ["ruff>=0.6"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = [
+    # Vendored third-party reference renderers — not our code, never linted.
+    "Open_Source_Repository",
+    # Frozen, numerically-validated physics references (see CLAUDE.md): the CPU
+    # ground truth the GPU port is checked against. Never reformatted or auto-fixed.
+    "src/renderer/metric.py",
+    "src/renderer/geodesic.py",
+    "src/renderer/disk.py",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "C4", "SIM"]
+ignore = [
+    # `l` is the Kerr-Schild null covector lₐ — standard GR notation used verbatim
+    # from skills/kerr-physics/SKILL.md; renaming would diverge from the formulas.
+    "E741",
 ]

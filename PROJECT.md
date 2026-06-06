@@ -562,6 +562,18 @@ work below predates and is **superseded by** the CKS migration above):
   `tests/test_ingest_stars.py` (25; both parsers, no catalogue file needed). The HYG
   ingest yielded 8 877 stars at V ≤ 6.5 (raised to V ≤ 8.0 → 41 410 stars when `dngr`
   became the default 2026-06-06, to match the diffuse map's bright-star cutoff; §7 S6).
+- **Codebase modernization + README rewrite (2026-06-07):** non-behavioral tooling
+  and docs pass. Added a `ruff` lint/format config (`[tool.ruff]`, line-length 100,
+  rules `E/F/I/W/UP/B/C4/SIM`; `E741` ignored — `l` is the Kerr-Schild null covector;
+  `extend-exclude` covers `Open_Source_Repository/` and the frozen `metric.py`/
+  `geodesic.py`/`disk.py`) and a `[dependency-groups] dev = ["ruff>=0.6"]` group;
+  filled in `[project]` metadata (`readme`, `license`, classifiers). Applied `ruff`
+  fixes + format and added type hints to the pure-Python (non-Taichi, non-frozen)
+  functions in `scripts/thumb.py`, `export_exr.py`, `gpu_test.py`, `ingest_stars.py`.
+  Rewrote `README.md` for the CKS migration (BL→Cartesian Kerr-Schild header,
+  CKS-1..10 physics table, `dngr` as the default background). **No physics, numeric
+  values, or render output changed; frozen files untouched.** *Verified:* `ruff check`
+  / `ruff format --check` clean; pytest 40 passed (GPU deselected).
 
 *Note — `render_pipe_a`* (the 256² dev LOD kernel for `_gate2_lod_test`) was
 migrated to `[y,u,…]` but **intentionally keeps its offset ray** as the offset-ray

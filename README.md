@@ -6,8 +6,8 @@ A physically-based, GPU-accelerated offline renderer for a near-extremal **Kerr
 relativity prescribes, then composited with a Blender-animated spaceship into a
 finished shot.
 
-> Geometric units `G = M = c = 1` · Boyer–Lindquist coordinates `(t, r, θ, φ)` ·
-> metric signature `(− + + +)` · spin `a = 0.999` (near-extremal).
+> Geometric units `G = M = c = 1` · Cartesian Kerr-Schild coordinates `(t, x, y, z)`
+> (spin axis `+z`) · metric signature `(− + + +)` · spin `a = 0.999` (near-extremal).
 
 ---
 
@@ -25,9 +25,12 @@ codebase is its own project:
 
 - **Correctness over speed-at-any-cost.** Light paths near a spinning horizon are
   numerically vicious (catastrophic cancellation, coordinate singularities at the
-  poles and at the horizon). The renderer uses horizon-stable state variables, a
-  factored discriminant, a singularity-free polar potential, and Kahan-compensated
-  RK4 so the geodesics actually conserve their constants of motion.
+  poles and at the horizon). The renderer works in **Cartesian Kerr-Schild**
+  coordinates — a frame that is regular on both the spin axis and the horizon — with
+  an exact analytic inverse metric (no matrix inversion) and a Kahan-compensated
+  8-vector Hamiltonian RK4 integrator, so the geodesics actually conserve their
+  constants of motion. (The earlier Boyer–Lindquist path left a gray polar-axis
+  seam; the 2026-06 CKS migration removed it at the coordinate level.)
 - **A single physics source of truth.** Every GR formula is copied *verbatim* from
   [`skills/kerr-physics/SKILL.md`](skills/kerr-physics/SKILL.md) and referenced by
   number in the code. Formulas are **never re-derived ad hoc** — re-derivation is how
@@ -47,11 +50,12 @@ The renderer traces two photon sub-pipelines **per pixel** inside split GPU kern
 - **Pipe A — background / lensing.** Trace a photon *backward* from the camera
   through curved spacetime. When it escapes to infinity, look up where it came from
   on the sky. Two background modes are supported:
-  - `texture` (default): sample a gravitationally-lensed 16K equirect starmap with
-    screen-space–Jacobian mip anti-aliasing.
-  - `dngr`: the *Interstellar*-style two-layer model — a **point-star catalog** that
-    stays sharp and *brightens* under lensing (magnification → flux, not smear),
-    plus an anisotropically-filtered diffuse Milky-Way band.
+  - `dngr` (default, since 2026-06-06): the *Interstellar*-style two-layer model — a
+    **point-star catalog** that stays sharp and *brightens* under lensing
+    (magnification → flux, not smear), plus an anisotropically-filtered diffuse
+    Milky-Way band.
+  - `texture` (legacy): sample a gravitationally-lensed 16K equirect starmap with
+    screen-space–Jacobian mip anti-aliasing (Formula 10).
 - **Pipe B — accretion disk.** Accumulate volumetric disk emission along the same
   geodesic, with `g⁴` relativistic Doppler/gravitational beaming so the approaching
   limb of the disk blazes and the receding limb darkens. Composited in front of the
@@ -128,10 +132,10 @@ Black/
 │   ├── blender/
 │   │   └── export_camera.py ← Blender script: exports camera_matrix.json (Phase 1)
 │   └── renderer/
-│       ├── metric.py        ← Kerr metric            (Formula 1)
-│       ├── geodesic.py      ← Mino-time RK4 null geodesic integrator (Formula 6)
-│       ├── disk.py          ← accretion-disk gas physics (F3/4/5/8/9) — FROZEN
-│       ├── starmap.py       ← 16K HDRI loader, mip pyramid, UV mapping
+│       ├── metric.py        ← CKS Kerr metric + exact inverse + derivs (CKS-1..4) — FROZEN
+│       ├── geodesic.py      ← CKS Hamiltonian RK4 null geodesic integrator (CKS-5/6/7) — FROZEN
+│       ├── disk.py          ← accretion-disk gas physics (CKS-8/9 + F9 chroma) — FROZEN
+│       ├── starmap.py       ← 16K HDRI loader, mip pyramid, CKS-10 celestial→UV
 │       └── taichi_renderer.py ← GPU renderer: Pipe A + Pipe B + DNGR, split kernels
 ├── scripts/
 │   ├── thumb.py             ← CPU preview renderer (development / QA)
@@ -154,15 +158,16 @@ Black/
 
 | Stage | Formula(s) | What happens |
 |-------|-----------|--------------|
-| Camera → photon | F7 (ZAMO tetrad) | Convert the Blender camera basis into a local Boyer–Lindquist triad and launch the photon momentum from a zero-angular-momentum observer. |
-| Trace | F6 / F11 / F12 | Integrate the null geodesic in Mino time with RK4, in the horizon-stable `[y = r − r₊, u = cos θ, φ, t, …]` state; factored `Δ = y(y+2k)` and the singularity-free `Θ_u(u)` keep it finite at the horizon and poles. |
-| Disk emission | F3 / F4 / F5 / F8 / F9 | Gas 4-velocity (circular outside ISCO, plunging inside), `g`-factor, and `g⁴` volumetric beaming with chromaticity-only blackbody color. |
-| Background | F10 / F13 | Mip-LOD lensed starmap (`texture`), or the two-layer DNGR point-star + diffuse model (`dngr`). |
+| Metric | CKS-1 / CKS-2 / CKS-3 / CKS-4 | The implicit Kerr radius `r(x,y,z)`, the Cartesian Kerr-Schild metric `g = η + f·l⊗l` (regular on axis and horizon), its **exact** analytic inverse (`l` is η-null — no matrix inversion), and the analytic coordinate derivatives for the geodesic force term. |
+| Camera → photon | CKS-7 (ZAMO) | Build a zero-angular-momentum observer directly from `g^{αβ}` and launch the photon momentum along the g-orthogonal projected camera ray — no BL spherical embedding or triad. |
+| Trace | CKS-5 / CKS-6 | Integrate the Hamiltonian null geodesic as an 8-vector `[xᵅ, p_α]` with Kahan-compensated RK4 and an adaptive affine step; capture (`r ≤ r₊ + ε_h`) and escape (`ρ ≥ r_max`) stops terminate the ray. `E = −p_t` and `L_z = x p_y − y p_x` are conserved. |
+| Disk emission | CKS-8 / CKS-9 / F9 | Gas 4-velocity (rigid `+z` rotation; `r_inner = r_isco`), the `g`-factor as a plain Cartesian dot product, and `g⁴` volumetric beaming with chromaticity-only blackbody color. |
+| Background | CKS-10 / F10 / F13 | An escaped ray's normalized contravariant direction `(p^x, p^y, p^z)` → `(θ′, φ′)` feeds either the two-layer DNGR point-star + diffuse model (`dngr`, default) or the mip-LOD lensed equirect starmap (`texture`, legacy). |
 
 The CPU reference path (`metric.py`, `geodesic.py`, `disk.py`) is the numerically
 frozen ground truth that the Taichi GPU port is validated against — geodesic tests
-assert `E`, `Lz`, `Q`, and the null norm are conserved to tight tolerances over
-thousands of integration steps.
+assert `E`, `L_z`, `Q` (CKS→BL diagnostic), and the null norm are conserved to tight
+tolerances over thousands of integration steps.
 
 ---
 

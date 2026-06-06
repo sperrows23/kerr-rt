@@ -10,6 +10,7 @@ file now pins the CKS ``celestial_to_uv`` mapping directly.
 No physics formula is touched; this is purely the celestial-sphere coordinate
 projection that precedes the SKILL.md Formula 10 starmap lookup.
 """
+
 from __future__ import annotations
 
 import math

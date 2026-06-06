@@ -41,17 +41,17 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+from renderer.disk import (  # noqa: E402
+    blackbody_rgb,
+    g_factor,
+    gas_four_velocity_cks,
+)
 from renderer.geodesic import (  # noqa: E402
     _horizon_radius,
     integrate_null_geodesic,
     make_null_initial_conditions,
 )
 from renderer.metric import kerr_radius  # noqa: E402
-from renderer.disk import (  # noqa: E402
-    blackbody_rgb,
-    g_factor,
-    gas_four_velocity_cks,
-)
 
 # CKS Cartesian coordinate index order (matches renderer.metric / geodesic).
 T, X, Y, Z = 0, 1, 2, 3
@@ -60,14 +60,16 @@ _CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs" / "render.yaml"
 
 
 def load_config(path: Path = _CONFIG_PATH) -> dict:
-    with open(path, "r", encoding="utf-8") as fh:
+    with open(path, encoding="utf-8") as fh:
         return yaml.safe_load(fh)
 
 
 # --------------------------------------------------------------------------- #
 # Camera (CKS Cartesian) — matches renderer.taichi_renderer._camera_basis
 # --------------------------------------------------------------------------- #
-def camera_basis(pos, world_up=(0.0, 0.0, 1.0)):
+def camera_basis(
+    pos: np.ndarray, world_up: tuple[float, float, float] = (0.0, 0.0, 1.0)
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Orthonormal (fwd, right, up) looking from ``pos`` toward the origin.
 
     All in world Cartesian = CKS. ``fwd = -normalize(pos)``,
@@ -79,7 +81,7 @@ def camera_basis(pos, world_up=(0.0, 0.0, 1.0)):
     wu = np.asarray(world_up, dtype=float)
     right = np.cross(f, wu)
     nrm = np.linalg.norm(right)
-    if nrm < 1e-8:                       # looking along the spin axis: pick any ⟂
+    if nrm < 1e-8:  # looking along the spin axis: pick any ⟂
         right = np.cross(f, np.array([1.0, 0.0, 0.0]))
         nrm = np.linalg.norm(right)
     right = right / nrm
@@ -87,14 +89,22 @@ def camera_basis(pos, world_up=(0.0, 0.0, 1.0)):
     return f, right, up
 
 
-def pixel_direction(px, py, res, tan_half_fov, fwd, right, up):
+def pixel_direction(
+    px: int,
+    py: int,
+    res: int,
+    tan_half_fov: float,
+    fwd: np.ndarray,
+    right: np.ndarray,
+    up: np.ndarray,
+) -> np.ndarray:
     """Coordinate (CKS) unit direction the photon travels for pixel (px, py).
 
     The camera looks along ``fwd`` toward the hole; ``+right`` is screen-x and
     ``+up`` is screen-y. ``n = normalize(fwd + sx·right + sy·up)``.
     """
-    sx = (2.0 * (px + 0.5) / res - 1.0) * tan_half_fov   # right
-    sy = (1.0 - 2.0 * (py + 0.5) / res) * tan_half_fov   # up
+    sx = (2.0 * (px + 0.5) / res - 1.0) * tan_half_fov  # right
+    sy = (1.0 - 2.0 * (py + 0.5) / res) * tan_half_fov  # up
     n = fwd + sx * right + sy * up
     return n / np.linalg.norm(n)
 
@@ -102,8 +112,18 @@ def pixel_direction(px, py, res, tan_half_fov, fwd, right, up):
 # --------------------------------------------------------------------------- #
 # Ray classification
 # --------------------------------------------------------------------------- #
-def trace_pixel(pos3, n, a, n_steps, d_lambda, r_max, r_plus, horizon_eps,
-                adaptive_floor, disk_params=None):
+def trace_pixel(
+    pos3: np.ndarray,
+    n: np.ndarray,
+    a: float,
+    n_steps: int,
+    d_lambda: float,
+    r_max: float,
+    r_plus: float,
+    horizon_eps: float,
+    adaptive_floor: float,
+    disk_params: dict | None = None,
+) -> tuple[str, float, np.ndarray, float]:
     """Trace one photon and return (outcome, r_min, disk_color, transmittance).
 
     outcome:  'captured' (fell to the horizon -> shadow),
@@ -119,8 +139,14 @@ def trace_pixel(pos3, n, a, n_steps, d_lambda, r_max, r_plus, horizon_eps,
     # integrator's CKS-6 stop conditions handle termination, so silence them.
     with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
         x, p = integrate_null_geodesic(
-            x0, p_cov0, a, n_steps, d_lambda,
-            r_max=r_max, horizon_eps=horizon_eps, adaptive_floor=adaptive_floor,
+            x0,
+            p_cov0,
+            a,
+            n_steps,
+            d_lambda,
+            r_max=r_max,
+            horizon_eps=horizon_eps,
+            adaptive_floor=adaptive_floor,
         )
 
     disk_color = np.zeros(3, dtype=float)
@@ -136,15 +162,16 @@ def trace_pixel(pos3, n, a, n_steps, d_lambda, r_max, r_plus, horizon_eps,
     finite = np.isfinite(xs) & np.isfinite(ys) & np.isfinite(zs)
     if not np.any(finite):
         return "captured", r_plus, disk_color, transmittance
-    r_series = np.array([
-        kerr_radius(float(xi), float(yi), float(zi), a)
-        for xi, yi, zi in zip(xs[finite], ys[finite], zs[finite])
-    ])
+    r_series = np.array(
+        [
+            kerr_radius(float(xi), float(yi), float(zi), a)
+            for xi, yi, zi in zip(xs[finite], ys[finite], zs[finite], strict=False)
+        ]
+    )
     r_min = float(r_series.min())
 
     # Escape: the final point reached r_max (rho); background light.
-    rho_last = float(np.sqrt(xs[finite][-1] ** 2 + ys[finite][-1] ** 2
-                             + zs[finite][-1] ** 2))
+    rho_last = float(np.sqrt(xs[finite][-1] ** 2 + ys[finite][-1] ** 2 + zs[finite][-1] ** 2))
     r_last = float(r_series[-1])
     if rho_last >= r_max:
         return "escaped", r_min, disk_color, transmittance
@@ -157,13 +184,15 @@ def trace_pixel(pos3, n, a, n_steps, d_lambda, r_max, r_plus, horizon_eps,
 # --------------------------------------------------------------------------- #
 # Shading
 # --------------------------------------------------------------------------- #
-def background_color(py, res, top, bottom):
+def background_color(py: int, res: int, top: np.ndarray, bottom: np.ndarray) -> np.ndarray:
     """Vertical linear-RGB gradient (top -> bottom)."""
     t = py / max(1, res - 1)
     return (1.0 - t) * top + t * bottom
 
 
-def ring_glow(r_min, peak, sigma, gain, color):
+def ring_glow(
+    r_min: float, peak: float, sigma: float, gain: float, color: np.ndarray
+) -> np.ndarray:
     """Gaussian photon-ring glow peaked at the photon-sphere radius."""
     w = np.exp(-((r_min - peak) ** 2) / (2.0 * sigma * sigma))
     return gain * w * color
@@ -172,7 +201,7 @@ def ring_glow(r_min, peak, sigma, gain, color):
 # --------------------------------------------------------------------------- #
 # Pipe B — volumetric accretion disk (CKS)
 # --------------------------------------------------------------------------- #
-def march_disk(x, p_cov, dp):
+def march_disk(x: np.ndarray, p_cov: np.ndarray, dp: dict) -> tuple[np.ndarray, float]:
     """Accumulate disk emission along an already-traced CKS geodesic.
 
     Implements Formulas CKS-8 (gas velocity), CKS-9 (g-factor) and 9 (emission)
@@ -238,7 +267,7 @@ def march_disk(x, p_cov, dp):
         # Vertical Gaussian density profile within the slab.
         density = np.exp(-0.5 * (dz / sigma_theta) ** 2)
 
-        emission = dp["emission_coeff"] * density * chroma * (g ** 4) * ds
+        emission = dp["emission_coeff"] * density * chroma * (g**4) * ds
         color += transmittance * emission
         transmittance *= np.exp(-dp["absorption_coeff"] * density * ds)
 
@@ -295,18 +324,20 @@ def render(cfg: dict, res: int, with_disk: bool = False) -> np.ndarray:
 
     # Camera position in CKS Cartesian (spin axis = +z); look at the origin.
     st, ct = np.sin(theta_cam), np.cos(theta_cam)
-    pos = np.array([r_cam * st * np.cos(phi_cam),
-                    r_cam * st * np.sin(phi_cam),
-                    r_cam * ct], dtype=float)
+    pos = np.array(
+        [r_cam * st * np.cos(phi_cam), r_cam * st * np.sin(phi_cam), r_cam * ct], dtype=float
+    )
     fwd, right, up = camera_basis(pos)
 
     disk_params = build_disk_params(cfg, a, d_lambda) if with_disk else None
 
     img = np.zeros((res, res, 3), dtype=float)
 
-    print(f"Tracing {res}x{res} = {res * res} rays "
-          f"(a={a}, r_cam={r_cam}, theta_cam={np.rad2deg(theta_cam):.0f} deg, "
-          f"fov={fov_deg} deg, disk={'on' if with_disk else 'off'})")
+    print(
+        f"Tracing {res}x{res} = {res * res} rays "
+        f"(a={a}, r_cam={r_cam}, theta_cam={np.rad2deg(theta_cam):.0f} deg, "
+        f"fov={fov_deg} deg, disk={'on' if with_disk else 'off'})"
+    )
     t0 = time.time()
 
     for py in range(res):
@@ -314,8 +345,16 @@ def render(cfg: dict, res: int, with_disk: bool = False) -> np.ndarray:
         for px in range(res):
             n = pixel_direction(px, py, res, tan_half_fov, fwd, right, up)
             outcome, r_min, disk_color, transmittance = trace_pixel(
-                pos, n, a, n_steps, d_lambda, r_max, r_plus, horizon_eps,
-                adaptive_floor, disk_params,
+                pos,
+                n,
+                a,
+                n_steps,
+                d_lambda,
+                r_max,
+                r_plus,
+                horizon_eps,
+                adaptive_floor,
+                disk_params,
             )
 
             if outcome == "captured":
@@ -324,13 +363,11 @@ def render(cfg: dict, res: int, with_disk: bool = False) -> np.ndarray:
             elif outcome == "escaped":
                 # Background light, brightened if the ray grazed the photon
                 # sphere (small r_min) -> the photon ring just outside the edge.
-                bg_layer = bg + ring_glow(r_min, ring_peak, ring_sigma,
-                                          ring_gain, ring_col)
+                bg_layer = bg + ring_glow(r_min, ring_peak, ring_sigma, ring_gain, ring_col)
             else:
                 # Undecided: ran out of steps winding near the critical curve.
                 # These are ring photons -> glow on a dark (behind-shadow) base.
-                bg_layer = ring_glow(r_min, ring_peak, ring_sigma,
-                                     ring_gain, ring_col)
+                bg_layer = ring_glow(r_min, ring_peak, ring_sigma, ring_gain, ring_col)
 
             # Composite: disk emission in front, background attenuated behind it.
             color = disk_color + transmittance * bg_layer
@@ -350,23 +387,30 @@ def render(cfg: dict, res: int, with_disk: bool = False) -> np.ndarray:
     return (img * 255.0 + 0.5).astype(np.uint8)
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Kerr black hole thumbnail (Pipe A).")
-    parser.add_argument("--res", type=int, default=None,
-                        help="Square resolution (default: config thumb_width).")
-    parser.add_argument("--frame", type=int, default=0,
-                        help="Frame index (reserved; frame 0 uses config camera).")
-    parser.add_argument("--disk", action="store_true",
-                        help="Composite the volumetric accretion disk (Pipe B); "
-                             "saves thumb_disk.png instead of thumb_output.png.")
+    parser.add_argument(
+        "--res", type=int, default=None, help="Square resolution (default: config thumb_width)."
+    )
+    parser.add_argument(
+        "--frame", type=int, default=0, help="Frame index (reserved; frame 0 uses config camera)."
+    )
+    parser.add_argument(
+        "--disk",
+        action="store_true",
+        help="Composite the volumetric accretion disk (Pipe B); "
+        "saves thumb_disk.png instead of thumb_output.png.",
+    )
     args = parser.parse_args(argv)
 
     cfg = load_config()
     res = args.res if args.res is not None else int(cfg["render"]["thumb_width"])
 
     if args.frame != 0:
-        print(f"[warn] --frame {args.frame}: per-frame camera matrices are not "
-              f"wired up yet; using the config camera (frame 0).")
+        print(
+            f"[warn] --frame {args.frame}: per-frame camera matrices are not "
+            f"wired up yet; using the config camera (frame 0)."
+        )
 
     from PIL import Image  # local import so --help works without Pillow
 

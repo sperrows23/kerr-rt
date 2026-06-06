@@ -78,9 +78,9 @@ _HEIGHT = 1080
 # numbers — see PROJECT.md §6 "CKS migration" and the render.yaml emission/
 # absorption recalibration. The band stays the same fractional width as the old
 # guard, recentred on the CKS value.
-_DOPPLER_RATIO_MIN = 3.8      # CKS baseline 4.32× (was BL 7.77×)
+_DOPPLER_RATIO_MIN = 3.8  # CKS baseline 4.32× (was BL 7.77×)
 _DOPPLER_RATIO_MAX = 4.9
-_DISK_MAX_REF = 6.1667        # peak HDR (disk emission edge), CKS; rel tol below
+_DISK_MAX_REF = 6.1667  # peak HDR (disk emission edge), CKS; rel tol below
 _DISK_MAX_RTOL = 0.05
 
 # Spin-axis seam guard (A4): max tolerated ratio of the center-column luminance
@@ -119,7 +119,7 @@ def beauty_frame() -> dict:
     cfg = tr.load_config()
 
     # camera_matrix.json is UTF-8-with-BOM (Blender export), per scripts/gpu_test.py.
-    with open(_CAMERA_PATH, "r", encoding="utf-8-sig") as fh:
+    with open(_CAMERA_PATH, encoding="utf-8-sig") as fh:
         frames = json.load(fh)
     if not 0 <= _FRAME_INDEX < len(frames):
         pytest.skip(f"frame {_FRAME_INDEX} out of range (have {len(frames)})")
@@ -128,9 +128,7 @@ def beauty_frame() -> dict:
     # Real production setup + render (re-inits Taichi on CUDA with the configured
     # device memory, then uploads the starmap mip pyramid).
     tr.setup_renderer(cfg)
-    hdr = tr.render_beauty_frame(
-        cfg, cam, _WIDTH, _HEIGHT, with_disk=True, lod_enabled=True
-    )
+    hdr = tr.render_beauty_frame(cfg, cam, _WIDTH, _HEIGHT, with_disk=True, lod_enabled=True)
 
     nan_count = int(np.isnan(hdr).sum())
 
@@ -139,7 +137,7 @@ def beauty_frame() -> dict:
     lum = hdr.sum(axis=2)
     w = hdr.shape[1]
     left = float(lum[:, : w // 2].mean())
-    right = float(lum[:, w // 2:].mean())
+    right = float(lum[:, w // 2 :].mean())
     doppler_ratio = max(left, right) / max(min(left, right), 1e-9)
 
     # With the disk on, the global peak pixel IS the beamed disk edge (frame max
@@ -158,10 +156,10 @@ def beauty_frame() -> dict:
     col_mean = top.mean(axis=0)
     col_diff = np.abs(np.diff(col_mean))
     c = w // 2
-    seam_center_jump = float(col_diff[c - 4:c + 4].max())
+    seam_center_jump = float(col_diff[c - 4 : c + 4].max())
     # Baseline background variation: interior columns, excluding the center
     # neighborhood so the seam under test can't inflate its own reference.
-    interior = np.concatenate([col_diff[5:c - 4], col_diff[c + 4:-5]])
+    interior = np.concatenate([col_diff[5 : c - 4], col_diff[c + 4 : -5]])
     seam_bg_median = float(np.median(interior))
 
     return {
@@ -187,9 +185,7 @@ def test_doppler_asymmetry_in_band(beauty_frame):
 
 
 def test_disk_peak_matches_reference(beauty_frame):
-    assert beauty_frame["disk_max"] == pytest.approx(
-        _DISK_MAX_REF, rel=_DISK_MAX_RTOL
-    )
+    assert beauty_frame["disk_max"] == pytest.approx(_DISK_MAX_REF, rel=_DISK_MAX_RTOL)
 
 
 def test_no_spin_axis_seam(beauty_frame):

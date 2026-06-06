@@ -6,15 +6,14 @@ hand-built catalogue lines exercise the byte offsets and the coordinate /
 flux / colour pipeline. No GR/Kerr physics here — these are the ingest's
 astronomy conversions (Pogson flux, Ballesteros B-V->T, RA/Dec->theta',phi').
 """
+
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import numpy as np
 import pytest
-
-from pathlib import Path
-
 from ingest_stars import (
     build_catalog,
     bv_to_temperature,
@@ -165,8 +164,7 @@ def test_parse_bsc5_record_no_vmag_is_skipped():
 # --------------------------------------------------------------------------- #
 # HYG / ATHYG CSV parser + format dispatch
 # --------------------------------------------------------------------------- #
-def _hyg_row(id="3", proper="", ra="6.752481", dec="-16.716116",
-             mag="-1.46", ci="0.0") -> dict:
+def _hyg_row(id="3", proper="", ra="6.752481", dec="-16.716116", mag="-1.46", ci="0.0") -> dict:
     """One HYG/ATHYG record (defaults ≈ Sirius: RA 6.75h, Dec -16.7°, V=-1.46)."""
     return {"id": id, "proper": proper, "ra": ra, "dec": dec, "mag": mag, "ci": ci}
 
@@ -177,20 +175,22 @@ def test_parse_hyg_row_sirius():
     theta, phi, vmag, bv = rec
     assert vmag == pytest.approx(-1.46)
     assert bv == pytest.approx(0.0)
-    assert theta > 0.5 * math.pi                      # southern hemisphere
+    assert theta > 0.5 * math.pi  # southern hemisphere
     assert phi == pytest.approx(math.radians(6.752481 * 15.0), rel=1e-6)
 
 
 def test_parse_hyg_row_skips_the_sun():
     # The Sun must never enter the background sky catalog.
-    assert parse_hyg_row(_hyg_row(id="0", proper="Sol", ra="0.0", dec="0.0",
-                                  mag="-26.7", ci="0.656")) is None
+    assert (
+        parse_hyg_row(_hyg_row(id="0", proper="Sol", ra="0.0", dec="0.0", mag="-26.7", ci="0.656"))
+        is None
+    )
 
 
 def test_parse_hyg_row_blank_ci_falls_back():
     rec = parse_hyg_row(_hyg_row(ci=""))
     assert rec is not None
-    assert rec[3] == pytest.approx(0.0)               # _DEFAULT_BV
+    assert rec[3] == pytest.approx(0.0)  # _DEFAULT_BV
 
 
 def test_parse_hyg_row_blank_mag_is_skipped():
@@ -200,18 +200,18 @@ def test_parse_hyg_row_blank_mag_is_skipped():
 def test_resolve_format_by_extension():
     assert resolve_format("auto", Path("a/b/hyglike.csv")) == "hyg"
     assert resolve_format("auto", Path("a/b/bsc5.dat")) == "bsc5"
-    assert resolve_format("bsc5", Path("whatever.csv")) == "bsc5"   # explicit wins
+    assert resolve_format("bsc5", Path("whatever.csv")) == "bsc5"  # explicit wins
 
 
 def test_build_catalog_hyg_csv_roundtrip(tmp_path):
     csv_path = tmp_path / "mini_hyg.csv"
     csv_path.write_text(
         "id,proper,ra,dec,mag,ci\n"
-        "0,Sol,0.0,0.0,-26.7,0.656\n"          # Sun -> skipped
-        "3,,6.752481,-16.7,-1.46,0.0\n"        # bright (kept)
-        "5,,3.0,40.0,9.9,0.5\n",               # fainter than mag_limit -> dropped
+        "0,Sol,0.0,0.0,-26.7,0.656\n"  # Sun -> skipped
+        "3,,6.752481,-16.7,-1.46,0.0\n"  # bright (kept)
+        "5,,3.0,40.0,9.9,0.5\n",  # fainter than mag_limit -> dropped
         encoding="utf-8",
     )
     cat = build_catalog(csv_path, mag_limit=6.5, fmt="auto")
-    assert cat.shape == (1, 5)                  # only the one bright star survives
+    assert cat.shape == (1, 5)  # only the one bright star survives
     assert cat.dtype == np.float32
