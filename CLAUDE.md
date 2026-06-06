@@ -21,7 +21,7 @@ Phase 3 (Blender Compositor) → final composited video
 | Item | Value / Convention |
 |------|-------------------|
 | Units | Geometric: G = M = c = 1 |
-| Coordinates | Boyer-Lindquist (t, r, θ, φ) |
+| Coordinates | **Cartesian Kerr-Schild (t, x, y, z)** — active renderer path (spin axis = +z; the CKS radius `r` is the BL radial coordinate, `z = r cosθ`). Boyer-Lindquist (t, r, θ, φ) is retired/history only. See SKILL.md PART II. |
 | Metric signature | (− + + +) |
 | Spin parameter | a = 0.999 (near-extremal) |
 | GPU backend | `ti.init(arch=ti.cuda)` — **locked**, never use `ti.gpu` |

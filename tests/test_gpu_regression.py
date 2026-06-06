@@ -15,27 +15,21 @@ What it guarantees, per frame (frame 0 of ``camera_matrix.json``, disk on):
 
   1. Doppler asymmetry — the g⁴-beamed approaching (right) disk edge is far
      brighter than the receding (left) edge. The left/right luminance ratio must
-     stay in a physical band (Formulas 8/9; baseline ≈ 7.77×). A sign flip or a
-     broken g-factor collapses this ratio.
-  2. NaN-free — no pixel is NaN. RK4 overshoot near the inner disk edge or a
-     polar 1/sin²θ blow-up (guarded by Formula 12's Θ_u) would poison pixels.
+     stay in a physical band (Formulas CKS-9/9; CKS baseline ≈ 4.32×). A sign flip
+     or a broken g-factor collapses this ratio.
+  2. NaN-free — no pixel is NaN. RK4 overshoot near the inner disk edge would
+     poison pixels. (The BL polar 1/sin²θ blow-up is *gone at the source* under
+     CKS — the chart is regular on the spin axis and across the horizon.)
   3. Disk emission peak — the brightest pixel (the beamed disk edge) must match a
      pinned reference within tolerance. Drift flags a change in the disk emission
-     / redshift chain (Formulas 3/4/5/8/9).
+     / redshift chain (Formulas 3 / CKS-8 / CKS-9 / 9).
   4. Spin-axis seam (A4) — no sharp vertical luminance discontinuity at the center
-     column (the spin-axis meridian caustic). Under the legacy ``texture`` default
-     this guarded the committed center-seam fold-saturation fix (~1.9× baseline).
-     The 2026-06-06 switch to the ``dngr`` default briefly drove this coarse
-     center-column metric to ~15× (the Layer-A meridian star-pileup, Artifact B),
-     which then **landed the R2 fix** (SKILL.md Formula 13 guard (b′): undeflected
-     proper-separation splat placement on the seam — see
-     docs/specs/2026-06-06-dngr-artifact-remediation.md §7.2). With R2 the center
-     ratio is back to ~2.06× (off-seam baseline), so this is again a **live PASS
-     guard**: it catches a reintroduced central meridian seam in either mode. (The
-     dedicated, location-agnostic ``test_background_has_no_vertical_seam_stripe``
-     stays ``xfail`` — but only because a single bright lensed star confounds it in
-     this framing's thin sky band, NOT a residual seam; that detector's bright-point
-     recalibration is deferred.)
+     column. Under CKS the BH spin-axis seam is **eliminated at the source**
+     (Formula CKS-10: the escaped-ray celestial direction is a genuine Cartesian
+     unit vector — no meridian caustic, no φ-accumulation blow-up), so this is now
+     a cheap sanity guard that should sit near the off-seam background baseline
+     (~2×) rather than the pre-CKS BL/dngr seam spikes. A reintroduced vertical
+     band (e.g. a regression back to a coordinate-singular path) still trips it.
 
 CUDA is mandatory (the backend is LOCKED to ``ti.init(arch=ti.cuda)`` per
 CLAUDE.md). On a host without a working CUDA backend the whole module skips
@@ -78,9 +72,15 @@ _HEIGHT = 1080
 # regression (e.g. the ~10% disk-peak shift between Phase-1 and the c45d24b fix)
 # trips them.
 # --------------------------------------------------------------------------- #
-_DOPPLER_RATIO_MIN = 7.0      # baseline 7.77× (matches gpu_test "≈7–8×" guard)
-_DOPPLER_RATIO_MAX = 8.5
-_DISK_MAX_REF = 12.7707       # peak HDR (disk emission edge); rel tol below
+# CKS baseline (2026-06 migration, measured on RTX 5060): Doppler 4.32×, disk peak
+# 6.17. The CKS affine emission measure reweights the g⁴ integral relative to the
+# retired BL Mino path (which read 7.77× / 12.77), so these are NOT the old BL
+# numbers — see PROJECT.md §6 "CKS migration" and the render.yaml emission/
+# absorption recalibration. The band stays the same fractional width as the old
+# guard, recentred on the CKS value.
+_DOPPLER_RATIO_MIN = 3.8      # CKS baseline 4.32× (was BL 7.77×)
+_DOPPLER_RATIO_MAX = 4.9
+_DISK_MAX_REF = 6.1667        # peak HDR (disk emission edge), CKS; rel tol below
 _DISK_MAX_RTOL = 0.05
 
 # Spin-axis seam guard (A4): max tolerated ratio of the center-column luminance
@@ -193,11 +193,11 @@ def test_disk_peak_matches_reference(beauty_frame):
 
 
 def test_no_spin_axis_seam(beauty_frame):
-    # The center "static" seam (spin-axis meridian caustic) shows as a sharp
-    # vertical luminance discontinuity at the center column. The legacy texture
-    # fold-saturation fix held this to ~1.9×; the dngr R2 splat-placement fix
-    # (SKILL.md F13 guard (b′)) holds it to ~2.06× — both well under the 6.0 limit.
-    # (Pre-R2 the dngr Layer-A meridian pileup spiked this to ~15×.)
+    # Under CKS the BH spin-axis seam is eliminated at the source (Formula CKS-10),
+    # so the center-column jump sits at the off-seam background baseline (~2×), well
+    # under the 6.0 limit. A regression back to a coordinate-singular path (BL
+    # meridian caustic / φ-accumulation) would reintroduce a sharp vertical
+    # discontinuity here and trip the guard.
     jump = beauty_frame["seam_center_jump"]
     baseline = max(beauty_frame["seam_bg_median"], 1e-9)
     assert jump / baseline <= _SEAM_JUMP_OVER_MEDIAN_MAX

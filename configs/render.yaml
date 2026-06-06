@@ -1,24 +1,35 @@
 black_hole:
   spin: 0.999      # a — the single source of truth; r_isco and r_plus below are FUNCTIONS of it
   r_isco: 1.182    # DERIVED (Formula 2 of a=0.999). Duplicated literal — re-derive if spin changes
-  r_plus: 1.0447   # DERIVED: r+ = 1 + sqrt(1-a^2), a=0.999 (true horizon). The GPU path computes
-                   # this from `spin` (_horizon_constants) and ignores this key; only the CPU preview
-                   # (thumb.py / seam_diag.py) still reads it as the radial_turning_point r_floor.
-                   # Kept only for that path — it silently desyncs if `spin` is edited (FLAGGED).
+  r_plus: 1.0447   # DERIVED: r+ = 1 + sqrt(1-a^2), a=0.999 (true horizon). Now UNUSED at runtime:
+                   # both the GPU renderer and the CPU preview (thumb.py) compute r+ from `spin`
+                   # via _horizon_radius (CKS-6). Kept as documentation only; it silently desyncs
+                   # if `spin` is edited (FLAGGED) — the live value is always derived from `spin`.
 
 render:
   width: 3840
   height: 2160
   thumb_width: 256
   thumb_height: 256
-  max_steps_pipe_a: 250        # Pipe B (volumetric disk march) shares this same trace loop / step cap
+  max_steps_pipe_a: 800        # Pipe B (volumetric disk march) shares this same trace loop / step cap.
+                               # CKS affine λ advances ~1 coord-unit per unit λ (unlike BL Mino time, which
+                               # advanced ~r² per unit λ), so a photon must take ~(r_max−r_cam)/h far-field
+                               # steps to escape plus extra near the photon ring — hence the larger cap.
   r_max: 50.0
   device_memory_gb: 6.0
-  d_lambda_pipe_a: 0.01        # Mino-time step for Pipe A geodesic integration
-  horizon_epsilon: 0.05        # Δ-capture stop before the horizon (was hardcoded _DELTA_MIN)
-  adaptive_step_floor: 0.005   # optimization Phase 2.2: lower bound on the y-scaled adaptive step factor
-  sin2_min: 1.0e-10            # polar guard on dφ/dλ, dt/dλ denominators only (Formula 12)
-  j_fold: 0.15                 # background LOD fold-saturation: escaped pixels whose screen-space exit footprint J(rad) exceeds this straddle the spin-axis meridian caustic -> collapse to coarsest mip (kills the center "static" seam)
+  d_lambda_pipe_a: 0.25        # CKS affine-parameter step dλ for the Hamiltonian geodesic (Formula CKS-5).
+                               # Far-field h≈dλ (≈0.25 coord-units/step); shrinks toward the horizon via the
+                               # adaptive factor below. Sized so a ~35-unit traverse (r_cam≈15→r_max=50) is
+                               # ~140 steps and a photon-ring grazer's few orbits stay under max_steps.
+  horizon_epsilon: 0.05        # CKS capture margin: stop when r <= r_plus + this (Formula CKS-6). CKS is
+                               # regular at the horizon, so this only bounds step cost in the deep field.
+  adaptive_step_floor: 0.02    # lower bound on the near-horizon adaptive step factor h = dλ·max(floor,(r−r₊)/r) (CKS-5)
+  # NOTE (2026-06-06 CKS migration): render.sin2_min was REMOVED. It was the BL
+  # 1/sin²θ polar guard (Formula 12); CKS has no spin-axis coordinate singularity.
+  j_fold: 0.15                 # screen-space LOD/DNGR fold guard: an escaped pixel whose exit-direction
+                               # footprint J(rad) exceeds this straddles a celestial-sphere texture pole
+                               # or the chaotic shadow edge -> collapse to the coarsest mip. (Under CKS the
+                               # BH spin-axis seam is gone; this now only guards the equirect texture poles.)
   motion_blur_samples: 4       # optimization Phase 4.2: temporal jitter samples per pixel
   fps: 24.0                    # animation frame rate; shutter arc = dphi*fps*shutter_fraction (optimization Phase 4.2)
   projection_mode: perspective # perspective | equirect (optimization Phase 4.1; perspective keeps the Doppler check valid)
@@ -29,8 +40,13 @@ disk:
   r_outer: 25.0
   theta_half_width: 0.15   # |θ - π/2| < this for bounding box (single source of truth for the slab)
   T_0: 1.0e4               # inner reference temperature (Decision B: T = T_0·(6/r)^0.75)
-  emission_coeff: 8.0      # volumetric emission scale (visualization)
-  absorption_coeff: 1.5    # volumetric absorption scale (visualization)
+  emission_coeff: 0.25     # volumetric emission scale (visualization). RECALIBRATED for CKS
+                           # (2026-06-07): the march integrates emis·density·g⁴·ds with ds = the
+                           # CKS affine step (~0.1–0.24 coord-units), whereas the old 8.0 was tuned
+                           # for the BL Mino step (~0.003–0.009, ~30× smaller). Scaled ~1/30 so the
+                           # disk is optically thin and the g⁴-beamed inner edge is not washed out.
+  absorption_coeff: 0.05   # volumetric absorption scale (visualization). RECALIBRATED for CKS ds
+                           # (2026-06-07; was 1.5) — same ~1/30 BL-Mino→CKS-affine rescale.
   vertical_sigma_frac: 0.5 # gaussian scale height as fraction of theta_half_width
   # NOTE: the Phase-3.3 |u|=|cosθ| disk-slab early-out bound is now DERIVED in code
   # as sin(theta_half_width) (renderer.render_beauty_frame) — the old hardcoded

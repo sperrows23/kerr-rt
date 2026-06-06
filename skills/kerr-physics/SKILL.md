@@ -31,7 +31,7 @@ do not silently substitute a re-derived version.
 | Black hole mass | M = 1 (all distances in units of M) |
 | Spin parameter | a = 0.999 (near-maximal prograde) |
 | Geodesic type | **Null** (photons, μ = 0) — affects Carter constant sign |
-| Coordinates | Boyer-Lindquist (BL): (t, r, θ, φ) |
+| Coordinates | **Cartesian Kerr-Schild (CKS): (t, x, y, z) — active renderer path (see PART II)**. Boyer-Lindquist (BL): (t, r, θ, φ) — retired/CPU-reference only. |
 | Metric signature | (− + + +) |
 | GPU backend | `ti.init(arch=ti.cuda)` — locked, do not change to `ti.gpu` |
 | Orbit direction | Prograde (co-rotating with spin) everywhere |
@@ -654,7 +654,247 @@ Formula 10 path structurally cannot achieve for point stars.
 
 ---
 
+# PART II — CARTESIAN KERR-SCHILD (CKS) COORDINATES  *(active renderer path, 2026-06-06)*
+
+**Why this part exists.** Boyer-Lindquist has *coordinate* singularities on the spin
+axis (θ = 0, π: the 1/sin²θ pole) and at the horizon (Δ → 0). Part I (Formulas
+1/6/7/11/12) fought the axis pole with band-aids — `u = cosθ`, `Θ_u`, per-step φ-wrap,
+`j_fold` mip collapse, `normalize_sphere_angles` punch-through, F13 guard (b′). The
+**Cartesian Kerr-Schild** chart is *regular on the axis and across the horizon*, so the
+entire artifact class is removed at the source. As of 2026-06-06 the renderer geodesic
+path, photon initialization, disk g-factor, and escaped-ray celestial direction use CKS.
+
+**Authoritative sources (verified 2026-06-06):** Chan, Psaltis & Özel, *GRay2* (ApJ 2018,
+arXiv:1706.07062); SpECTRE `gr::Solutions::KerrSchild`; Visser, *The Kerr spacetime*
+(arXiv:0706.0622). The metric, inverse, implicit radius, and analytic derivatives below
+were cross-checked across these and confirmed self-consistent (l is η-null ⇒ the inverse
+is exact; ∂r forms verified against the quartic).
+
+**Conventions:** geometric `G = M = c = 1`; signature `(− + + +)`; spin `a` along **+z**;
+coordinates `(t, x, y, z)`. The CKS radius `r` **is the Boyer-Lindquist radial coordinate**
+(`z = r cosθ`), so all BL-radius quantities (ISCO, Ω, E_I/L_I) carry over unchanged.
+
+**Status of the Part I formulas under CKS:**
+
+| Formula | Status under CKS |
+|---|---|
+| 1 (BL metric), 6 (Mino BL geodesic), 7 (BL ZAMO tetrad), 11 (y=r−r₊), 12 (u=cosθ Θ_u) | **SUPERSEDED for the renderer** — they describe the retired BL path. Kept for history / the CPU `[r,θ,…]` reference only. |
+| 2 (ISCO), 3 (Ω, u^t), 4 (E_I,L_I) | **REUSED unchanged** (BL-radius quantities; r is identical). |
+| 8 (g-factor), 9 (g⁴ beaming, blackbody chroma) | **REUSED** — structure unchanged; see CKS-9 (now a Cartesian dot product; the BL Δ-divide bug is structurally impossible). |
+| 10 (mip LOD), 13 (DNGR μ/PSF) | **REUSED unchanged** — they act on the celestial direction `(θ′, φ′)` (CKS-10), which is coordinate-agnostic. |
+
+---
+
+## Formula CKS-1 — Kerr radius r(x, y, z)  [implicit]
+
+`r` is the same BL radial coordinate, defined implicitly (`ρ² = x²+y²+z²`):
+
+```
+r⁴ − (ρ² − a²) r² − a² z² = 0
+
+# explicit positive root:
+r² = ½(ρ² − a²) + sqrt( ¼(ρ² − a²)² + a² z² )
+r  = sqrt(r²)
+```
+
+Identity used below: `Σ ≡ r² + a² z²/r² = (r⁴ + a² z²)/r²`  (= BL `r²+a²cos²θ`). At the
+equator `z = 0` (the disk plane): `r = sqrt(x² + y² − a²)`.
+
+---
+
+## Formula CKS-2 — Kerr-Schild metric (Cartesian)
+
+```
+g_αβ = η_αβ + f · l_α l_β,        η = diag(−1, 1, 1, 1)
+
+f   = 2 r³ / (r⁴ + a² z²)         (= 2 M r / Σ with M = 1)
+
+l_α = ( 1,
+        (r x + a y)/(r² + a²),
+        (r y − a x)/(r² + a²),
+        z / r )                   # covariant; l_t = 1
+```
+
+`l` is null w.r.t. **both** η and g. Every `l_α` is finite on the spin axis (x=y=0 ⇒
+l_x=l_y=0, l_z=z/r=±1) and across the horizon — the whole point of CKS.
+
+---
+
+## Formula CKS-3 — Inverse metric (exact, NO numerical inversion)
+
+Because `l` is η-null (`η^αβ l_α l_β = 0`, verified):
+
+```
+g^αβ = η^αβ − f · l^α l^β,   where  l^α = η^αγ l_γ = (−1, l_x, l_y, l_z)
+                                    (l^t = −l_t = −1,  l^i = l_i)
+```
+
+Do **not** call a matrix inverter; use this closed form.
+
+---
+
+## Formula CKS-4 — Coordinate derivatives (analytic; let D = r⁴ + a² z²)
+
+```
+∂r/∂x = r³ x / D
+∂r/∂y = r³ y / D
+∂r/∂z = r z (r² + a²) / D
+
+∂f/∂xⁱ = f · [ 3·(∂r/∂xⁱ)/r − (4 r³·(∂r/∂xⁱ) + 2 a² z·δ_iz) / D ]
+∂l_t/∂xⁱ = 0
+```
+
+Differentiate the spatial `l_i` directly (unambiguous; `S = r² + a²`):
+
+```
+∂l_x/∂xʲ = [ (x·∂r/∂xʲ + r·δ_jx + a·δ_jy)·S − (r x + a y)·(2 r·∂r/∂xʲ) ] / S²
+∂l_y/∂xʲ = [ (y·∂r/∂xʲ + r·δ_jy − a·δ_jx)·S − (r y − a x)·(2 r·∂r/∂xʲ) ] / S²
+∂l_z/∂xʲ = δ_jz / r − z·(∂r/∂xʲ) / r²
+```
+
+---
+
+## Formula CKS-5 — Hamiltonian geodesic equations of motion
+
+Null photon Hamiltonian (affine parameter λ):
+
+```
+H = ½ g^αβ p_α p_β = 0          # enforced by init; monitored as drift
+dx^α/dλ = ∂H/∂p_α = g^αβ p_β
+dp_α/dλ = −∂H/∂x^α = −½ (∂_α g^βγ) p_β p_γ
+```
+
+Stationary + axisymmetric ⇒ **E = −p_t** and **L_z = x p_y − y p_x** are conserved.
+Working form (η constant, `g^βγ = η^βγ − f l^β l^γ`), with `φ_l ≡ l^β p_β =
+−p_t + l_x p_x + l_y p_y + l_z p_z`:
+
+```
+dt/dλ  = −p_t + f φ_l                        # = η^{tβ}p_β − f l^t φ_l,  l^t=−1
+dxⁱ/dλ = p_i − f l_i φ_l                      # η^{ii}=+1, l^i=l_i
+
+dp_t/dλ = 0                                   # E conserved
+dp_i/dλ = ½ (∂_i f) φ_l² + f φ_l (∂_i φ_l)
+          where ∂_i φ_l = (∂_i l_x)p_x + (∂_i l_y)p_y + (∂_i l_z)p_z
+```
+
+Integrate the 8-vector `[t, x, y, z, p_t, p_x, p_y, p_z]` with RK4. `p_t` is constant
+analytically — a free per-step error monitor. Recommended affine step: constant `dλ`
+far out, shrunk near the horizon, e.g. `h = dλ · max(step_floor, (r − r₊)/r)`.
+
+---
+
+## Formula CKS-6 — Horizon capture and escape
+
+```
+r₊ = 1 + sqrt(1 − a²)            # outer horizon (r is the BL radius)
+capture  when  r ≤ r₊ + ε_h      # ε_h = config render.horizon_epsilon (cost bound only)
+escape   when  ρ = sqrt(x²+y²+z²) ≥ r_max    # config render.r_max
+```
+
+CKS is regular at the horizon, so capture is detected right at `r₊` with no Δ→0 blowup;
+`ε_h` merely caps step count in the deep field.
+
+---
+
+## Formula CKS-7 — Photon initialization (ZAMO observer + projected ray direction)
+
+Preserves **Decision A (ZAMO)**, built coordinate-cleanly from the inverse metric.
+
+```
+# 1. ZAMO 4-velocity at the camera (x,y,z) — directly from g^{αβ}:
+α        = 1 / sqrt(−g^{tt})          # lapse
+u_obs^α  = −α · g^{tα}                 # ⇒ u_obs^t = 1/α > 0 ; zero angular momentum
+
+# 2. Camera ray coordinate direction n=(nx,ny,nz) (unit) from pixel + FOV
+#    (n = normalize(fwd + sx·right + sy·up); fwd/right/up are the world=CKS basis).
+#    Make it a 4-vector, g-orthogonal to u_obs, then g-unit:
+N^α   = (0, nx, ny, nz)
+N'^α  = N^α + (g_μν N^μ u_obs^ν) · u_obs^α        # now g·(N', u_obs) = 0
+ŝ^α   = N'^α / sqrt(g_μν N'^μ N'^ν)               # spatial unit (+++)
+
+# 3. Null photon momentum (contravariant), then lower:
+p^α = E_loc · ( u_obs^α + ŝ^α )                    # null automatically
+p_α = g_αβ p^β
+E   = −p_t,   L_z = x p_y − y p_x                  # set E_loc so E=1 (any scale; g uses ratios)
+```
+
+At `r ≳ 6` the camera is far outside the ergosphere (`r_ergo ≤ 2`), so ZAMO ≈ static and
+the construction is well-conditioned (`g ≈ η`). This replaces the BL closed-form ZAMO
+tetrad (Formula 7); the single-direction projection avoids needing a full tetrad.
+
+---
+
+## Formula CKS-8 — Accretion-disk gas 4-velocity (CKS, equatorial)
+
+Disk plane `z = 0`; `r = sqrt(x²+y²−a²)` (CKS-1). For a circular orbit (`r ≥ r_isco`),
+`dr = 0` along the orbit ⇒ the BL→KS `t`/`φ` shifts are constant ⇒ the velocity is a
+**rigid rotation about +z** at the BL angular velocity Ω (Formula 3):
+
+```
+Ω   = 1 / (r^{3/2} + a)                                   # Formula 3
+u^t = (1 + a r^{−3/2}) / sqrt(1 − 3/r + 2 a r^{−3/2})     # Formula 3 (numerator mandatory)
+u^x = −Ω y u^t,   u^y = +Ω x u^t,   u^z = 0
+```
+
+Prograde (co-rotating with +z spin): at `(R,0,0)`, `u^y > 0` (counter-clockwise).
+*Derivation:* at `z=0`, `x = r cosφ̃ + a sinφ̃`, `y = r sinφ̃ − a cosφ̃` (φ̃ = KS azimuth);
+`∂x/∂φ̃ = −y`, `∂y/∂φ̃ = x`, and `dr=0` ⇒ `u^x = (∂x/∂φ̃)u^φ̃ = −yΩu^t`, `u^y = xΩu^t`. No
+BL→KS Jacobian needed. *(Plunging `r < r_isco` is below the disk inner edge
+`r_inner = r_isco` and is never sampled; if ever required, transform Formula 5 with the
+full BL→KS Jacobian and **flag for human review** before use.)*
+
+---
+
+## Formula CKS-9 — g-factor (CKS)
+
+Observer at rest at infinity ⇒ `(p·u)_obs = p_t = −E`. With the integrator's covariant
+CKS momenta `p_μ` and the gas `u^μ` from CKS-8:
+
+```
+g = E_obs/E_emit = −E / ( p_t u^t + p_x u^x + p_y u^y + p_z u^z )
+```
+
+Then emission follows **Formula 9 verbatim** (chromaticity · g⁴, volumetric). The
+Formula-8 "divide p_r by Δ" bug is impossible here: there is no Δ and `p_μ` is already
+covariant.
+
+---
+
+## Formula CKS-10 — Escaped-ray celestial direction (no spin-axis seam)
+
+When a photon escapes (`ρ ≥ r_max`) the spacetime is asymptotically flat, so the
+contravariant spatial momentum direction **is** the celestial direction:
+
+```
+d   = (dx/dλ, dy/dλ, dz/dλ) normalized   # = (p^x,p^y,p^z)/|·|, the incoming sky dir
+θ′  = acos( clamp(d_z, −1, 1) )
+φ′  = atan2(d_y, d_x)
+equirect:  u = wrap(φ′/2π),   v = clamp(θ′/π, 0, 1)
+```
+
+`d` is a genuine Cartesian unit vector for **every** ray ⇒ the BL spin-axis seam, the
+φ-accumulation blowup, `normalize_sphere_angles` punch-through, and the `j_fold` /
+guard-(b′) meridian band-aids are **all removed**. Formula 10 (LOD) and Formula 13 (DNGR
+μ/PSF) act unchanged on screen-space neighbour differences of `(θ′, φ′)`; the only
+residual pole effect is the ordinary equirect-texture coordinate at `θ′ = 0, π`, handled
+by the standard φ-wrap already in the samplers.
+
+---
+
 ## Conservation test requirements
+
+**CKS harness (active path).** Verify along every integrated null geodesic:
+
+| Quantity | Tolerance | How to check |
+|---|---|---|
+| Photon energy `E = −p_t` | relative drift < 1e-4 | `abs((E−E₀)/E₀)` |
+| Axial ang. mom. `L_z = x p_y − y p_x` | relative drift < 1e-4 | `abs((Lz−Lz₀)/Lz₀)` |
+| Null condition `H = ½ g^αβ p_α p_β` | `abs(H)` < 1e-6 | CKS-3 inverse, direct eval |
+| Carter `Q` (null form, optional but recommended) | relative drift < 1e-4 | convert CKS→BL (`r` from CKS-1, `cosθ=z/r`, `p_θ` via Jacobian) then the BL null-Q below |
+
+The legacy BL harness below remains valid for the retired CPU `[r,θ,…]` path.
+
+### Legacy BL harness
 
 The pytest harness must verify all three of the following along every
 integrated null geodesic:
@@ -717,6 +957,7 @@ configs/render.yaml              ← a, r_isco, WIDTH, HEIGHT, step counts, star
 | v1.4 | **F10:** Added the screen-space Jacobian amendment (eliminate the offset ray; difference exit directions of neighbor pixels in a second shading kernel; same J/L; captured-neighbor ⇒ max_lod). **F11 (new):** FP32-stable factored discriminant Δ = y(y+2k). **F12 (new):** singularity-free polar potential Θ_u(u) for the u=cosθ state transform, with the `v_r=Δ·p_r → v_y=Δ·p_r` invariant migration, `p_θ=−v_u/√(1−u²)` recovery, and the approved polar guard on dφ/dt only. All three approved by the project owner 2026-06-02 for the renderer optimization (PROJECT.md §6). |
 | v1.5 | **F13 (new):** Hybrid DNGR point-star magnification — screen-space ray-bundle Jacobian J (2×2 generalization of F10's scalar J), magnification μ = \|det J₀·sinθ′₀\|/\|det J·sinθ′\|, and energy-conserving point flux `I_base·μ·g⁴` with a truncated-Gaussian PSF. Verified against `REFERENCE_dngr_paper.md` (James et al. 2015, A.2/A.3.1/A.7) on 2026-06-04. Resolves the F10 fidelity-note divergences #1 (point-star blur) and #2 (anisotropy). **⚠ Three guards FLAGGED pending owner approval:** (a) μ normalization by the flat-space footprint `det J₀·sinθ′₀`; (b) ESCAPE/`j_fold` boundary clamp `μ=1` (inherited from F10 v1.4); (c) g⁴ exponent choice for stars. |
 | v1.6 | **F13 guards APPROVED (owner, 2026-06-05)** and the DNGR render path landed (PROJECT.md §8 Phases 2–5): (a) μ normalized by the FD undeflected-reference footprint so μ→1 in flat space; (b) boundary clamp μ=1 on non-ESCAPED neighbours / `J>j_fold`, plus `δ⁻<caustic_delta_min ⇒ μ=min(μ,mag_clip)`; (c) volumetric g⁴ as a `starfield.g_beaming` hook (default g≡1). Two decoupled sky layers in `taichi_renderer.py`: Layer A point-star energy gather (`flux·μ·g⁴·PSF`, cell-grid candidate query) and Layer B anisotropic-EWA diffuse Milky-Way fetch; gated by `starfield.mode: texture\|dngr` (texture default reproduces v1.4 golden frames bit-for-bit). |
+| v1.8 | **PART II — Cartesian Kerr-Schild (CKS) ADDED + APPROVED (owner, 2026-06-06):** the renderer geodesic path migrates BL → CKS to remove the spin-axis (1/sin²θ) and horizon (Δ→0) *coordinate* singularities at the source (the root cause of the user-reported gray polar line and the whole seam-band-aid lineage). New Formulas CKS-1…CKS-10: implicit radius `r(x,y,z)`; metric `g=η+f l⊗l`; **exact** inverse `g=η−f l⊗l` (l is η-null); analytic ∂r/∂f/∂l; Hamiltonian geodesic EOM (`dx=g·p`, `dp=−½∂g·pp`); ZAMO-from-`g^{αβ}` + projected-ray photon init (preserves Decision A); equatorial disk gas velocity `u^x=−Ωy u^t, u^y=Ωx u^t` (no BL→KS Jacobian); CKS g-factor (Δ-bug impossible); seam-free escaped-ray celestial direction. BL Formulas 1/6/7/11/12 marked SUPERSEDED-for-renderer; 2/3/4/8/9/10/13 reused. Verified against GRay2 (arXiv:1706.07062), SpECTRE, Visser (arXiv:0706.0622). |
 | v1.7 | **F13 guard (b′) ADDED + APPROVED (owner, 2026-06-06):** Layer-A splat *placement* rule when `det J` is invalid (spin-axis seam / non-ESCAPED neighbour). The shipped code positioned the splat with the degenerate `J⁻¹`, collapsing all polar-cell stars onto the meridian (the "Artifact B" seam pileup, ≈15× the off-seam jump). (b′) places the splat by the star's true proper angular separation `d² = (Δθ′²+sin²θ′·Δφ′²)/dΩ` under the undeflected footprint `dΩ=|det J₀·sinθ′₀|` (the guard-(a) quantity), so seam stars keep real angular spacing at μ=1. Resolves the dngr-default seam (`test_no_spin_axis_seam`, `test_background_has_no_vertical_seam_stripe`). The matching Formula-10 `texture`-LOD regularization is a separate follow-up (spec §7.2), **not** part of this revision. |
 
 *Last verified: 2026-06-06 (F13 guard (b′) Layer-A splat-placement rule approved +

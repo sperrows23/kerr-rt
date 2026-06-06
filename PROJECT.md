@@ -13,8 +13,10 @@ one forward-looking proposal. This file supersedes the former `PROJECT_MAP.md`,
 > - **Config:** every numeric parameter lives in `configs/render.yaml` — no
 >   hardcoded physics or render literals in source.
 > - **Backend:** GPU is locked to `ti.init(arch=ti.cuda)` — never `ti.gpu`.
-> - **Units/coords:** geometric `G = M = c = 1`; Boyer-Lindquist `(t, r, θ, φ)`;
->   signature `(− + + +)`; spin `a = 0.999` (near-extremal).
+> - **Units/coords:** geometric `G = M = c = 1`; **Cartesian Kerr-Schild `(t, x, y, z)`**
+>   (active renderer path, SKILL.md PART II; spin axis = +z, CKS `r` is the BL radius,
+>   `z = r cosθ`). Boyer-Lindquist `(t, r, θ, φ)` is retired/history only.
+>   Signature `(− + + +)`; spin `a = 0.999` (near-extremal).
 > - **Encoding:** read text/config with `utf-8` / `utf-8-sig` (Windows cp949 box).
 
 ---
@@ -208,7 +210,6 @@ Black/
 │   ├── thumb.py                 ← CPU preview renderer (development / QA)
 │   ├── gpu_test.py              ← FHD GPU beauty render smoke test
 │   ├── ingest_stars.py          ← offline ingest: HYG/ATHYG csv (or BSC5) → point-star {θ',φ',flux_rgb}.npy (Formula 13 / §8 Layer A)
-│   ├── seam_diagnostics.py      ← spin-axis seam isolation tools (off the render path; ex-§7 C1)
 │   └── export_exr.py            ← Phase 5: multi-channel RGBAZ EXR writer (OpenImageIO)
 ├── skills/
 │   └── kerr-physics/
@@ -219,15 +220,15 @@ Black/
 │   │   └── export_camera.py     ← Blender script: exports camera_matrix.json
 │   └── renderer/
 │       ├── __init__.py
-│       ├── metric.py            ← Kerr metric (Formula 1)
-│       ├── geodesic.py          ← Mino-time RK4 null geodesic integrator (Formula 6)
-│       ├── disk.py              ← Accretion disk gas physics (Formulas 3/4/5/8/9) — FROZEN
-│       ├── starmap.py           ← 16K HDRI loader, mip pyramid, UV mapping (reused for the diffuse map)
+│       ├── metric.py            ← CKS Kerr metric + exact inverse + analytic derivs (Formulas CKS-1..4)
+│       ├── geodesic.py          ← CKS Hamiltonian RK4 null geodesic integrator (Formulas CKS-5/6/7)
+│       ├── disk.py              ← Accretion disk gas physics (Formulas CKS-8/9 + F9 chroma)
+│       ├── starmap.py           ← 16K HDRI loader, mip pyramid, CKS-10 celestial→UV (reused for the diffuse map)
 │       └── taichi_renderer.py   ← GPU renderer: Pipe A + Pipe B + Formula-13 DNGR background, split kernels
 ├── tests/
 │   ├── cuda_smoke_test.py       ← confirms CUDA backend JIT on RTX 5060
 │   ├── test_geodesic.py         ← conservation law tests (E, Lz, Q, null norm)
-│   ├── test_starmap.py          ← polar punch-through / UV normalization tests
+│   ├── test_starmap.py          ← CKS-10 celestial-direction → UV mapping tests
 │   ├── test_ingest_stars.py     ← point-star ingest transforms + HYG/BSC5 parsers (Layer A ingest)
 │   ├── test_starfield_dngr.py   ← Formula-13 DNGR: μ→1 flat-space, cell-grid CSR, CUDA dngr smoke
 │   ├── test_gpu_regression.py   ← automated GPU Doppler / NaN / disk-peak guard (CUDA-gated)
@@ -257,31 +258,36 @@ render values.
 **`skills/kerr-physics/SKILL.md`** — the physics formula reference (see §5). All GR
 formulas are copied verbatim from here, referenced by number throughout the code.
 
-**`src/renderer/metric.py`** — Kerr metric (Formula 1): `metric_bl(r, theta, a)` and
-the numerical inverse `inverse_metric_bl`. Used by `thumb.py` and
-`test_geodesic.py`. The GPU renderer inlines the metric analytically instead of
-importing this.
+**`src/renderer/metric.py`** — CKS Kerr metric (Formulas CKS-1..4): `kerr_radius`,
+`null_vector_cks`, `metric_cks`, the **exact** closed-form `inverse_metric_cks`
+(`l` is η-null, no numerical inverse), and `dmetric_inv_cks` (analytic spatial
+derivatives for the geodesic force). Coordinate order `(t, x, y, z)`. Used by
+`geodesic.py`, `disk.py`, `thumb.py`, `test_geodesic.py`. The GPU renderer inlines
+the same math as `@ti.func` instead of importing this.
 
-**`src/renderer/geodesic.py`** — CPU null-geodesic integrator (Formula 6): Mino-time
-RK4 with a projection step re-imposing `(dr/dλ)²=R`, `(dθ/dλ)²=Θ`. Key:
-`integrate_null_geodesic`, `make_null_initial_conditions`, `carter_Q`,
-`radial_turning_point`, `_DELTA_MIN = 0.05`. **CPU state vector**
-`[r, θ, φ, t, v_r, v_θ]` with `v_r = Δ·p_r`, `v_θ = p_θ`. *(This CPU `[r,θ,…]`
-docstring is correct and intentional — only the GPU side migrated to `[y,u,…]`.)*
-Used by `thumb.py`, `test_geodesic.py`.
+**`src/renderer/geodesic.py`** — CPU null-geodesic integrator (Formulas CKS-5/6/7):
+RK4 on the **8-vector** `[t, x, y, z, p_t, p_x, p_y, p_z]` (covariant momenta),
+with the adaptive affine step `h = dλ·max(floor, (r−r₊)/r)` and the CKS-6
+capture/escape stops. Key: `photon_momentum_cks` (CKS-7 ZAMO + projected ray),
+`make_null_initial_conditions`, `integrate_null_geodesic`, `_horizon_radius`, and
+the conserved-quantity helpers `energy`, `axial_angular_momentum`, `null_norm`,
+`carter_Q` (CKS→BL diagnostic). The legacy BL `radial_turning_point` /
+Mino-`R(r)`/`Θ(θ)` API is **removed**. Used by `thumb.py`, `test_geodesic.py`.
 
-**`src/renderer/disk.py`** — CPU accretion-disk gas physics; the reference the GPU
-port must match numerically (verified at three test points). Key:
-`isco_conserved_quantities` (F4), `gas_four_velocity` (F3/5), `g_factor` (F8;
-`p_cov[R]` already covariant — do not divide by Δ again), `blackbody_rgb` (F9
-chromaticity, no T⁴). **FROZEN — do not edit** (numerical regression). Used by
-`thumb.py` and `taichi_renderer.py` (imports `isco_conserved_quantities`).
+**`src/renderer/disk.py`** — CPU accretion-disk gas physics; the CKS reference the
+GPU `_disk_emit_cks` / `_gas_four_velocity_cks` `@ti.func` must match. Key:
+`gas_four_velocity_cks` (CKS-8 rigid +z rotation; no frozen ISCO constants — the
+plunging branch is never sampled since `r_inner = r_isco`), `g_factor` (CKS-9
+Cartesian dot product, `p` already covariant — no Δ-divide bug possible),
+`blackbody_rgb` (F9 chromaticity, no T⁴). Used by `thumb.py`.
 
 **`src/renderer/starmap.py`** — host-side 16K equirect starmap: `load_equirect`,
 `build_mip_pyramid` (box-filter, f16 levels), `Starmap.load/.sample` (trilinear
-ground truth), `normalize_sphere_angles` (polar punch-through fold),
-`direction_to_uv`. Equirect convention `u = φ/2π` (col), `v = θ/π` (row, north pole
-at v=0). Used by `taichi_renderer.py` (GPU upload) and `test_starmap.py`.
+ground truth), and `celestial_to_uv` (Formula CKS-10: an escaped ray's Cartesian
+direction → equirect UV; the BL `normalize_sphere_angles` punch-through fold is
+**removed** — CKS is regular on the spin axis). Equirect convention `u = φ'/2π`
+(col), `v = θ'/π` (row, north pole at v=0). Used by `taichi_renderer.py` (GPU
+upload) and `test_starmap.py`.
 
 **`src/renderer/taichi_renderer.py`** — the GPU renderer (~1084 lines). Ports the CPU
 physics to Taichi and runs both pipes on CUDA in the horizon-stable
@@ -311,40 +317,42 @@ physics to Taichi and runs both pipes on CUDA in the horizon-stable
   axis, and the point-star energy gather `Σ flux·μ·g⁴·exp(−d²/2σ²)` over the
   overlapping catalog cells (`d` = screen offset via `J⁻¹`).
 - *Kernels:* `render_pipe_a` (Pipe A only, square; retains its offset ray as the
-  dev LOD reference); **`render_beauty_physics`** (production K1 — traces, writes
-  exit/outcome + weighted Z, wraps φ into (−π,π] each step, shortest-arc exit
-  interp); **`render_beauty_shade`** (production K2 — `mode=texture`: the legacy
+  dev LOD reference); **`render_beauty_physics`** (production K1 — traces the CKS
+  8-vector, writes the CKS-10 exit direction `(cosθ′, φ′)` + outcome + weighted Z;
+  no per-step φ-wrap needed — the exit direction is a genuine Cartesian unit
+  vector); **`render_beauty_shade`** (production K2 — `mode=texture`: the legacy
   screen-space-Jacobian LOD + single starmap fetch, byte-for-byte unchanged;
   `mode=dngr`: `_dngr_shade` two-layer background. `_screen_jacobian_lod` saturates
-  LOD to `_MAX_LOD` when J > `render.j_fold`). *(The `render_starmap_raw` /
-  `render_fixed_lod` / `dump_phi_exit` seam diagnostics now live in
-  `scripts/seam_diagnostics.py` — §7 C1, resolved.)*
+  LOD to `_MAX_LOD` when J > `render.j_fold`).
 - *Host:* `load_config` (UTF-8), `setup_renderer` (cuda init + starmap upload;
   `_setup_dngr` uploads the Layer-A cell grid via `_build_star_grid` + the Layer-B
   pyramid via `_pack_pyramid` when `starfield.mode=dngr`),
-  `_alloc_output`/`_alloc_frame`, `render_pipe_a_image`,
-  **`render_beauty_frame`** (main entry — Blender world→BL, camera triad, runs
-  K1+K2, optional NaN-guarded Z), `render_beauty_frame_mb` (motion blur, masked
-  depth averaging), `tonemap` (Reinhard + gamma). **Consumed by:** `gpu_test.py`,
-  `export_exr.py`, `test_gpu_regression.py`.
+  `_alloc_output`/`_alloc_frame`, `render_pipe_a_image`, `_camera_basis`,
+  **`render_beauty_frame`** (main entry — Blender world basis = CKS directly,
+  re-orthonormalized, runs K1+K2, optional NaN-guarded Z), `render_beauty_frame_mb`
+  (motion blur, masked depth averaging), `tonemap` (Reinhard + gamma). **Consumed
+  by:** `gpu_test.py`, `export_exr.py`, `test_gpu_regression.py`.
 
-Camera conversion in `render_beauty_frame`: Blender `pos/fwd/up/right` →
-spherical embedding (`r_cam, θ_cam, φ_cam`) → local triad (r̂, θ̂, φ̂) → dot the
-camera axes onto the triad → feed the three local components to the ZAMO tetrad.
+Camera conversion in `render_beauty_frame`: world Cartesian **is** CKS, so the
+Blender `pos/fwd/up/right` basis is used directly (Gram-Schmidt re-orthonormalized
+`up` against `fwd`); per-pixel `n = normalize(fwd + sx·right + sy·up)` feeds the
+CKS-7 ZAMO + projected-ray photon init. No BL spherical embedding / triad.
 
 **`src/blender/export_camera.py`** — Blender Python (Phase 1). Writes
 `camera_matrix.json` (one record/frame: `{frame, pos, fwd, up, right, fov}`). `fwd`
 = world −Z; `fov = cam.angle` *(labeled "vertical FOV" — see §7 A1)*. Needs `bpy`.
 
 **`scripts/thumb.py`** — CPU preview renderer (single-threaded NumPy; slow but
-self-contained). `--disk` enables `march_disk`; uses config `thumb.*` framing
-overrides; `zamo_photon_momentum` is the CPU reference for `_zamo_init`. Flow:
-`render()` → `camera_ray_direction()` → `zamo_photon_momentum()` →
-`integrate_null_geodesic()` → `march_disk()` → `trace_pixel()` → tonemap.
+self-contained) — the CKS reference twin of `taichi_renderer`. `--disk` enables
+`march_disk`; uses config `thumb.*` framing overrides. Flow: `render()` (places
+the camera in CKS Cartesian, `camera_basis()`) → `pixel_direction()` →
+`make_null_initial_conditions()` (CKS-7) → `integrate_null_geodesic()` (CKS-5/6) →
+`march_disk()` (CKS-8/9) → `trace_pixel()` → tonemap.
 
 **`scripts/gpu_test.py`** — FHD GPU beauty smoke test. Reads a frame from
 `camera_matrix.json` (`utf-8-sig`), runs `render_beauty_frame` at 1920×1080,
-reports the Doppler asymmetry (`right_lum/left_lum` ≈ 7–8× expected). `--no-disk`,
+reports the Doppler asymmetry (`right_lum/left_lum` ≈ 4.3× under CKS — the affine
+emission measure reweights it down from the BL Mino value). `--no-disk`,
 `--exposure` flags.
 
 **`scripts/export_exr.py`** — Phase 5 production entry. Extracts beauty + depth via
@@ -352,11 +360,11 @@ reports the Doppler asymmetry (`right_lum/left_lum` ≈ 7–8× expected). `--no
 `render_blackhole/bh_####.exr`. `_shutter_arc(frames, idx, shutter_fraction, fps)`
 returns `Δφ·fps·shutter_fraction` (F2). `--motion-blur` opt-in.
 
-**`tests/test_geodesic.py`** — CPU geodesic conservation (E, Lz, Q drift < 1e-4;
-null condition < 1e-6 over 4000 steps) + a golden-CSV regression.
+**`tests/test_geodesic.py`** — CPU CKS geodesic conservation (E, Lz drift < 1e-4;
+null condition `|H|` < 1e-6 along the integrated 8-vector) + a golden-CSV regression.
 
-**`tests/test_starmap.py`** — polar punch-through fix unit tests
-(`normalize_sphere_angles`, `direction_to_uv`).
+**`tests/test_starmap.py`** — CKS-10 celestial-direction → UV mapping unit tests
+(`celestial_to_uv`).
 
 **`tests/test_gpu_regression.py`** — automated GPU beauty regression (the pytest form
 of the manual `gpu_test.py` check). Drives production `render_beauty_frame` (frame
@@ -377,11 +385,11 @@ machine; fails explicitly if `arch` is not `Arch.cuda`.
 
 ```
 configs/render.yaml ──▶ taichi_renderer.py · thumb.py · gpu_test.py · test_geodesic.py
-skills/.../SKILL.md  ──▶ metric.py(F1) · geodesic.py(F6) · disk.py(F3/4/5/8/9) ·
-                          starmap.py(F10 UV) · taichi_renderer.py(all, GPU port)
-metric.py    ──▶ thumb.py · test_geodesic.py
+skills/.../SKILL.md  ──▶ metric.py(CKS-1..4) · geodesic.py(CKS-5/6/7) · disk.py(CKS-8/9) ·
+                          starmap.py(CKS-10 UV) · taichi_renderer.py(all, GPU port)
+metric.py    ──▶ geodesic.py · disk.py · thumb.py · test_geodesic.py
 geodesic.py  ──▶ thumb.py · test_geodesic.py
-disk.py      ──▶ thumb.py(march_disk) · taichi_renderer.py(isco_conserved_quantities)
+disk.py      ──▶ thumb.py(march_disk)
 starmap.py   ──▶ taichi_renderer.py(setup_renderer upload) · test_starmap.py
 taichi_renderer.py ──▶ gpu_test.py · export_exr.py · test_gpu_regression.py
 export_camera.py(in Blender) ──▶ camera_matrix.json ──▶ gpu_test.py · export_exr.py
@@ -394,11 +402,12 @@ export_camera.py(in Blender) ──▶ camera_matrix.json ──▶ gpu_test.py 
 | GPU backend = `ti.cuda`, never `ti.gpu` | `taichi_renderer.py`, `cuda_smoke_test.py`, `CLAUDE.md` |
 | All formulas from `SKILL.md`, no re-derivation | `CLAUDE.md` physics policy |
 | All parameters from `configs/render.yaml` | all source; no physics literals |
-| `v_r = Δ·p_r` (CPU) renamed `v_y = dy/dλ = Δ·p_r` (GPU `[y,u,…]`) | `geodesic.py` / `_zamo_init`,`_disk_emit` |
-| `p_r` covariant recovery = `v_r/Δ` (not `/Δ²`) | `disk.py`, `_disk_emit` |
+| CKS coords `(t,x,y,z)`, 8-vector `[t,x,y,z,p_t,p_x,p_y,p_z]` | `geodesic.py`, `taichi_renderer.py` |
+| Exact inverse `g^αβ = η − f l^α l^β` (no matrix inverse) | `metric.py:inverse_metric_cks` |
+| `g`-factor is a Cartesian dot product (`p` already covariant — no Δ-divide) | `disk.py:g_factor`, `_disk_emit_cks` |
 | `blackbody_rgb` chromaticity-only | `disk.py`, `_blackbody_rgb` |
-| g⁴ beaming correct, not double-counted | `disk.py`, `_disk_emit` |
-| θ ∈ [0, π] before UV lookup | `starmap.py:normalize_sphere_angles` (GPU clamps `acos(u)` inline) |
+| g⁴ beaming correct, not double-counted | `disk.py`, `_disk_emit_cks` |
+| Escaped-ray celestial dir = normalized contravariant `(p^x,p^y,p^z)` (CKS-10) | `starmap.py:celestial_to_uv`, `_exit_cos_phi` |
 | Camera file encoding = utf-8-sig | `gpu_test.py` |
 | Config files read with utf-8 | `taichi_renderer.py`, `thumb.py`, `test_geodesic.py` |
 
@@ -408,8 +417,8 @@ export_camera.py(in Blender) ──▶ camera_matrix.json ──▶ gpu_test.py 
 
 | Section | Key fields |
 |---------|-----------|
-| `black_hole` | `spin` (a=0.999), `r_isco` (1.182 M), `r_plus` (1.0447 M — true outer horizon r₊=1+√(1−a²); consumed only by `thumb.py`, the renderer derives r₊ in `_horizon_constants`) |
-| `render` | `width`/`height` (4K), `thumb_width/height` (256), `max_steps_pipe_a` (250 — Pipe B shares this same trace loop / step cap; the dead `max_steps_pipe_b` key was removed, §7 F4), `d_lambda_pipe_a` (0.01), `r_max` (50 M), `device_memory_gb` (6), `horizon_epsilon` (0.05), `adaptive_step_floor` (0.005), `sin2_min` (1e-10 polar guard), `j_fold` (0.15 — background LOD fold-saturation; kills the center "static" seam), `fps` (24.0 — shutter arc = Δφ·fps·shutter_fraction), `projection_mode` (perspective\|equirect), `depth_infinity` (1e5 no-disk Z sentinel) |
+| `black_hole` | `spin` (a=0.999), `r_isco` (1.182 M), `r_plus` (1.0447 M — true outer horizon r₊=1+√(1−a²); now documentation-only, both the renderer and `thumb.py` derive r₊ from `spin` via `_horizon_radius`, CKS-6) |
+| `render` | `width`/`height` (4K), `thumb_width/height` (256), `max_steps_pipe_a` (800 — Pipe B shares this same trace loop / step cap; raised from 250 because the CKS affine λ advances ~1 coord-unit/step vs BL Mino ~r²/step), `d_lambda_pipe_a` (0.25 — CKS affine step; far-field h≈dλ, shrunk near the horizon), `r_max` (50 M), `device_memory_gb` (6), `horizon_epsilon` (0.05 — CKS-6 capture margin, cost bound only), `adaptive_step_floor` (0.02), `j_fold` (0.15 — background LOD fold-saturation; under CKS this only guards the equirect texture poles, the BH spin-axis seam is gone), `fps` (24.0 — shutter arc = Δφ·fps·shutter_fraction), `projection_mode` (perspective\|equirect), `depth_infinity` (1e5 no-disk Z sentinel). *(The BL `sin2_min` 1/sin²θ polar guard was removed — CKS has no spin-axis coordinate singularity.)* |
 | `disk` | `r_inner`, `r_outer`, `theta_half_width`, `T_0`, `emission_coeff`, `absorption_coeff`, `vertical_sigma_frac` (the bbox `|u|` early-out bound is now **derived** as `sin(theta_half_width)` in code — the old `bounding_sin_theta_half` literal was removed, §7 S2) |
 | `starmap` | `path` (relative to repo root), `width` (16384 — used to compute LOD) |
 | `starfield` | **DNGR background (Formula 13 / §8).** `mode` (`texture`\|`dngr`; texture default keeps the legacy F10 path + golden frames). *Ingest:* `format` (auto\|hyg\|bsc5), `source_catalog` (HYG/ATHYG csv or `bsc5.dat`), `catalog_path` (`assets/stars.npy`), `mag_limit` (6.5), `mag_zero_point` (0.0). *Layer A (point stars):* `star_grid_cols/rows` (candidate cell grid), `star_cell_radius`, `star_psf_px` (PSF σ), `psf_trunc_sigma`, `mag_clip` (μ cap), `caustic_delta_min` (δ⁻ floor), `g_beaming` (g⁴ hook, default off). *Layer B (diffuse):* `diffuse_map` (Milky-Way EXR), `diffuse_width`, `ewa_max_taps`, `jacobian` (`finite_diff`). The Layer-A/B fields load only in `mode=dngr` |
@@ -420,6 +429,29 @@ export_camera.py(in Blender) ──▶ camera_matrix.json ──▶ gpu_test.py 
 ---
 
 ## 5. Physics formula index (`SKILL.md`)
+
+**Active path = PART II (Cartesian Kerr-Schild).** As of the 2026-06 CKS migration
+the renderer, CPU core, disk, and starmap UV all use Formulas **CKS-1…CKS-10**
+(SKILL.md PART II). The PART I BL formulas **1/6/7/11/12** are *superseded for the
+renderer* (kept for history / the retired BL reference); **2/3/4** are reused
+unchanged (BL-radius quantities — CKS `r` is the BL radius); **8/9/10/13** are
+reused, acting on coordinate-agnostic quantities (the CKS-9 g-factor / CKS-10
+celestial direction). CKS PART II index:
+
+| Formula | Content |
+|---------|---------|
+| CKS-1 | Implicit Kerr radius r(x,y,z) (= BL radial coord; explicit positive root) |
+| CKS-2 | Cartesian Kerr-Schild metric g_αβ = η_αβ + f·l_α l_β (regular on axis + horizon) |
+| CKS-3 | **Exact** inverse g^αβ = η^αβ − f·l^α l^β (l is η-null; no matrix inverse) |
+| CKS-4 | Analytic coordinate derivatives ∂r, ∂f, ∂l_α (geodesic force term) |
+| CKS-5 | Hamiltonian null-geodesic EOM; 8-vector RK4; E=−p_t, L_z=x p_y−y p_x conserved |
+| CKS-6 | Horizon capture (r ≤ r₊+ε_h) / escape (ρ ≥ r_max) |
+| CKS-7 | Photon init: ZAMO observer (from g^αβ) + g-orthogonal projected ray |
+| CKS-8 | Equatorial disk gas 4-velocity: rigid +z rotation at Ω (no BL→KS Jacobian) |
+| CKS-9 | g-factor = −E/(p_t u^t + p_x u^x + p_y u^y + p_z u^z) (Cartesian dot product) |
+| CKS-10 | Escaped-ray celestial dir = normalized contravariant (p^x,p^y,p^z) → (θ′,φ′) |
+
+PART I (retired/reused) formula index:
 
 | Formula | Content |
 |---------|---------|
@@ -443,8 +475,23 @@ simple temperature model T = T₀·(6/r)^0.75.
 
 ## 6. Implementation status — shipped
 
+**CKS migration (2026-06, headline).** The entire renderer was refactored from
+Boyer-Lindquist to **Cartesian Kerr-Schild** to eliminate the gray polar-axis
+artifact at its source (the BL 1/sin²θ spin-axis pole + Δ→0 horizon singularity).
+SKILL.md PART II (CKS-1…10) is the contract; `metric.py`/`geodesic.py` (8-vector
+RK4), `taichi_renderer.py` (GPU), `disk.py`, `starmap.py`, `thumb.py`, and
+`configs/render.yaml` are all on CKS. The BL band-aids — `sin2_min`, `Θ_u`,
+per-step φ-wrap, `j_fold` *meridian* collapse, `normalize_sphere_angles`
+punch-through, and the four `scripts/seam_*`/`_uv_sweep`/`test_pipe_a` diagnostics
+— are **deleted**. *Validated:* `test_geodesic` green (E conserved ~1e-8, |H|<1e-6);
+GPU `--no-disk` shows a clean shadow with **no polar line**; disk render shows the
+photon ring + g⁴-beamed approaching edge. The CKS affine-vs-Mino emission measure
+reweights the Doppler half-frame ratio to ≈4.3× (was 7.77× under BL) and required
+recalibrating `emission_coeff`/`absorption_coeff` ~1/30 (see §4 + render.yaml).
+
 The full 5-phase optimization from `guid.md` (the now-superseded source spec) is
-**complete** and committed. Condensed history:
+**complete** and committed. Condensed history (the Phase-1 `[y,u,…]` / Θ_u / φ-wrap
+work below predates and is **superseded by** the CKS migration above):
 
 - **Gates approved (2026-06-02):** SKILL.md Formula 11/12 + the Formula 10 amendment
   landed (rev v1.4); polar guard kept on dφ/dt only.
@@ -583,10 +630,11 @@ are documented, not yet applied — confirmed present on inspection:
   `render_beauty_frame` from `disk.theta_half_width`; the duplicated literal
   (which desynced when θ_half was edited) was removed from `render.yaml`.
   `black_hole.r_plus`/`r_isco` are likewise derived-value duplicates of `spin`;
-  the GPU already derives `r_plus` (`_horizon_constants`) — its stale docstring was
-  corrected. **FLAGGED:** the CPU preview (`thumb.py`/`seam_diag.py`) still reads the
-  `r_plus` literal as the `radial_turning_point` r_floor and will desync if `spin`
-  changes — migrate it to derive too (CPU path, frozen this pass).
+  the GPU already derives `r_plus` (`_horizon_radius`) — its stale docstring was
+  corrected. ✅ **RESOLVED by the CKS migration (2026-06):** the CPU preview
+  (`thumb.py`) now also derives `r₊` from `spin` via `_horizon_radius` (the BL
+  `radial_turning_point` r_floor it used is gone), so `r_plus` is documentation-only
+  and the desync hazard is removed.
 - **S3 — GPU kernel consistency.** ✅ **RESOLVED (2026-06-05).** The per-step φ-wrap
   and `_J_FOLD` fold-saturation that the production beauty kernels carry were
   propagated into `render_pipe_a` (it had neither, so its raw exit-φ collapsed to

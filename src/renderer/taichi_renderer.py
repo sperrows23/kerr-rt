@@ -1,24 +1,41 @@
 """Production Taichi GPU renderer — Phase 2 of the Kerr pipeline.
 
-This module currently implements **Pipe A** (4K-capable beauty pass: starmap +
-gravitational lensing, no volume). Pipe B (volumetric disk march) and the
-multi-part EXR writer are added in later build steps.
+This module implements **Pipe A** (4K-capable beauty pass: starmap +
+gravitational lensing) and **Pipe B** (volumetric accretion-disk march) on the
+GPU, plus the Formula-13 DNGR two-layer background.
 
-Physics is ported **verbatim** from the NumPy reference modules, which in turn
-follow ``skills/kerr-physics/SKILL.md`` (project CRITICAL RULE: no formula is
+Physics is ported **verbatim** from ``skills/kerr-physics/SKILL.md`` PART II —
+**Cartesian Kerr-Schild (CKS)** — mirroring the verified NumPy reference modules
+``renderer.metric`` / ``renderer.geodesic`` (project CRITICAL RULE: no formula is
 re-derived here). The ported pieces are:
 
-  * Formula 1  — Kerr metric components       (``renderer.metric``)
-  * Formula 6  — Mino-time RK4 integration    (``renderer.geodesic``)
-  * Formula 7  — ZAMO tetrad photon momentum  (``scripts.thumb.zamo_photon_momentum``)
-  * Formula 10 — differential-ray mip LOD     (``skills/kerr-physics`` + ``renderer.starmap``)
+  * Formula CKS-1/2 — implicit Kerr radius r(x,y,z); metric g = η + f l⊗l
+  * Formula CKS-3   — *exact* inverse g⁻¹ = η − f l⊗l   (l is η-null)
+  * Formula CKS-4   — analytic ∂r, ∂f, ∂l_i
+  * Formula CKS-5   — Hamiltonian null geodesic EOM, RK4 on [t,x,y,z,p_t,p_x,p_y,p_z]
+  * Formula CKS-6   — horizon capture (r ≤ r₊+ε) / escape (ρ ≥ r_max)
+  * Formula CKS-7   — ZAMO-from-g⁻¹ + projected-ray photon initialization
+  * Formula CKS-8   — equatorial disk gas 4-velocity (rigid rotation about +z)
+  * Formula CKS-9   — g-factor (Cartesian dot product; the BL Δ-divide bug is gone)
+  * Formula CKS-10  — escaped-ray celestial direction from asymptotic momentum
+  * Formula 10/13   — differential-ray mip LOD + DNGR μ/PSF (coordinate-agnostic;
+                      they act on the celestial direction (θ′, φ′) and are unchanged)
+
+**Why CKS:** Boyer-Lindquist had *coordinate* singularities on the spin axis
+(1/sin²θ) and at the horizon (Δ→0). The whole BL band-aid lineage — u=cosθ Θ_u,
+per-step φ-wrap, ``_project`` potential re-imposition, ``normalize_sphere_angles``
+punch-through, the spin-axis ``j_fold`` meridian collapse — is **deleted**: CKS is
+regular on the axis and across the horizon, so the artifact class is removed at the
+source. The escaped-ray direction (CKS-10) is a genuine Cartesian unit vector for
+every ray, so ``exit_buf`` still stores ``(cosθ′, φ′, outcome)`` and every
+downstream screen-space LOD / DNGR routine is byte-for-byte unchanged.
 
 GPU backend is LOCKED to ``ti.init(arch=ti.cuda)`` (never ``ti.gpu``) per CLAUDE.md.
 
 All numerical parameters come from ``configs/render.yaml`` (no hardcoded values).
-The only literals here are integration-scheme safety constants that already live
-in ``renderer.geodesic`` (``_DELTA_MIN`` horizon stop, ``1e-10`` polar-axis
-denominator clamp) — these are not physics and are mirrored, not re-derived.
+The only literals here are integration-scheme safety constants (the horizon-capture
+margin, mirrored from ``render.horizon_epsilon``; tiny denominator clamps) — these
+are not physics.
 """
 
 import math
@@ -43,23 +60,20 @@ def load_config(path: Path = _CONFIG_PATH) -> dict:
         return yaml.safe_load(fh)
 
 
-# Integration-scheme safety constants (mirrored from renderer.geodesic — NOT
-# physics). Overridden from configs/render.yaml in setup_renderer:
-#   _DELTA_MIN ← render.horizon_epsilon  (Δ-capture stop before the horizon)
-#   _SIN2_MIN  ← render.sin2_min         (polar guard on dφ/dλ, dt/dλ ONLY; Formula 12)
-_DELTA_MIN = 0.05
-_SIN2_MIN = 1e-10
+# Horizon-capture margin (mirrored from render.horizon_epsilon — NOT physics).
+# CKS is regular at the horizon, so capture is detected right at r₊; this ε only
+# caps step count in the deep field (Formula CKS-6). Baked into kernels at JIT.
+_HORIZON_EPS = 0.05
 # Background-fold LOD saturation: an escaped pixel whose screen-space exit
-# footprint J (rad) exceeds this is straddling a lensing fold (the spin-axis
-# meridian caustic) and is collapsed to the coarsest mip. From render.j_fold.
+# footprint J (rad) exceeds this straddles an equirect-texture pole or the
+# chaotic shadow edge and is collapsed to the coarsest mip. From render.j_fold.
+# (Under CKS the BL spin-axis seam is gone; this now only guards the texture
+# poles / shadow silhouette.)
 _J_FOLD = 0.15
 
-# State vector layout (Phase 1.3, Formula 12): [y, u, φ, t, v_y, v_u] where
-#   y = r − r₊   (horizon-relative radius; Formula 11)
-#   u = cos θ    (singularity-free polar coordinate)
-#   v_y = dy/dλ = Δ·p_r   (invariant migrated from v_r = Δ·p_r; dy = dr)
-#   v_u = du/dλ = −sinθ·p_θ = −√(1−u²)·p_θ
-vec6 = ti.types.vector(6, ti.f32)
+# State vector layout (Formula CKS-5): the 8-vector [t, x, y, z, p_t, p_x, p_y, p_z]
+# in Cartesian Kerr-Schild coordinates (covariant momenta). p_t is conserved (= −E).
+vec8 = ti.types.vector(8, ti.f32)
 vec4 = ti.types.vector(4, ti.f32)
 vec3 = ti.types.vector(3, ti.f32)
 vec2 = ti.types.vector(2, ti.f32)
@@ -120,7 +134,7 @@ _RES = 0
 # Beauty-pass output (non-square, set per frame render).
 frame_pixels: ti.Field = None     # type: ignore[assignment]
 # Kernel-split hand-off buffers (Phase 2.4): physics kernel writes, shading reads.
-exit_buf: ti.Field = None         # type: ignore[assignment]  (H,W,3): u_exit, φ_exit, outcome
+exit_buf: ti.Field = None         # type: ignore[assignment]  (H,W,3): cosθ′, φ′, outcome
 disk_buf: ti.Field = None         # type: ignore[assignment]  (H,W,4): disk_rgb + transmittance
 depth_pixels: ti.Field = None     # type: ignore[assignment]  (H,W): transmittance-weighted Z (3.4)
 _FW = 0
@@ -188,15 +202,14 @@ def setup_renderer(cfg: dict) -> Starmap:
     """
     global star_flat, star_off, star_w, star_h
     global _N_LEVELS, _MAX_LOD, _STARMAP_WIDTH
-    global _DELTA_MIN, _SIN2_MIN, _J_FOLD
+    global _HORIZON_EPS, _J_FOLD
     global cat_theta, cat_phi, cat_flux, cell_start, cell_count
     global mw_flat, mw_off, mw_w, mw_h, _MW_N_LEVELS, _MW_MAX_LOD, _MW_WIDTH
     global _DNGR, _STAR_COLS, _STAR_ROWS, _STAR_CELL_R, _STAR_PSF, _PSF_TRUNC
     global _MAG_CLIP, _CAUSTIC_DMIN, _EWA_MAX_TAPS, _G_BEAMING
 
     # Integration-scheme constants from config (baked into kernels at first JIT).
-    _DELTA_MIN = float(cfg["render"]["horizon_epsilon"])
-    _SIN2_MIN = float(cfg["render"]["sin2_min"])
+    _HORIZON_EPS = float(cfg["render"]["horizon_epsilon"])   # CKS-6 capture margin
     _J_FOLD = float(cfg["render"].get("j_fold", 0.15))
 
     mem_gb = float(cfg["render"]["device_memory_gb"])
@@ -314,22 +327,15 @@ def _setup_dngr(cfg: dict) -> None:
         _MW_WIDTH = 16384.0
 
 
-def _horizon_constants(a: float) -> tuple[float, float]:
-    """Precompute FP32-stable horizon constants (optimization Phase 1.1 / Formula 11).
+def _horizon_radius(a: float) -> float:
+    """Outer horizon r₊ = 1 + √(1−a²) (Formula CKS-6; r is the BL radius).
 
-    Returns ``(k_horizon, r_plus)`` with ``k_horizon = √(1−a²)`` and the *true*
-    outer horizon ``r₊ = 1 + k_horizon``. Derived from ``a`` here (like E_I/L_I and
-    tan_half_fov) rather than read from ``configs.black_hole.r_plus`` so it can never
-    drift out of sync with ``black_hole.spin``: r₊ is a *function* of a, so the
-    config key (1.0447 for a=0.999) is a derived-value duplication that silently
-    desyncs if a is edited. The config key is still consumed verbatim by the CPU
-    preview path (``scripts/thumb.py`` / ``seam_diag.py``) as the
-    ``radial_turning_point`` r_floor (= the horizon, which is correct at a=0.999);
-    those readers should be migrated to derive r₊ too. FLAGGED — CPU path, out of
-    scope for the GPU audit.
+    Derived from ``a`` here (like the camera basis and disk constants) rather than
+    read from ``configs.black_hole.r_plus`` so it can never drift out of sync with
+    ``black_hole.spin``: r₊ is a *function* of a, so the config key (1.0447 for
+    a=0.999) is a derived-value duplication that silently desyncs if a is edited.
     """
-    k = math.sqrt(1.0 - a * a)
-    return k, 1.0 + k
+    return 1.0 + math.sqrt(max(0.0, 1.0 - a * a))
 
 
 def _alloc_output(res: int) -> None:
@@ -351,169 +357,220 @@ def _alloc_frame(width: int, height: int) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Physics @ti.func — ported verbatim from renderer.geodesic / metric / thumb
+# CKS physics @ti.func — ported verbatim from renderer.metric / renderer.geodesic
 # --------------------------------------------------------------------------- #
 @ti.func
-def _delta(r, a):
-    return r * r - 2.0 * r + a * a
+def _kerr_radius(x, y, z, a):
+    """Kerr radius r(x,y,z) — Formula CKS-1 explicit positive root."""
+    a2 = a * a
+    rho2 = x * x + y * y + z * z
+    half = 0.5 * (rho2 - a2)
+    r2 = half + ti.sqrt(half * half + a2 * z * z)
+    return ti.sqrt(ti.max(r2, 1e-12))
 
 
 @ti.func
-def _delta_y(y, k):
-    # Δ = y·(y + 2k)  ≡  r²−2r+a²   (Formula 11; zero catastrophic cancellation).
-    # y = r − r₊,  k = √(1−a²),  r₊ = 1 + k.
-    return y * (y + 2.0 * k)
+def _cks_f_l(x, y, z, a):
+    """Scalar f and covariant null vector l_α (l_t = 1) — Formula CKS-2."""
+    r = _kerr_radius(x, y, z, a)
+    r2 = r * r
+    a2 = a * a
+    D = r2 * r2 + a2 * z * z          # r⁴ + a²z²
+    S = r2 + a2                       # r² + a²
+    f = 2.0 * r2 * r / D
+    l = vec4(1.0, (r * x + a * y) / S, (r * y - a * x) / S, z / r)
+    return f, l
 
 
 @ti.func
-def _radial_potential_y(y, k, r_plus, E, Lz, Q, a):
-    # R = [E(r²+a²) − aL_z]² − Δ·[(L_z − aE)² + Q]   (Formula 6, null form),
-    # with r = y + r₊ and Δ = _delta_y(y,k)  (Formula 11).
-    r = y + r_plus
-    P = E * (r * r + a * a) - a * Lz
-    B = (Lz - a * E) ** 2 + Q
-    return P * P - _delta_y(y, k) * B
+def _metric_cks(x, y, z, a):
+    """Covariant metric g_αβ = η_αβ + f l_α l_β — Formula CKS-2."""
+    f, l = _cks_f_l(x, y, z, a)
+    eta = vec4(-1.0, 1.0, 1.0, 1.0)
+    M = ti.Matrix.zero(ti.f32, 4, 4)
+    for i in ti.static(range(4)):
+        for j in ti.static(range(4)):
+            diag = eta[i] if i == j else 0.0
+            M[i, j] = diag + f * l[i] * l[j]
+    return M
 
 
 @ti.func
-def _radial_potential_deriv_y(y, k, r_plus, E, Lz, Q, a):
-    # dR/dy = dR/dr = 4Er·P − (2r−2)·B   (calculus derivative; dr/dy = 1).
-    r = y + r_plus
-    P = E * (r * r + a * a) - a * Lz
-    B = (Lz - a * E) ** 2 + Q
-    return 4.0 * E * r * P - (2.0 * r - 2.0) * B
+def _inv_metric_cks(x, y, z, a):
+    """Exact inverse g^αβ = η^αβ − f l^α l^β — Formula CKS-3 (l is η-null)."""
+    f, l = _cks_f_l(x, y, z, a)
+    lu = vec4(-l[0], l[1], l[2], l[3])   # l^α = η^αγ l_γ : l^t = −l_t = −1
+    eta = vec4(-1.0, 1.0, 1.0, 1.0)
+    M = ti.Matrix.zero(ti.f32, 4, 4)
+    for i in ti.static(range(4)):
+        for j in ti.static(range(4)):
+            diag = eta[i] if i == j else 0.0
+            M[i, j] = diag - f * lu[i] * lu[j]
+    return M
 
 
 @ti.func
-def _theta_potential_u(u, E, Lz, Q, a):
-    # Θ_u(u) = (1−u²)(Q + a²E²u²) − L_z²u²   (Formula 12; singularity-free).
-    u2 = u * u
-    return (1.0 - u2) * (Q + a * a * E * E * u2) - Lz * Lz * u2
+def _eom(s, a):
+    """Right-hand side of the CKS-5 8-vector EOM (mirrors renderer.geodesic._eom).
 
+    s = [t, x, y, z, p_t, p_x, p_y, p_z] (covariant momenta). Working form with
+    φ_l = l^β p_β = −p_t + l_x p_x + l_y p_y + l_z p_z:
 
-@ti.func
-def _theta_potential_deriv_u(u, E, Lz, Q, a):
-    # dΘ_u/du = −2u(Q + a²E²u²) + 2a²E²u(1−u²) − 2L_z²u   (Formula 12).
-    u2 = u * u
-    return (-2.0 * u * (Q + a * a * E * E * u2)
-            + 2.0 * a * a * E * E * u * (1.0 - u2)
-            - 2.0 * Lz * Lz * u)
-
-
-@ti.func
-def _deriv(s, E, Lz, Q, a, k, r_plus):
-    # State s = [y, u, φ, t, v_y, v_u]; returns ds/dλ (Mino time), Formulas 6/11/12.
-    y = s[0]
-    u = s[1]
-    vy = s[4]
-    vu = s[5]
-    r = y + r_plus
-    Delta = _delta_y(y, k)
-    sin2 = 1.0 - u * u
-    sin2_safe = ti.max(sin2, _SIN2_MIN)   # polar guard on dφ/dλ, dt/dλ ONLY
-    P = E * (r * r + a * a) - a * Lz
-
-    dy = vy
-    du = vu
-    dphi = -(a * E - Lz / sin2_safe) + a * P / Delta
-    dt = -a * (a * E * sin2 - Lz) + (r * r + a * a) * P / Delta
-    dvy = 0.5 * _radial_potential_deriv_y(y, k, r_plus, E, Lz, Q, a)
-    dvu = 0.5 * _theta_potential_deriv_u(u, E, Lz, Q, a)
-    return vec6(dy, du, dphi, dt, dvy, dvu)
-
-
-@ti.func
-def _project(s, E, Lz, Q, a, k, r_plus):
-    # Re-impose (dy/dλ)² = R, (du/dλ)² = Θ_u exactly (signs from RK4 evolution).
-    R = _radial_potential_y(s[0], k, r_plus, E, Lz, Q, a)
-    Theta_u = _theta_potential_u(s[1], E, Lz, Q, a)
-    vy_mag = ti.sqrt(ti.max(0.0, R))
-    vu_mag = ti.sqrt(ti.max(0.0, Theta_u))
-    vy = vy_mag if s[4] >= 0.0 else -vy_mag
-    vu = vu_mag if s[5] >= 0.0 else -vu_mag
-    return vec6(s[0], s[1], s[2], s[3], vy, vu)
-
-
-@ti.func
-def _rk4_delta(s, E, Lz, Q, a, k, r_plus, h):
-    # RK4 increment Δs (before projection); split out so the loop can apply
-    # Kahan compensated summation to the state accumulation (optimization Phase 1.4).
-    k1 = _deriv(s, E, Lz, Q, a, k, r_plus)
-    k2 = _deriv(s + 0.5 * h * k1, E, Lz, Q, a, k, r_plus)
-    k3 = _deriv(s + 0.5 * h * k2, E, Lz, Q, a, k, r_plus)
-    k4 = _deriv(s + h * k3, E, Lz, Q, a, k, r_plus)
-    return (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
-
-
-@ti.func
-def _rk4_step(s, E, Lz, Q, a, k, r_plus, h):
-    # Plain (uncompensated) RK4 + project — used by the diagnostics kernels.
-    s2 = s + _rk4_delta(s, E, Lz, Q, a, k, r_plus, h)
-    return _project(s2, E, Lz, Q, a, k, r_plus)
-
-
-@ti.func
-def _rk4_step_kahan(s, c, E, Lz, Q, a, k, r_plus, h):
-    """Compensated (Kahan) RK4 step (optimization Phase 1.4). Returns ``(s_next, c_next)``.
-
-    Kahan summation on the state accumulation keeps the slowly-growing position
-    components (y, u, φ, t) from losing low-order bits over hundreds of small
-    f32 steps. The velocity components (v_y, v_u) are re-imposed exactly by the
-    projection each step, so their compensation is reset to 0.
+        dt/dλ  = −p_t + f φ_l
+        dxⁱ/dλ = p_i − f l_i φ_l
+        dp_t/dλ = 0
+        dp_i/dλ = ½ (∂_i f) φ_l² + f φ_l (∂_i φ_l)
     """
-    delta = _rk4_delta(s, E, Lz, Q, a, k, r_plus, h)
-    y_step = delta - c
-    t = s + y_step
-    c_next = (t - s) - y_step
-    s_next = _project(t, E, Lz, Q, a, k, r_plus)
-    # Projection overwrote v_y, v_u → clear their (now stale) compensation.
-    c_next = vec6(c_next[0], c_next[1], c_next[2], c_next[3], 0.0, 0.0)
-    return s_next, c_next
+    x = s[1]
+    y = s[2]
+    z = s[3]
+    p_t = s[4]
+    p_x = s[5]
+    p_y = s[6]
+    p_z = s[7]
+
+    a2 = a * a
+    rho2 = x * x + y * y + z * z
+    half = 0.5 * (rho2 - a2)
+    r = ti.sqrt(ti.max(half + ti.sqrt(half * half + a2 * z * z), 1e-12))
+    r2 = r * r
+    r3 = r2 * r
+    D = r2 * r2 + a2 * z * z          # r⁴ + a²z²
+    S = r2 + a2                       # r² + a²
+
+    f = 2.0 * r3 / D
+    l_x = (r * x + a * y) / S
+    l_y = (r * y - a * x) / S
+    l_z = z / r
+
+    # ∂r/∂xⁱ  (CKS-4)
+    dr_x = r3 * x / D
+    dr_y = r3 * y / D
+    dr_z = r * z * S / D
+
+    # ∂f/∂xⁱ = f·[3 (∂r/∂xⁱ)/r − (4 r³ ∂r/∂xⁱ + 2 a² z δ_iz)/D]  (CKS-4)
+    df_x = f * (3.0 * dr_x / r - (4.0 * r3 * dr_x) / D)
+    df_y = f * (3.0 * dr_y / r - (4.0 * r3 * dr_y) / D)
+    df_z = f * (3.0 * dr_z / r - (4.0 * r3 * dr_z + 2.0 * a2 * z) / D)
+
+    # ∂l_i/∂xʲ  (CKS-4); l_t constant ⇒ no t-row.
+    S2 = S * S
+    dlx_x = ((x * dr_x + r) * S - (r * x + a * y) * (2.0 * r * dr_x)) / S2
+    dlx_y = ((x * dr_y + a) * S - (r * x + a * y) * (2.0 * r * dr_y)) / S2
+    dlx_z = ((x * dr_z) * S - (r * x + a * y) * (2.0 * r * dr_z)) / S2
+    dly_x = ((y * dr_x - a) * S - (r * y - a * x) * (2.0 * r * dr_x)) / S2
+    dly_y = ((y * dr_y + r) * S - (r * y - a * x) * (2.0 * r * dr_y)) / S2
+    dly_z = ((y * dr_z) * S - (r * y - a * x) * (2.0 * r * dr_z)) / S2
+    dlz_x = -z * dr_x / r2
+    dlz_y = -z * dr_y / r2
+    dlz_z = 1.0 / r - z * dr_z / r2
+
+    phi_l = -p_t + l_x * p_x + l_y * p_y + l_z * p_z
+
+    dt = -p_t + f * phi_l
+    dx = p_x - f * l_x * phi_l
+    dy = p_y - f * l_y * phi_l
+    dz = p_z - f * l_z * phi_l
+
+    dphi_x = dlx_x * p_x + dly_x * p_y + dlz_x * p_z
+    dphi_y = dlx_y * p_x + dly_y * p_y + dlz_y * p_z
+    dphi_z = dlx_z * p_x + dly_z * p_y + dlz_z * p_z
+
+    dpx = 0.5 * df_x * phi_l * phi_l + f * phi_l * dphi_x
+    dpy = 0.5 * df_y * phi_l * phi_l + f * phi_l * dphi_y
+    dpz = 0.5 * df_z * phi_l * phi_l + f * phi_l * dphi_z
+
+    return vec8(dt, dx, dy, dz, 0.0, dpx, dpy, dpz)
 
 
 @ti.func
-def _zamo_init(r, theta, a, k, r_plus, n_r, n_th, n_ph):
-    """Formula 7 ZAMO tetrad → (E, L_z, Q, v_y0, v_u0) for the [y,u,...] state.
+def _rk4_step(s, a, h):
+    """One RK4 step of the CKS-5 EOM (mirrors renderer.geodesic.integrate)."""
+    k1 = _eom(s, a)
+    k2 = _eom(s + 0.5 * h * k1, a)
+    k3 = _eom(s + 0.5 * h * k2, a)
+    k4 = _eom(s + h * k3, a)
+    return s + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
 
-    Mirrors ``scripts.thumb.zamo_photon_momentum``. The state-derivative
-    extraction is migrated (Formula 12): v_y = Δ·p_r (= old v_r, since dy=dr) and
-    v_u = du/dλ = −sinθ·p_θ = −√(1−u²)·p_θ.
+
+@ti.func
+def _photon_momentum_cks(cx, cy, cz, nx, ny, nz, a):
+    """Covariant photon momentum p_α at the camera — Formula CKS-7.
+
+    ZAMO observer from g^αβ, ray coordinate direction n projected g-orthogonal to
+    u_obs, normalized, p^α = u_obs^α + ŝ^α, lowered, scaled so E = −p_t = 1.
+    Mirrors ``renderer.geodesic.photon_momentum_cks``.
     """
-    sin2 = ti.sin(theta) ** 2
-    cos2 = ti.cos(theta) ** 2
-    Sigma = r * r + a * a * cos2
-    Delta = _delta_y(r - r_plus, k)                    # Formula 11 (FP32-stable)
-    A = (r * r + a * a) ** 2 - a * a * Delta * sin2     # exact A (Formula 7)
-    omega = 2.0 * a * r / A
-    alpha = ti.sqrt(Sigma * Delta / A)
-    g_phiphi = A * sin2 / Sigma
+    g = _metric_cks(cx, cy, cz, a)
+    gi = _inv_metric_cks(cx, cy, cz, a)
 
-    # Contravariant momentum (Formula 7).
-    p_t_con = 1.0 / alpha
-    p_r_con = n_r * ti.sqrt(Delta / Sigma)
-    p_th_con = n_th * (1.0 / ti.sqrt(Sigma))
-    p_ph_con = omega / alpha + n_ph * (1.0 / ti.sqrt(g_phiphi))
+    lapse = 1.0 / ti.sqrt(-gi[0, 0])
+    u_obs = vec4(0.0, 0.0, 0.0, 0.0)
+    for i in ti.static(range(4)):
+        u_obs[i] = -lapse * gi[0, i]              # u_obs^α = −α g^{tα}
 
-    # Metric components (Formula 1) to lower the index.
-    g_tt = -(1.0 - 2.0 * r / Sigma)
-    g_tph = -2.0 * a * r * sin2 / Sigma
-    g_phph = g_phiphi
-    g_rr = Sigma / Delta
-    g_thth = Sigma
+    N = vec4(0.0, nx, ny, nz)
+    gNu = N.dot(g @ u_obs)                        # g_μν N^μ u_obs^ν
+    Nprime = N + gNu * u_obs                      # now g·(N′, u_obs) = 0
+    s_hat = Nprime / ti.sqrt(Nprime.dot(g @ Nprime))
+    p_up = u_obs + s_hat                          # E_loc = 1; null automatically
+    p_cov = g @ p_up                              # lower index
+    E = -p_cov[0]
+    return p_cov / E                              # scale so E = −p_t = 1
 
-    p_t = g_tt * p_t_con + g_tph * p_ph_con
-    p_r = g_rr * p_r_con
-    p_th = g_thth * p_th_con
-    p_ph = g_phph * p_ph_con + g_tph * p_t_con
 
-    E = -p_t
-    Lz = p_ph
-    sin2_safe = ti.max(sin2, _SIN2_MIN)
-    Q = p_th * p_th + cos2 * (-(a * a) * E * E + Lz * Lz / sin2_safe)
+@ti.func
+def _exit_cos_phi(s, a):
+    """Escaped-ray celestial direction — Formula CKS-10.
 
-    v_y0 = Delta * p_r              # v_y = Δ·p_r  (p_r covariant; dy = dr)
-    v_u0 = -ti.sin(theta) * p_th    # v_u = −sinθ·p_θ = −√(1−u²)·p_θ
-    return E, Lz, Q, v_y0, v_u0
+    Asymptotically flat ⇒ the contravariant spatial momentum direction
+    d = (dx/dλ, dy/dλ, dz/dλ) = (p^x, p^y, p^z) IS the celestial direction. Returns
+    ``(cosθ′, φ′)`` to match the legacy ``exit_buf`` layout so every downstream
+    screen-space LOD / DNGR routine is unchanged.
+    """
+    v = _eom(s, a)
+    dx = v[1]
+    dy = v[2]
+    dz = v[3]
+    inv = 1.0 / ti.sqrt(dx * dx + dy * dy + dz * dz)
+    cos_th = ti.min(ti.max(dz * inv, -1.0), 1.0)
+    phi = ti.atan2(dy * inv, dx * inv)
+    return cos_th, phi
+
+
+@ti.func
+def _trace_to_exit(cx, cy, cz, nx, ny, nz, a, r_plus, r_max,
+                   n_steps, d_lambda, adaptive_floor):
+    """Integrate one null geodesic to its outcome (capture / escape).
+
+    Returns ``(outcome, cosθ′, φ′)``. Adaptive affine step (Formula CKS-5):
+    ``h = dλ·max(adaptive_floor, (r − r₊)/r)`` — full steps far out, shrinking
+    toward the horizon. Used by the Pipe-A preview kernel (the beauty kernel
+    inlines the same loop with disk accumulation interleaved).
+    """
+    p0 = _photon_momentum_cks(cx, cy, cz, nx, ny, nz, a)
+    s = vec8(0.0, cx, cy, cz, p0[0], p0[1], p0[2], p0[3])
+
+    out = _RUNNING
+    cos_exit = 0.0
+    phi_exit = 0.0
+    step = 0
+    while step < n_steps and out == _RUNNING:
+        x = s[1]
+        y = s[2]
+        z = s[3]
+        r = _kerr_radius(x, y, z, a)
+        rho = ti.sqrt(x * x + y * y + z * z)
+        if r <= r_plus + _HORIZON_EPS:
+            out = _CAPTURED
+        elif rho >= r_max:
+            out = _ESCAPED
+            cos_exit, phi_exit = _exit_cos_phi(s, a)
+        else:
+            h = d_lambda * ti.max(adaptive_floor, (r - r_plus) / r)
+            s = _rk4_step(s, a, h)
+        step += 1
+    return out, cos_exit, phi_exit
 
 
 # --------------------------------------------------------------------------- #
@@ -580,43 +637,23 @@ def _sample_trilinear(u, v, lod):
 
 
 # --------------------------------------------------------------------------- #
-# Pipe B physics @ti.func — ported verbatim from renderer.disk
+# Pipe B physics @ti.func — Formula CKS-8 (gas velocity), CKS-9 (g-factor)
 # --------------------------------------------------------------------------- #
 @ti.func
-def _gas_four_velocity(r, theta, a, r_isco, E_I, L_I):
-    """Contravariant gas 4-velocity u^μ = (u^t, u^r, u^θ, u^φ).
+def _gas_four_velocity_cks(x, y, z, a):
+    """Equatorial disk gas 4-velocity u^μ = (u^t, u^x, u^y, u^z) — Formula CKS-8.
 
-    r ≥ r_isco : circular orbit (Formula 3).
-    r <  r_isco : plunging free-fall with frozen E_I, L_I (Formula 5).
-    Mirrors ``renderer.disk.gas_four_velocity`` — no formula re-derived.
+    Circular prograde orbit (r ≥ r_isco): a rigid rotation about +z at the BL
+    angular velocity Ω (Formula 3). No BL→KS Jacobian — see SKILL.md CKS-8.
+    (The plunging r < r_isco branch is never sampled: disk.r_inner = r_isco.)
     """
-    u_t = 0.0
-    u_r = 0.0
-    u_th = 0.0
-    u_ph = 0.0
-    if r >= r_isco:
-        # Formula 3 — circular orbit (numerator (1 + a·r^-3/2) is mandatory).
-        r15 = ti.pow(r, 1.5)
-        Omega = 1.0 / (r15 + a)
-        u_t = (1.0 + a / r15) / ti.sqrt(1.0 - 3.0 / r + 2.0 * a / r15)
-        u_ph = Omega * u_t
-    else:
-        # Formula 5 — plunging region (frozen E_I, L_I; u^r must be infalling).
-        cos2 = ti.cos(theta) ** 2
-        Sigma = r * r + a * a * cos2
-        # Review #5: factored Δ=(r−r₊)(r−r₋) (Formula 11) instead of the
-        # cancellation-prone r²−2r+a², matching the migrated integrator. (Dead
-        # for r_inner==r_isco today, but keeps the inner-disk gas FP32-stable if
-        # disk.r_inner is ever lowered below the ISCO.)
-        kk = ti.sqrt(ti.max(1.0 - a * a, 0.0))
-        Delta = (r - (1.0 + kk)) * (r - (1.0 - kk))
-        X = E_I * (r * r + a * a) - a * L_I
-        u_r = -(1.0 / Sigma) * ti.sqrt(
-            ti.max(0.0, X * X - Delta * (r * r + (L_I - a * E_I) ** 2))
-        )
-        u_t = (1.0 / Sigma) * ((r * r + a * a) * X / Delta - a * (a * E_I - L_I))
-        u_ph = (1.0 / Sigma) * (a * X / Delta - (a * E_I - L_I))
-    return vec4(u_t, u_r, u_th, u_ph)
+    r = _kerr_radius(x, y, z, a)
+    r15 = ti.pow(r, 1.5)
+    Omega = 1.0 / (r15 + a)                                   # Formula 3
+    u_t = (1.0 + a / r15) / ti.sqrt(ti.max(1.0 - 3.0 / r + 2.0 * a / r15, 1e-9))
+    u_x = -Omega * y * u_t
+    u_y = Omega * x * u_t
+    return vec4(u_t, u_x, u_y, 0.0)
 
 
 @ti.func
@@ -634,43 +671,40 @@ def _blackbody_rgb(temp):
 
 
 @ti.func
-def _disk_emit(y, u, vy, vu, E, Lz, a, k, r_plus, r_isco, E_I, L_I,
-               r_inner, r_outer, theta_half, sigma_frac, T_0, emis_c, absb_c, ds):
-    """One volumetric disk sample at a geodesic point → (emission RGB, dτ).
+def _disk_emit_cks(x, y, z, p_cov, a, r_inner, r_outer,
+                   theta_half, sigma_frac, T_0, emis_c, absb_c, ds):
+    """One volumetric disk sample at a CKS geodesic point → (emission RGB, dτ).
 
-    Returns ``vec4(emission_r, emission_g, emission_b, dtau)`` where the running
-    pixel update is ``color += T·emission`` and ``T *= exp(-dtau)``. Outside the
+    Returns ``vec4(emission_r, emission_g, emission_b, dtau)``; the running pixel
+    update is ``color += T·emission`` and ``T *= exp(-dtau)``. Outside the
     equatorial slab bounding box it returns zeros.
 
-    Formula 8 g-factor (state migrated, Formula 12): the kernel state carries
-    ``v_y = Δ·p_r`` (p_r covariant) and ``v_u = −√(1−u²)·p_θ``; with conserved
-    ``p_t = −E`` and ``p_φ = L_z`` the covariant photon momentum is recovered as
-    ``p_r = v_y/Δ`` (NOT divided again — avoids the Formula-8 known bug) and
-    ``p_θ = −v_u/√(1−u²)``. Formula 9: chromaticity·g⁴ volumetric emission.
+    Formula CKS-9 g-factor (Cartesian dot product): with the integrator's
+    covariant momenta ``p_μ`` and the gas ``u^μ`` (CKS-8),
+    ``g = −E / (p_t u^t + p_x u^x + p_y u^y + p_z u^z)``. The Formula-8 "divide
+    p_r by Δ" bug is structurally impossible — there is no Δ and p is already
+    covariant. Formula 9: chromaticity·g⁴ volumetric emission.
     """
     out = vec4(0.0, 0.0, 0.0, 0.0)
-    r = y + r_plus
-    th = ti.acos(ti.min(ti.max(u, -1.0), 1.0))
-    dz = th - 0.5 * math.pi
-    if (ti.abs(dz) < theta_half) and (r >= r_inner) and (r <= r_outer):
-        u4 = _gas_four_velocity(r, th, a, r_isco, E_I, L_I)
-        Delta = _delta_y(y, k)
-        sin_th = ti.sqrt(ti.max(1.0 - u * u, _SIN2_MIN))
-        p_t = -E
-        p_r = vy / Delta            # covariant p_r (state stores v_y = Δ·p_r)
-        p_th = -vu / sin_th         # covariant p_θ = −v_u/√(1−u²)  (Formula 12)
-        p_ph = Lz
-        denom = p_t * u4[0] + p_r * u4[1] + p_th * u4[2] + p_ph * u4[3]
+    r = _kerr_radius(x, y, z, a)
+    cos_th = ti.min(ti.max(z / r, -1.0), 1.0)
+    th = ti.acos(cos_th)
+    dz_ang = th - 0.5 * math.pi
+    if (ti.abs(dz_ang) < theta_half) and (r >= r_inner) and (r <= r_outer):
+        u4 = _gas_four_velocity_cks(x, y, z, a)
+        E = -p_cov[0]
+        denom = (p_cov[0] * u4[0] + p_cov[1] * u4[1]
+                 + p_cov[2] * u4[2] + p_cov[3] * u4[3])
         if ti.abs(denom) > 1e-12:
-            g = -1.0 / denom    # Formula 8
+            g = -E / denom                       # Formula CKS-9
             if g > 0.0:
                 # Decision B temperature model: T = T_0·(6/r)^0.75.
                 T_emit = T_0 * ti.pow(6.0 / r, 0.75)
                 T_obs = g * T_emit
                 chroma = _blackbody_rgb(T_obs)
                 sigma_theta = theta_half * sigma_frac
-                density = ti.exp(-0.5 * (dz / sigma_theta) ** 2)
-                g4 = g * g * g * g                       # Formula 9 (3D volume: g⁴)
+                density = ti.exp(-0.5 * (dz_ang / sigma_theta) ** 2)
+                g4 = g * g * g * g                # Formula 9 (3D volume: g⁴)
                 emission = emis_c * density * g4 * ds
                 out = vec4(emission * chroma[0], emission * chroma[1],
                            emission * chroma[2], absb_c * density * ds)
@@ -678,139 +712,74 @@ def _disk_emit(y, u, vy, vu, E, Lz, a, k, r_plus, r_isco, E_I, L_I,
 
 
 # --------------------------------------------------------------------------- #
-# Pipe A kernel
+# Pipe A preview kernel (square, inline offset-ray LOD)
 # --------------------------------------------------------------------------- #
-@ti.func
-def _ray_dir(px, py, res, tan_half_fov):
-    """Local ZAMO-frame unit ray direction for screen sample (px, py)."""
-    sx = (2.0 * (px + 0.5) / res - 1.0) * tan_half_fov   # right (+φ̂)
-    sy = (1.0 - 2.0 * (py + 0.5) / res) * tan_half_fov   # up    (−θ̂)
-    n_r = -1.0
-    n_th = -sy
-    n_ph = sx
-    inv = 1.0 / ti.sqrt(n_r * n_r + n_th * n_th + n_ph * n_ph)
-    return n_r * inv, n_th * inv, n_ph * inv
-
-
 @ti.kernel
-def render_pipe_a(res: int, tan_half_fov: float, r_cam: float,
-                  theta_cam: float, phi_cam: float, a: float,
-                  k_horizon: float, r_plus: float,
-                  r_max: float, n_steps: int, d_lambda: float,
+def render_pipe_a(res: int, tan_half_fov: float,
+                  cx: float, cy: float, cz: float,
+                  fwd_x: float, fwd_y: float, fwd_z: float,
+                  rgt_x: float, rgt_y: float, rgt_z: float,
+                  up_x: float, up_y: float, up_z: float,
+                  a: float, r_plus: float, r_max: float,
+                  n_steps: int, d_lambda: float, adaptive_floor: float,
                   lod_enabled: int):
     """Pipe A: trace one primary + one offset ray per pixel; sample the lensed sky.
 
-    The offset ray (screen u shifted by +1/res = one pixel) is integrated to exit
-    **inside the same while loop** as the primary ray (Formula 10 requirement) so
-    its exit direction yields the on-sky Jacobian J → mip LOD L. No step-count
-    proxy is used.
-
-    State is [y, u, φ, t, v_y, v_u] (Formula 11/12): y = r − r₊, u = cosθ.
+    Camera position and basis (fwd/right/up) are **world Cartesian = CKS** — no
+    spherical embedding. Each ray's coordinate direction is
+    ``n = normalize(fwd + sx·right + sy·up)`` (CKS-7 input). The offset ray
+    (screen u shifted by +1 px) yields the on-sky Jacobian J → mip LOD (Formula 10).
     """
-    y_cam = r_cam - r_plus
-    u_cam = ti.cos(theta_cam)
-    r_capture = 2.0 - r_plus      # r < 2 ⇔ y < 2 − r₊
-    y_escape = r_max - r_plus     # r ≥ r_max ⇔ y ≥ r_max − r₊
     for py, px in ti.ndrange(res, res):
-        # --- primary + offset initial conditions (ZAMO tetrad, Formula 7) ---
-        npr_r, npr_th, npr_ph = _ray_dir(ti.cast(px, ti.f32), ti.cast(py, ti.f32),
-                                         ti.cast(res, ti.f32), tan_half_fov)
-        nof_r, nof_th, nof_ph = _ray_dir(ti.cast(px + 1, ti.f32), ti.cast(py, ti.f32),
-                                         ti.cast(res, ti.f32), tan_half_fov)
+        rf = ti.cast(res, ti.f32)
+        sx_p = (2.0 * (px + 0.5) / rf - 1.0) * tan_half_fov
+        sy_p = (1.0 - 2.0 * (py + 0.5) / rf) * tan_half_fov
+        sx_o = (2.0 * (px + 1 + 0.5) / rf - 1.0) * tan_half_fov
 
-        Ep, Lp, Qp, vy_p, vu_p = _zamo_init(r_cam, theta_cam, a, k_horizon, r_plus,
-                                            npr_r, npr_th, npr_ph)
-        Eo, Lo, Qo, vy_o, vu_o = _zamo_init(r_cam, theta_cam, a, k_horizon, r_plus,
-                                            nof_r, nof_th, nof_ph)
+        npx = fwd_x + sx_p * rgt_x + sy_p * up_x
+        npy = fwd_y + sx_p * rgt_y + sy_p * up_y
+        npz = fwd_z + sx_p * rgt_z + sy_p * up_z
+        invp = 1.0 / ti.sqrt(npx * npx + npy * npy + npz * npz)
+        npx *= invp
+        npy *= invp
+        npz *= invp
 
-        sp = vec6(y_cam, u_cam, phi_cam, 0.0, vy_p, vu_p)
-        so = vec6(y_cam, u_cam, phi_cam, 0.0, vy_o, vu_o)
-        c_sp = vec6(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)   # Kahan compensation (optimization Phase 1.4)
-        c_so = vec6(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        nox = fwd_x + sx_o * rgt_x + sy_p * up_x
+        noy = fwd_y + sx_o * rgt_y + sy_p * up_y
+        noz = fwd_z + sx_o * rgt_z + sy_p * up_z
+        invo = 1.0 / ti.sqrt(nox * nox + noy * noy + noz * noz)
+        nox *= invo
+        noy *= invo
+        noz *= invo
 
-        out_p = _RUNNING
-        out_o = _RUNNING
-        u_p_exit = u_cam
-        ph_p_exit = phi_cam
-        u_o_exit = u_cam
-        ph_o_exit = phi_cam
+        out_p, cos_p, ph_p = _trace_to_exit(cx, cy, cz, npx, npy, npz, a,
+                                            r_plus, r_max, n_steps, d_lambda,
+                                            adaptive_floor)
+        out_o, cos_o, ph_o = _trace_to_exit(cx, cy, cz, nox, noy, noz, a,
+                                            r_plus, r_max, n_steps, d_lambda,
+                                            adaptive_floor)
 
-        # --- shared integration loop: step both rays until both exit ---
-        step = 0
-        while step < n_steps and (out_p == _RUNNING or out_o == _RUNNING):
-            if out_p == _RUNNING:
-                if _delta_y(sp[0], k_horizon) < _DELTA_MIN:
-                    out_p = _CAPTURED
-                else:
-                    sp, c_sp = _rk4_step_kahan(sp, c_sp, Ep, Lp, Qp, a,
-                                               k_horizon, r_plus, d_lambda)
-                    # Per-step φ-wrap into (−π, π] — identical to render_beauty_physics.
-                    # Without it a near-pole passage (dφ/dλ = Lz/sin²θ) inflates the
-                    # raw accumulated φ past f32's fractional precision, so the exit
-                    # azimuth collapses to noise across the spin-axis meridian. φ is
-                    # cyclic and never on the RHS of `_deriv` (Kerr is axisymmetric),
-                    # so folding it each step is an exact coordinate identity.
-                    phi_wp = sp[2] - _TWO_PI * ti.round(sp[2] / _TWO_PI)
-                    sp = vec6(sp[0], sp[1], phi_wp, sp[3], sp[4], sp[5])
-                    c_sp = vec6(c_sp[0], c_sp[1], 0.0, c_sp[3], c_sp[4], c_sp[5])
-                    if _delta_y(sp[0], k_horizon) < _DELTA_MIN or sp[0] < r_capture:
-                        out_p = _CAPTURED
-                    elif sp[0] >= y_escape:
-                        out_p = _ESCAPED
-                        u_p_exit = sp[1]
-                        ph_p_exit = sp[2]
-            if out_o == _RUNNING:
-                if _delta_y(so[0], k_horizon) < _DELTA_MIN:
-                    out_o = _CAPTURED
-                else:
-                    so, c_so = _rk4_step_kahan(so, c_so, Eo, Lo, Qo, a,
-                                               k_horizon, r_plus, d_lambda)
-                    # Per-step φ-wrap into (−π, π] (see the primary ray above).
-                    phi_wo = so[2] - _TWO_PI * ti.round(so[2] / _TWO_PI)
-                    so = vec6(so[0], so[1], phi_wo, so[3], so[4], so[5])
-                    c_so = vec6(c_so[0], c_so[1], 0.0, c_so[3], c_so[4], c_so[5])
-                    if _delta_y(so[0], k_horizon) < _DELTA_MIN or so[0] < r_capture:
-                        out_o = _CAPTURED
-                    elif so[0] >= y_escape:
-                        out_o = _ESCAPED
-                        u_o_exit = so[1]
-                        ph_o_exit = so[2]
-            step += 1
-
-        # --- shade ---
         col = vec3(0.0, 0.0, 0.0)
         if out_p == _ESCAPED:
-            # u = cosθ keeps θ_exit = acos(u) ∈ [0, π] by construction, so the old
-            # polar punch-through fold is no longer needed; just recover θ and wrap φ.
-            th_p_n = ti.acos(ti.min(ti.max(u_p_exit, -1.0), 1.0))
-            u = ph_p_exit / (2.0 * math.pi)
+            th_p = ti.acos(cos_p)
+            u = ph_p / _TWO_PI
             u = u - ti.floor(u)
-            v = ti.min(ti.max(th_p_n / math.pi, 0.0), 1.0)
+            v = ti.min(ti.max(th_p / math.pi, 0.0), 1.0)
 
             lod = 0.0
             if lod_enabled == 1:
                 if out_o == _ESCAPED:
-                    # Formula 10 (v1.3): J from the offset ray's raw one-pixel
-                    # exit-direction delta. φ spans 2π radians across the full
-                    # 16384-texel width, so dividing by 2π maps the angular
-                    # footprint to a texel footprint (without it the LOD saturates
-                    # to max mip for every background pixel).
-                    th_o_n = ti.acos(ti.min(ti.max(u_o_exit, -1.0), 1.0))
-                    d_th = th_o_n - th_p_n
-                    d_ph = ph_o_exit - ph_p_exit
-                    # wrap δφ into [−π, π] (φ periodic).
-                    d_ph = d_ph - 2.0 * math.pi * ti.round(d_ph / (2.0 * math.pi))
-                    sin_th = ti.sin(th_p_n)
+                    th_o = ti.acos(cos_o)
+                    d_th = th_o - th_p
+                    d_ph = ph_o - ph_p
+                    d_ph = d_ph - _TWO_PI * ti.round(d_ph / _TWO_PI)
+                    sin_th = ti.sin(th_p)
                     J = ti.sqrt(d_th * d_th + sin_th * sin_th * d_ph * d_ph)
-                    # Fold saturation — identical to _screen_jacobian_lod: a footprint
-                    # spanning the spin-axis meridian caustic (J > _J_FOLD) collapses
-                    # to the uniform coarsest mip instead of an aliased mid-mip fetch.
                     if J > _J_FOLD:
                         lod = _MAX_LOD
                     else:
-                        lod = ti.log(_STARMAP_WIDTH * J / (2.0 * math.pi)) / ti.log(2.0)  # log2
+                        lod = ti.log(_STARMAP_WIDTH * J / _TWO_PI) / ti.log(2.0)
                 else:
-                    # Offset ray dived into the chaotic edge → huge footprint.
                     lod = _MAX_LOD
             col = _sample_trilinear(u, v, lod)
 
@@ -820,161 +789,117 @@ def render_pipe_a(res: int, tan_half_fov: float, r_cam: float,
 
 
 # --------------------------------------------------------------------------- #
-# Beauty kernel — Pipe A (lensed starmap + LOD) combined with Pipe B (disk)
+# Beauty kernel — Pipe A (lensed background) + Pipe B (volumetric disk)
 # --------------------------------------------------------------------------- #
 @ti.kernel
 def render_beauty_physics(width: int, height: int,
-                          fwd_r: float, fwd_th: float, fwd_ph: float,
-                          rgt_r: float, rgt_th: float, rgt_ph: float,
-                          up_r: float, up_th: float, up_ph: float,
+                          cx: float, cy: float, cz: float,
+                          fwd_x: float, fwd_y: float, fwd_z: float,
+                          rgt_x: float, rgt_y: float, rgt_z: float,
+                          up_x: float, up_y: float, up_z: float,
                           tan_half_x: float, tan_half_y: float,
-                          r_cam: float, theta_cam: float, phi_cam: float,
-                          a: float, k_horizon: float, r_plus: float,
+                          a: float, r_plus: float,
                           r_max: float, n_steps: int, d_lambda: float,
                           adaptive_floor: float, disk_enabled: int,
                           projection_mode: int, depth_infinity: float,
-                          r_isco: float, E_I: float, L_I: float,
-                          r_inner: float, r_outer: float, theta_half: float,
-                          bound_sin_half: float,
-                          sigma_frac: float, T_0: float, emis_c: float, absb_c: float):
-    """Kernel 1 (Phase 2.4 split): trace ONE primary ray per pixel — no offset ray.
+                          r_inner: float, r_outer: float,
+                          theta_half: float, bound_sin_half: float,
+                          sigma_frac: float, T_0: float, emis_c: float,
+                          absb_c: float):
+    """Kernel 1 (Phase 2.4 split): trace ONE primary ray per pixel (no offset ray).
 
-    Writes the per-pixel exit state to ``exit_buf`` (u_exit, φ_exit, outcome), the
+    Writes the per-pixel exit state to ``exit_buf`` (cosθ′, φ′, outcome), the
     front-to-back disk accumulation to ``disk_buf`` (disk_rgb, transmittance), and
-    the transmittance-weighted Mino-affine Z to ``depth_pixels`` (optimization Phase 3.4). The
-    Formula-10 LOD + background lookup are deferred to ``render_beauty_shade``,
-    which differences neighbor exit directions in screen space (SKILL.md F10
-    amendment v1.4). Eliminating the offset ray halves the geodesic workload.
+    the transmittance-weighted affine Z to ``depth_pixels`` (optimization Phase 3.4).
+    The Formula-10 LOD + background lookup are deferred to ``render_beauty_shade``,
+    which differences neighbour exit directions in screen space.
 
-    Adaptive Mino step (optimization Phase 2.2): ``h = d_lambda·max(adaptive_floor, y/(y+2))`` —
-    full steps far out, shrinking toward the horizon (y→0).
+    Camera position and basis are **world Cartesian = CKS** (no spherical
+    embedding). Per-pixel ray direction n = normalize(fwd + sx·right + sy·up).
+    State is the CKS 8-vector [t, x, y, z, p_t, p_x, p_y, p_z] (Formula CKS-5);
+    adaptive affine step h = d_lambda·max(adaptive_floor, (r−r₊)/r).
 
-    ``projection_mode`` (optimization Phase 4.1): 0 = perspective (camera basis + FOV), 1 =
-    equirectangular 360° (px→lon, py→lat in the local ZAMO frame, for VR output).
-
-    State is [y, u, φ, t, v_y, v_u] (Formula 11/12): y = r − r₊, u = cosθ.
+    ``projection_mode`` (optimization Phase 4.1): 0 = perspective (camera basis +
+    FOV), 1 = equirectangular 360° (px→lon, py→lat about the camera basis, for VR).
     """
-    y_cam = r_cam - r_plus
-    u_cam = ti.cos(theta_cam)
-    r_capture = 2.0 - r_plus      # r < 2 ⇔ y < 2 − r₊
-    y_escape = r_max - r_plus     # r ≥ r_max ⇔ y ≥ r_max − r₊
-    y_inner = r_inner - r_plus    # disk bbox in y (optimization Phase 3.3)
-    y_outer = r_outer - r_plus
     for py, px in ti.ndrange(height, width):
-        npr_r = fwd_r
-        npr_th = fwd_th
-        npr_ph = fwd_ph
+        nx = fwd_x
+        ny = fwd_y
+        nz = fwd_z
         if projection_mode == 1:
-            # Equirectangular 360° ray-gen (optimization Phase 4.1): screen → (lon, lat) →
-            # local ZAMO-frame direction. No tan_half_fov perspective math.
-            lon = (px + 0.5) / width * 2.0 * math.pi          # azimuth ∈ [0, 2π)
-            lat = (py + 0.5) / height * math.pi               # polar ∈ [0, π]
-            npr_r = ti.sin(lat) * ti.cos(lon)
-            npr_th = ti.cos(lat)
-            npr_ph = ti.sin(lat) * ti.sin(lon)
+            # Equirectangular 360° ray-gen: screen → (lon, lat) → camera-basis dir.
+            lon = (px + 0.5) / width * _TWO_PI                 # azimuth ∈ [0, 2π)
+            lat = (py + 0.5) / height * math.pi                # polar ∈ [0, π]
+            d_fwd = ti.sin(lat) * ti.cos(lon)
+            d_rgt = ti.sin(lat) * ti.sin(lon)
+            d_up = ti.cos(lat)
+            nx = d_fwd * fwd_x + d_rgt * rgt_x + d_up * up_x
+            ny = d_fwd * fwd_y + d_rgt * rgt_y + d_up * up_y
+            nz = d_fwd * fwd_z + d_rgt * rgt_z + d_up * up_z
         else:
-            # Perspective: screen offset along the camera right/up basis.
             sx_p = (2.0 * (px + 0.5) / width - 1.0) * tan_half_x
             sy_p = (1.0 - 2.0 * (py + 0.5) / height) * tan_half_y
-            npr_r = fwd_r + sx_p * rgt_r + sy_p * up_r
-            npr_th = fwd_th + sx_p * rgt_th + sy_p * up_th
-            npr_ph = fwd_ph + sx_p * rgt_ph + sy_p * up_ph
-        invp = 1.0 / ti.sqrt(npr_r * npr_r + npr_th * npr_th + npr_ph * npr_ph)
-        npr_r *= invp
-        npr_th *= invp
-        npr_ph *= invp
+            nx = fwd_x + sx_p * rgt_x + sy_p * up_x
+            ny = fwd_y + sx_p * rgt_y + sy_p * up_y
+            nz = fwd_z + sx_p * rgt_z + sy_p * up_z
+        invp = 1.0 / ti.sqrt(nx * nx + ny * ny + nz * nz)
+        nx *= invp
+        ny *= invp
+        nz *= invp
 
-        Ep, Lp, Qp, vy_p, vu_p = _zamo_init(r_cam, theta_cam, a, k_horizon, r_plus,
-                                            npr_r, npr_th, npr_ph)
-
-        sp = vec6(y_cam, u_cam, phi_cam, 0.0, vy_p, vu_p)
-        c_sp = vec6(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)   # Kahan compensation (optimization Phase 1.4)
+        p0 = _photon_momentum_cks(cx, cy, cz, nx, ny, nz, a)
+        s = vec8(0.0, cx, cy, cz, p0[0], p0[1], p0[2], p0[3])
 
         out_p = _RUNNING
-        u_p_exit = u_cam
-        ph_p_exit = phi_cam
+        cos_exit = 0.0
+        phi_exit = 0.0
 
         disk_col = vec3(0.0, 0.0, 0.0)
         transm = 1.0
-        ray_length = 0.0          # accumulated Mino-affine path length (depth proxy)
+        ray_length = 0.0          # accumulated affine path length (depth proxy)
         weighted_depth = 0.0      # Σ ray_length·contribution  (optimization Phase 3.4)
         total_emission = 0.0      # Σ contribution
 
         step = 0
         while step < n_steps and out_p == _RUNNING:
-            # Adaptive step (optimization Phase 2.2): shrink toward the horizon (y→0). Computed
-            # BEFORE the disk emit so the same h is used as the emission path
-            # element ds — otherwise the variable step desyncs the Riemann sum.
-            local_h = d_lambda * ti.max(adaptive_floor, sp[0] / (sp[0] + 2.0))
-            # Pipe B: accumulate disk emission at the current point (front-to-back).
-            # optimization Phase 3.3 bounding-box early-out: skip the disk math entirely unless the
-            # sample is inside the equatorial slab (|u|<sin θ_half) and radial band.
-            if disk_enabled == 1 and ti.abs(sp[1]) < bound_sin_half \
-                    and sp[0] >= y_inner and sp[0] <= y_outer:
-                ev = _disk_emit(sp[0], sp[1], sp[4], sp[5], Ep, Lp, a,
-                                k_horizon, r_plus, r_isco, E_I, L_I,
-                                r_inner, r_outer,
-                                theta_half, sigma_frac, T_0, emis_c, absb_c,
-                                local_h)
-                disk_col += transm * vec3(ev[0], ev[1], ev[2])
-                # optimization Phase 3.4: transmittance-weighted depth (contribution = T·emission).
-                contribution = transm * (ev[0] + ev[1] + ev[2])
-                weighted_depth += ray_length * contribution
-                total_emission += contribution
-                transm *= ti.exp(-ev[3])
-            if _delta_y(sp[0], k_horizon) < _DELTA_MIN:
+            x = s[1]
+            y = s[2]
+            z = s[3]
+            r = _kerr_radius(x, y, z, a)
+            rho = ti.sqrt(x * x + y * y + z * z)
+
+            if r <= r_plus + _HORIZON_EPS:
                 out_p = _CAPTURED
+            elif rho >= r_max:
+                out_p = _ESCAPED
+                cos_exit, phi_exit = _exit_cos_phi(s, a)
             else:
-                y_prev = sp[0]          # pre-step state, for escape event location
-                u_prev = sp[1]
-                ph_prev = sp[2]
-                sp, c_sp = _rk4_step_kahan(sp, c_sp, Ep, Lp, Qp, a,
-                                           k_horizon, r_plus, local_h)
+                # Adaptive affine step (Formula CKS-5). Computed BEFORE the disk
+                # emit so the same h is the emission path element ds (else the
+                # variable step desyncs the Riemann sum).
+                local_h = d_lambda * ti.max(adaptive_floor, (r - r_plus) / r)
+
+                # Pipe B: accumulate disk emission at the current point.
+                # optimization Phase 3.3 bounding-box early-out: |cosθ| < sin θ_half (≡ the
+                # slab test) and r within the radial band.
+                if disk_enabled == 1 and ti.abs(z / r) < bound_sin_half \
+                        and r >= r_inner and r <= r_outer:
+                    p_cov = vec4(s[4], s[5], s[6], s[7])
+                    ev = _disk_emit_cks(x, y, z, p_cov, a,
+                                        r_inner, r_outer, theta_half, sigma_frac,
+                                        T_0, emis_c, absb_c, local_h)
+                    disk_col += transm * vec3(ev[0], ev[1], ev[2])
+                    contribution = transm * (ev[0] + ev[1] + ev[2])
+                    weighted_depth += ray_length * contribution
+                    total_emission += contribution
+                    transm *= ti.exp(-ev[3])
+
+                s = _rk4_step(s, a, local_h)
                 ray_length += local_h
-                # Axisymmetry wrap (restores the original bounded-φ behaviour).
-                # φ is cyclic — it never appears on the RHS of `_deriv` (Kerr is
-                # axisymmetric) — so folding it into (−π, π] every step is an
-                # exact coordinate identity, not a physics change. A near-pole
-                # passage drives dφ/dλ = Lz/sin²θ toward Lz/_SIN2_MIN (~1e10),
-                # inflating the raw accumulated φ to ~1e6 rad; at that magnitude
-                # f32 retains no fractional precision, so the exit azimuth — the
-                # only physically meaningful part — collapses to noise and flips
-                # sign across the symmetric center column (the "static" seam).
-                # Keeping φ in (−π, π] preserves full f32 precision throughout.
-                phi_w = sp[2] - _TWO_PI * ti.round(sp[2] / _TWO_PI)
-                sp = vec6(sp[0], sp[1], phi_w, sp[3], sp[4], sp[5])
-                c_sp = vec6(c_sp[0], c_sp[1], 0.0, c_sp[3], c_sp[4], c_sp[5])
-                if _delta_y(sp[0], k_horizon) < _DELTA_MIN or sp[0] < r_capture:
-                    out_p = _CAPTURED
-                elif sp[0] >= y_escape:
-                    out_p = _ESCAPED
-                    # Linear event location: interpolate the exit angles back to
-                    # the escape surface y = y_escape (r = r_max). Far out, a
-                    # single Mino step advances r by ~r²·h (tens of units near
-                    # r_max), so neighbor pixels overshoot the sphere by
-                    # different amounts. Recording the raw overshot angle injects
-                    # that step-quantization jitter into the screen-space
-                    # Jacobian (Formula 10), over-coarsening the background mip.
-                    # Interpolating to the exact surface removes it. (Numerical
-                    # event location of the integrated geodesic — no GR formula
-                    # is re-derived; SKILL.md formulas are untouched.)
-                    denom = sp[0] - y_prev
-                    frac = 1.0
-                    if denom > 1e-12:
-                        frac = (y_escape - y_prev) / denom
-                    frac = ti.min(ti.max(frac, 0.0), 1.0)
-                    u_p_exit = u_prev + frac * (sp[1] - u_prev)
-                    # Shortest-arc φ delta: ph_prev and the per-step-wrapped sp[2]
-                    # can land on opposite sides of the ±π fold, so interpolate
-                    # along the wrapped increment (the geodesic turns < π over one
-                    # far-field step at r≈r_max, so the short arc is the true one).
-                    dph = sp[2] - ph_prev
-                    dph = dph - _TWO_PI * ti.round(dph / _TWO_PI)
-                    ph_p_exit = ph_prev + frac * dph
             step += 1
 
-        exit_buf[py, px, 0] = u_p_exit
-        exit_buf[py, px, 1] = ph_p_exit
+        exit_buf[py, px, 0] = cos_exit
+        exit_buf[py, px, 1] = phi_exit
         exit_buf[py, px, 2] = ti.cast(out_p, ti.f32)
         disk_buf[py, px, 0] = disk_col[0]
         disk_buf[py, px, 1] = disk_col[1]
@@ -989,13 +914,13 @@ def render_beauty_physics(width: int, height: int,
 
 @ti.func
 def _screen_jacobian_lod(py, px, height, width, th_p, ph_p):
-    """Formula 10 (amendment v1.4): LOD from screen-space neighbor exit deltas.
+    """Formula 10 (amendment v1.4): LOD from screen-space neighbour exit deltas.
 
     Differences the primary pixel's exit direction against its +x and +y
-    neighbors (backward at the far edges). If any neighbor did not ESCAPE
+    neighbours (backward at the far edges). If any neighbour did not ESCAPE
     (``outcome != _ESCAPED``), returns ``_MAX_LOD`` (the chaotic shadow-edge
     boundary rule). Otherwise L = log2(W·J/2π) with J the larger of the two
-    axis footprints.
+    axis footprints. ``exit_buf[...,0]`` is cosθ′ (CKS-10), so θ′ = acos(·).
     """
     nx = px + 1 if px + 1 < width else px - 1
     ny = py + 1 if py + 1 < height else py - 1
@@ -1020,15 +945,12 @@ def _screen_jacobian_lod(py, px, height, width, th_p, ph_p):
         Jy = ti.sqrt((th_y - th_p) ** 2 + sin_th * sin_th * dphy * dphy)
 
         J = ti.max(Jx, Jy)
-        # Fold saturation (restores the original offset-ray behaviour). Near the
-        # spin-axis meridian the lensing folds: neighbour pixels exit on opposite
-        # sides of the pole, ~π apart in azimuth, so a single scalar-LOD trilinear
-        # fetch lands on unrelated coarse-mip texels → the "static" seam. The old
-        # offset-ray Jacobian forced _MAX_LOD whenever the companion ray dived into
-        # that chaotic region; with screen-space differencing the equivalent signal
-        # is a footprint J spanning a large fraction of the sky. Above _J_FOLD the
-        # pixel genuinely integrates that whole fan, so collapse it to the uniform
-        # coarsest mip (smooth grey) rather than an aliased mid-mip fetch.
+        # Fold saturation: a footprint J spanning a large fraction of the sky
+        # straddles an equirect-texture pole or the chaotic shadow silhouette, so
+        # a single scalar-LOD trilinear fetch would land on unrelated coarse-mip
+        # texels. Above _J_FOLD collapse to the uniform coarsest mip (smooth grey)
+        # rather than an aliased mid-mip fetch. (Under CKS the BL spin-axis seam
+        # is gone; this only guards the texture poles / shadow edge now.)
         if J > _J_FOLD:
             lod = _MAX_LOD
         else:
@@ -1110,12 +1032,10 @@ def _dngr_shade(py, px, height, width, th_p, ph_p, d_omega):
         ``μ = dΩ_pixel / |det J · sinθ′|`` (normalized so μ→1 in flat space).
     Boundary rules (Formula 13 guard b, approved 2026-06-05): a non-ESCAPED
     neighbour or a fold footprint ``δ⁺ > j_fold`` ⇒ μ=1 and the diffuse layer
-    falls back to the coarsest mip (matches the legacy seam handling). On that
-    same invalid-``det J`` branch the Layer-A splat is *placed* by guard (b′)
-    (approved 2026-06-06): the undeflected proper-separation footprint
-    ``d² = (Δθ′² + sin²θ′·Δφ′²)/dΩ`` instead of the degenerate ``J⁻¹`` — this
-    removes the spin-axis meridian star-pileup (Artifact B).
-    Returns the combined background radiance (diffuse + stars).
+    falls back to the coarsest mip. On that same invalid-``det J`` branch the
+    Layer-A splat is *placed* by guard (b′) using the undeflected proper-separation
+    footprint ``d² = (Δθ′² + sin²θ′·Δφ′²)/dΩ``. ``exit_buf[...,0]`` is cosθ′
+    (CKS-10), so θ′ = acos(·). Returns the combined background radiance.
     """
     nx = px + 1 if px + 1 < width else px - 1
     ny = py + 1 if py + 1 < height else py - 1
@@ -1198,23 +1118,10 @@ def _dngr_shade(py, px, height, width, th_p, ph_p, d_omega):
         diffuse = _mw_sample_trilinear(u, v, _MW_MAX_LOD)
 
     # --- Layer A: point-star energy gather (flux · μ · g⁴ · Gaussian PSF) ---
-    # Placement of each catalog star's splat (its screen-space offset from the
-    # pixel centre) follows Formula 13 guards (b) + (b′):
-    #   * `usable` (det J a valid beam Jacobian): lensed placement
-    #       (dpx, dpy) = J⁻¹ · (Δθ′, Δφ′)        — stars follow the lensing.
-    #   * NOT `usable` (det J invalid: non-ESCAPED neighbour, or fold δ⁺>j_fold —
-    #     the spin-axis seam): guard (b′). J⁻¹ is degenerate there (Δφ′≈±π ⇒
-    #     |det J| large ⇒ J⁻¹→0), which would collapse every polar-cell star to
-    #     d≈0 and pile them onto the meridian (the seam pileup). Instead place
-    #     the splat by the star's TRUE proper angular separation under the
-    #     undeflected footprint dΩ (the guard-(a) quantity, `d_omega`):
-    #         d² = (Δθ′² + sin²θ′·Δφ′²) / dΩ   [screen-pixel²]
-    #     i.e. great-circle separation / undeflected angular pixel size √dΩ, so
-    #     polar stars keep their real spacing. μ is already clamped to 1 here, so
-    #     seam stars stay sharp point-like at base flux. The gather now runs for
-    #     every escaped pixel (the old `valid`-only gate left a star-free band
-    #     around the shadow silhouette and on the seam); placement degenerates to
-    #     the no-lens geometry exactly where the lensed Jacobian is unusable.
+    # Placement of each catalog star's splat follows Formula 13 guards (b) + (b′):
+    #   * `usable` (det J valid): lensed placement (dpx,dpy) = J⁻¹·(Δθ′,Δφ′).
+    #   * NOT `usable`: guard (b′) — undeflected proper-separation placement
+    #       d² = (Δθ′² + sin²θ′·Δφ′²) / dΩ, μ clamped to 1 (stars stay sharp).
     stars = vec3(0.0, 0.0, 0.0)
     g4 = 1.0   # _G_BEAMING hook: g≡1 for a static camera at the celestial sphere
     two_sig2 = 2.0 * _STAR_PSF * _STAR_PSF
@@ -1222,8 +1129,6 @@ def _dngr_shade(py, px, height, width, th_p, ph_p, d_omega):
     inv_det = 0.0
     if usable and ti.abs(detJ) > 1e-20:
         inv_det = 1.0 / detJ
-    # Only gather when a placement metric is available: lensed J⁻¹ (usable) or the
-    # undeflected footprint dΩ (guard b′). dΩ≈0 (degenerate pixel) ⇒ skip.
     if (usable and ti.abs(detJ) > 1e-20) or (not usable and d_omega > 1e-20):
         ci = ti.cast(u * _STAR_COLS, ti.i32)
         cj = ti.cast(v * _STAR_ROWS, ti.i32)
@@ -1242,12 +1147,10 @@ def _dngr_shade(py, px, height, width, th_p, ph_p, d_omega):
                         dph = _wrap_pi(cat_phi[sidx] - ph_p)
                         d2 = 0.0
                         if usable:
-                            # lensed placement: screen offset = J⁻¹ · (Δθ′, Δφ′)
                             dpx = (dphy * dth - dthy * dph) * inv_det
                             dpy = (-dphx * dth + dthx * dph) * inv_det
                             d2 = dpx * dpx + dpy * dpy
                         else:
-                            # guard (b′): undeflected proper-separation placement
                             d2 = (dth * dth + sin_th * sin_th * dph * dph) / d_omega
                         if d2 < d_max2:
                             wgt = ti.exp(-d2 / two_sig2) * mu * g4
@@ -1262,18 +1165,17 @@ def render_beauty_shade(width: int, height: int, lod_enabled: int, mode: int,
     """Kernel 2 (Phase 2.4 split): background lookup + composite.
 
     ``mode == 0`` (texture): the legacy Formula-10 path — screen-space LOD from
-    neighbour exit deltas, single trilinear lensed-starmap fetch (byte-for-byte
-    unchanged). ``mode == 1`` (dngr): the Formula-13 two-layer background
-    (``_dngr_shade``: anisotropic diffuse + magnified point-star gather). Either
-    way it writes ``frame_pixels = disk_rgb + transmittance·background``.
+    neighbour exit deltas, single trilinear lensed-starmap fetch. ``mode == 1``
+    (dngr): the Formula-13 two-layer background (``_dngr_shade``). Either way it
+    writes ``frame_pixels = disk_rgb + transmittance·background``.
     """
     for py, px in ti.ndrange(height, width):
         out_p = exit_buf[py, px, 2]
         bg = vec3(0.0, 0.0, 0.0)
         if out_p < 1.5 and out_p > 0.5:        # escaped
-            u_p_exit = exit_buf[py, px, 0]
+            cos_exit = exit_buf[py, px, 0]
             ph_p_exit = exit_buf[py, px, 1]
-            th_p_n = ti.acos(ti.min(ti.max(u_p_exit, -1.0), 1.0))
+            th_p_n = ti.acos(ti.min(ti.max(cos_exit, -1.0), 1.0))
             if mode == 1:
                 # Undeflected per-pixel solid angle dΩ_pixel (μ normalization, F13 §2a).
                 d_omega = 0.0
@@ -1304,8 +1206,34 @@ def render_beauty_shade(width: int, height: int, lod_enabled: int, mode: int,
         frame_pixels[py, px, 2] = col[2]
 
 
+# --------------------------------------------------------------------------- #
+# Host-side camera helpers + entry points
+# --------------------------------------------------------------------------- #
+def _camera_basis(pos, fwd, world_up=(0.0, 0.0, 1.0)):
+    """Orthonormal camera basis (fwd, right, up) from a look direction.
+
+    All in world Cartesian = CKS. ``right = normalize(fwd × world_up)``,
+    ``up = right × fwd`` (right-handed). ``world_up`` defaults to the +z spin axis.
+    """
+    f = np.asarray(fwd, dtype=float)
+    f = f / np.linalg.norm(f)
+    wu = np.asarray(world_up, dtype=float)
+    right = np.cross(f, wu)
+    nrm = np.linalg.norm(right)
+    if nrm < 1e-8:                       # looking along the spin axis: pick any ⟂
+        right = np.cross(f, np.array([1.0, 0.0, 0.0]))
+        nrm = np.linalg.norm(right)
+    right = right / nrm
+    up = np.cross(right, f)
+    return f, right, up
+
+
 def render_pipe_a_image(cfg: dict, res: int, lod_enabled: bool) -> np.ndarray:
-    """Render one Pipe A frame at ``res×res`` and return a float32 (res,res,3) HDR."""
+    """Render one Pipe A frame at ``res×res`` and return a float32 (res,res,3) HDR.
+
+    The preview camera is placed from ``thumb`` config (spherical radius/θ/φ),
+    converted to CKS Cartesian, looking at the origin.
+    """
     bh = cfg["black_hole"]
     rcfg = cfg["render"]
     cam = cfg["camera"]
@@ -1318,14 +1246,26 @@ def render_pipe_a_image(cfg: dict, res: int, lod_enabled: bool) -> np.ndarray:
     phi_cam = 0.0
     n_steps = int(rcfg["max_steps_pipe_a"])
     d_lambda = float(rcfg["d_lambda_pipe_a"])
+    adaptive_floor = float(rcfg["adaptive_step_floor"])
     r_max = float(rcfg["r_max"])
     tan_half_fov = math.tan(math.radians(fov_deg) / 2.0)
-    k_horizon, r_plus = _horizon_constants(a)
+    r_plus = _horizon_radius(a)
+
+    # Camera position in CKS Cartesian (spin axis = +z); look at the origin.
+    st, ct = math.sin(theta_cam), math.cos(theta_cam)
+    pos = np.array([r_cam * st * math.cos(phi_cam),
+                    r_cam * st * math.sin(phi_cam),
+                    r_cam * ct], dtype=float)
+    fwd, right, up = _camera_basis(pos, -pos)
 
     _alloc_output(res)
-    render_pipe_a(res, tan_half_fov, r_cam, theta_cam, phi_cam, a,
-                  k_horizon, r_plus,
-                  r_max, n_steps, d_lambda, 1 if lod_enabled else 0)
+    render_pipe_a(res, tan_half_fov,
+                  float(pos[0]), float(pos[1]), float(pos[2]),
+                  float(fwd[0]), float(fwd[1]), float(fwd[2]),
+                  float(right[0]), float(right[1]), float(right[2]),
+                  float(up[0]), float(up[1]), float(up[2]),
+                  a, r_plus, r_max, n_steps, d_lambda, adaptive_floor,
+                  1 if lod_enabled else 0)
     ti.sync()
     return pixels.to_numpy()
 
@@ -1337,47 +1277,36 @@ def render_beauty_frame(cfg: dict, cam_frame: dict, width: int, height: int,
 
     ``cam_frame`` carries the Blender camera in **world Cartesian** coordinates
     (``pos``/``fwd``/``up``/``right`` and a vertical ``fov`` in radians, per
-    ``src/blender/export_camera.py``). This converts the position to Boyer-Lindquist
-    (r, θ, φ) via the spherical embedding and projects the camera axes onto the
-    local (r̂, θ̂, φ̂) triad, which the ZAMO tetrad (Formula 7) consumes directly.
+    ``src/blender/export_camera.py``). Under CKS the world Cartesian frame **is**
+    the coordinate frame (spin axis = +z), so the camera position and basis are
+    used directly — no Boyer-Lindquist embedding, no (r̂,θ̂,φ̂) projection. The
+    supplied basis is re-orthonormalized for numerical safety.
 
-    Returns a float32 ``(height, width, 3)`` HDR buffer.
+    Returns a float32 ``(height, width, 3)`` HDR buffer (and the depth pass if
+    ``return_depth``).
     """
     bh = cfg["black_hole"]
     rcfg = cfg["render"]
     d = cfg["disk"]
 
     a = float(bh["spin"])
-    r_isco = float(bh["r_isco"])
-    k_horizon, r_plus = _horizon_constants(a)
+    r_plus = _horizon_radius(a)
 
     pos = np.asarray(cam_frame["pos"], dtype=float)
-    fwd = np.asarray(cam_frame["fwd"], dtype=float)
-    up = np.asarray(cam_frame["up"], dtype=float)
-    right = np.asarray(cam_frame["right"], dtype=float)
+    fwd_in = np.asarray(cam_frame["fwd"], dtype=float)
+    up_in = np.asarray(cam_frame["up"], dtype=float)
 
-    # World Cartesian → Boyer-Lindquist (spherical embedding; the a²-oblateness
-    # is ~0.1% at r≈18 and is neglected for the camera placement only).
-    x, y, z = float(pos[0]), float(pos[1]), float(pos[2])
-    r_cam = math.sqrt(x * x + y * y + z * z)
-    # Clamp the cosine to [-1, 1]: fp rounding can push z/r_cam slightly out of
-    # domain at the poles, which would make acos return NaN. Matches the clamping
-    # already applied to every in-kernel acos.
-    theta_cam = math.acos(min(1.0, max(-1.0, z / r_cam)))
-    phi_cam = math.atan2(y, x)
-
-    st, ct = math.sin(theta_cam), math.cos(theta_cam)
-    sp_, cp_ = math.sin(phi_cam), math.cos(phi_cam)
-    rhat = np.array([st * cp_, st * sp_, ct])
-    thhat = np.array([ct * cp_, ct * sp_, -st])
-    phhat = np.array([-sp_, cp_, 0.0])
-
-    def to_local(vec):
-        return (float(vec @ rhat), float(vec @ thhat), float(vec @ phhat))
-
-    fwd_l = to_local(fwd)
-    rgt_l = to_local(right)
-    up_l = to_local(up)
+    # World Cartesian = CKS. Re-orthonormalize the camera basis (Gram-Schmidt the
+    # supplied up against fwd) so FP drift in the exported matrix can't skew rays.
+    fwd = fwd_in / np.linalg.norm(fwd_in)
+    up0 = up_in - np.dot(up_in, fwd) * fwd
+    nrm = np.linalg.norm(up0)
+    if nrm < 1e-8:
+        _, right, up = _camera_basis(pos, fwd)
+    else:
+        up = up0 / nrm
+        right = np.cross(fwd, up)
+        right = right / np.linalg.norm(right)
 
     # fov is the vertical field of view (radians) per the exporter; the horizontal
     # half-angle follows from the frame aspect ratio.
@@ -1391,35 +1320,26 @@ def render_beauty_frame(cfg: dict, cam_frame: dict, width: int, height: int,
     adaptive_floor = float(rcfg["adaptive_step_floor"])
     depth_infinity = float(rcfg["depth_infinity"])
     projection_mode = 1 if str(rcfg.get("projection_mode", "perspective")) == "equirect" else 0
-    # Disk-slab |u|=|cosθ| early-out bound, DERIVED from its source parameter
-    # (single source of truth): |θ−π/2| < θ_half  ⇔  |cosθ| < sin(θ_half), exactly
-    # the slab test re-checked inside `_disk_emit`. The old config literal
-    # `bounding_sin_theta_half` duplicated sin(θ_half) and silently desynced the
-    # bounding box whenever `disk.theta_half_width` was edited (the config-sync bug).
+    # Disk-slab |cosθ| early-out bound, DERIVED from its source parameter (single
+    # source of truth): |θ−π/2| < θ_half ⇔ |cosθ| < sin(θ_half), exactly the slab
+    # test re-checked inside ``_disk_emit_cks``.
     bound_sin_half = math.sin(float(d["theta_half_width"]))
-
-    # Formula 4 — frozen ISCO conserved quantities for the plunging gas (Pipe B).
-    E_I, L_I = 0.0, 0.0
-    if with_disk:
-        from renderer.disk import isco_conserved_quantities
-        E_I, L_I = isco_conserved_quantities(r_isco, a)
 
     _alloc_frame(width, height)
     # Phase 2.4 kernel split: physics pass writes exit_buf/disk_buf, shading pass
     # computes the screen-space-Jacobian LOD and composites.
     render_beauty_physics(
         width, height,
-        fwd_l[0], fwd_l[1], fwd_l[2],
-        rgt_l[0], rgt_l[1], rgt_l[2],
-        up_l[0], up_l[1], up_l[2],
+        float(pos[0]), float(pos[1]), float(pos[2]),
+        float(fwd[0]), float(fwd[1]), float(fwd[2]),
+        float(right[0]), float(right[1]), float(right[2]),
+        float(up[0]), float(up[1]), float(up[2]),
         tan_half_x, tan_half_y,
-        r_cam, theta_cam, phi_cam,
-        a, k_horizon, r_plus, r_max, n_steps, d_lambda,
+        a, r_plus, r_max, n_steps, d_lambda,
         adaptive_floor, 1 if with_disk else 0,
         projection_mode, depth_infinity,
-        r_isco, E_I, L_I,
-        float(d["r_inner"]), float(d["r_outer"]), float(d["theta_half_width"]),
-        bound_sin_half,
+        float(d["r_inner"]), float(d["r_outer"]),
+        float(d["theta_half_width"]), bound_sin_half,
         float(d["vertical_sigma_frac"]), float(d["T_0"]),
         float(d["emission_coeff"]), float(d["absorption_coeff"]),
     )
@@ -1429,11 +1349,9 @@ def render_beauty_frame(cfg: dict, cam_frame: dict, width: int, height: int,
                         tan_half_x, tan_half_y, projection_mode)
     ti.sync()
     if return_depth:
-        # Review #3: a non-finite disk sample (RK4 overshoot at the inner edge)
-        # could leave NaN/±inf in the Z pass, which nothing downstream guards
-        # (export_exr only nan_to_num's beauty). Map any non-finite depth to the
-        # no-hit sentinel so a poisoned pixel reads as "empty", never as a finite
-        # garbage Z the compositor would trust.
+        # A non-finite disk sample (RK4 overshoot at the inner edge) could leave
+        # NaN/±inf in the Z pass; map any non-finite depth to the no-hit sentinel
+        # so a poisoned pixel reads as "empty", never as a finite garbage Z.
         depth = np.nan_to_num(depth_pixels.to_numpy(), nan=depth_infinity,
                               posinf=depth_infinity, neginf=depth_infinity)
         return frame_pixels.to_numpy(), depth
@@ -1454,13 +1372,8 @@ def render_beauty_frame_mb(cfg: dict, cam_frame: dict, width: int, height: int,
 
     Renders ``render.motion_blur_samples`` copies of the frame with the camera
     rotated about the spin axis across the shutter arc ``shutter_arc`` (radians of
-    azimuthal travel during the shutter, = ω·shutter_fraction; the caller derives ω
-    from adjacent ``camera_matrix.json`` entries) and averages the HDR results.
-
-    Averaging at the frame level (not inside the kernel) keeps the Phase-2.4 split
-    intact: each sub-frame still has a single, well-defined exit direction per pixel
-    for the screen-space Jacobian. ``samples<=1`` or ``shutter_arc==0`` → a single
-    render (no blur, no extra cost).
+    azimuthal travel during the shutter) and averages the HDR results. ``samples<=1``
+    or ``shutter_arc==0`` → a single render (no blur, no extra cost).
     """
     samples = int(cfg["render"]["motion_blur_samples"])
     if samples <= 1 or shutter_arc == 0.0:
@@ -1485,22 +1398,20 @@ def render_beauty_frame_mb(cfg: dict, cam_frame: dict, width: int, height: int,
         hdr = out[0] if return_depth else out
         acc = hdr.astype(np.float64) if acc is None else acc + hdr
         if return_depth:
-            # Review #1: NEVER arithmetic-mean the depth_infinity no-hit sentinel
-            # with real depths — averaging 1e5 with a finite Z yields a garbage
-            # "finite" value the compositor trusts. Accumulate only the sub-frames
-            # that actually hit the disk; pixels never hit keep the +∞ sentinel.
-            d = out[1].astype(np.float64)
-            hit = d < depth_inf
+            # NEVER arithmetic-mean the depth_infinity no-hit sentinel with real
+            # depths. Accumulate only the sub-frames that actually hit the disk;
+            # pixels never hit keep the +∞ sentinel.
+            dd = out[1].astype(np.float64)
+            hit = dd < depth_inf
             if depth_sum is None:
-                depth_sum = np.where(hit, d, 0.0)
+                depth_sum = np.where(hit, dd, 0.0)
                 depth_hits = hit.astype(np.float64)
             else:
-                depth_sum += np.where(hit, d, 0.0)
+                depth_sum += np.where(hit, dd, 0.0)
                 depth_hits += hit
 
     hdr_mean = (acc / samples).astype(np.float32)
     if return_depth:
-        # Masked mean over hit sub-frames; sentinel where the disk was never hit.
         depth_mean = np.where(depth_hits > 0.0,
                               depth_sum / np.maximum(depth_hits, 1.0),
                               depth_inf)

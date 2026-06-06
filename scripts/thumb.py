@@ -1,22 +1,21 @@
-"""Thumbnail preview renderer for the Kerr black hole.
+"""Thumbnail preview renderer for the Kerr black hole — Cartesian Kerr-Schild.
 
 Traces one null geodesic per pixel through Kerr spacetime and produces a small
 PNG. Without ``--disk`` it renders Pipe A only (shadow + photon ring + gradient
 background) to verify the lensing geometry. With ``--disk`` it composites the
 Pipe B volumetric accretion disk on top.
 
-All physics follows ``skills/kerr-physics/SKILL.md`` verbatim:
+This is the CPU reference twin of ``renderer.taichi_renderer``: it drives the
+same Cartesian Kerr-Schild (CKS) physics through the pure-NumPy
+``renderer.geodesic`` / ``renderer.disk`` so a render can be sanity-checked
+without a GPU. All physics follows ``skills/kerr-physics/SKILL.md`` PART II
+verbatim:
 
-  * Formula 1     — Kerr metric            (``renderer.metric``)
-  * Formula 6     — Mino-time integration  (``renderer.geodesic``)
-  * Formula 7     — ZAMO observer tetrad   (photon momentum initialisation, below)
-  * Formulas 3-5  — gas 4-velocity         (``renderer.disk``)
-  * Formula 8     — g-factor               (``renderer.disk``)
-  * Formula 9     — blackbody emission     (``renderer.disk`` + march_disk below)
-
-Photon momenta are initialised with the **ZAMO tetrad** (Formula 7), *not* the
-heuristic dot-product projection that the skill flags as only valid far away
-with a narrow FOV.
+  * Formula CKS-5/6 — Hamiltonian null geodesic + capture/escape (``renderer.geodesic``)
+  * Formula CKS-7   — ZAMO observer + projected-ray photon init (``renderer.geodesic``)
+  * Formula CKS-8   — equatorial gas 4-velocity (``renderer.disk``)
+  * Formula CKS-9   — g-factor (``renderer.disk``)
+  * Formula 9       — blackbody emission (``renderer.disk`` + march_disk below)
 
 All numerical parameters come from ``configs/render.yaml`` (project rule: no
 hardcoded values in source).
@@ -43,20 +42,19 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from renderer.geodesic import (  # noqa: E402
-    carter_Q,
+    _horizon_radius,
     integrate_null_geodesic,
-    radial_turning_point,
+    make_null_initial_conditions,
 )
-from renderer.metric import metric_bl  # noqa: E402
+from renderer.metric import kerr_radius  # noqa: E402
 from renderer.disk import (  # noqa: E402
     blackbody_rgb,
     g_factor,
-    gas_four_velocity,
-    isco_conserved_quantities,
+    gas_four_velocity_cks,
 )
 
-# Boyer-Lindquist coordinate index order (matches renderer.metric / geodesic).
-T, R, TH, PH = 0, 1, 2, 3
+# CKS Cartesian coordinate index order (matches renderer.metric / geodesic).
+T, X, Y, Z = 0, 1, 2, 3
 
 _CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs" / "render.yaml"
 
@@ -67,93 +65,63 @@ def load_config(path: Path = _CONFIG_PATH) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# Formula 7 — ZAMO tetrad photon momentum initialisation
+# Camera (CKS Cartesian) — matches renderer.taichi_renderer._camera_basis
 # --------------------------------------------------------------------------- #
-def zamo_photon_momentum(r, theta, a, n_rhat, n_thetahat, n_phihat):
-    """Covariant photon momentum p_mu from a local ZAMO ray direction.
+def camera_basis(pos, world_up=(0.0, 0.0, 1.0)):
+    """Orthonormal (fwd, right, up) looking from ``pos`` toward the origin.
 
-    Implements Formula 7 of skills/kerr-physics/SKILL.md verbatim.
-
-    Parameters
-    ----------
-    r, theta, a : float
-        Boyer-Lindquist position and spin.
-    n_rhat, n_thetahat, n_phihat : float
-        Components of the local (orthonormal) camera ray direction in the ZAMO
-        frame. Should be a unit 3-vector.
-
-    Returns
-    -------
-    p_cov : (4,) ndarray
-        Covariant photon momentum [p_t, p_r, p_theta, p_phi].
+    All in world Cartesian = CKS. ``fwd = -normalize(pos)``,
+    ``right = normalize(fwd × world_up)``, ``up = right × fwd`` (right-handed);
+    ``world_up`` defaults to the +z spin axis.
     """
-    sin2 = np.sin(theta) ** 2
-    cos2 = np.cos(theta) ** 2
-
-    Sigma = r * r + a * a * cos2
-    Delta = r * r - 2.0 * r + a * a
-    # Exact A — do NOT approximate as (r^2 + a^2)^2 (Formula 7 note).
-    A = (r * r + a * a) ** 2 - a * a * Delta * sin2
-
-    omega = 2.0 * a * r / A            # ZAMO angular velocity
-    alpha = np.sqrt(Sigma * Delta / A)  # lapse function
-    g_phiphi = A * sin2 / Sigma
-
-    # Contravariant momentum: p^mu = e_(t) + n . spatial tetrad (Formula 7).
-    p_t_con = 1.0 / alpha
-    p_r_con = n_rhat * np.sqrt(Delta / Sigma)
-    p_th_con = n_thetahat * (1.0 / np.sqrt(Sigma))
-    p_ph_con = omega / alpha + n_phihat * (1.0 / np.sqrt(g_phiphi))
-
-    # Lower the index with the metric (Formula 7).
-    g = metric_bl(r, theta, a)
-    p_t = g[T, T] * p_t_con + g[T, PH] * p_ph_con
-    p_r = g[R, R] * p_r_con
-    p_th = g[TH, TH] * p_th_con
-    p_ph = g[PH, PH] * p_ph_con + g[T, PH] * p_t_con
-
-    return np.array([p_t, p_r, p_th, p_ph], dtype=float)
+    f = -np.asarray(pos, dtype=float)
+    f = f / np.linalg.norm(f)
+    wu = np.asarray(world_up, dtype=float)
+    right = np.cross(f, wu)
+    nrm = np.linalg.norm(right)
+    if nrm < 1e-8:                       # looking along the spin axis: pick any ⟂
+        right = np.cross(f, np.array([1.0, 0.0, 0.0]))
+        nrm = np.linalg.norm(right)
+    right = right / nrm
+    up = np.cross(right, f)
+    return f, right, up
 
 
-def camera_ray_direction(px, py, res, tan_half_fov):
-    """Local ZAMO-frame unit direction for pixel (px, py) of an res x res image.
+def pixel_direction(px, py, res, tan_half_fov, fwd, right, up):
+    """Coordinate (CKS) unit direction the photon travels for pixel (px, py).
 
-    The camera looks inward toward the black hole (local -r_hat), with +phi_hat
-    to the right and -theta_hat up (theta increases toward the south pole).
+    The camera looks along ``fwd`` toward the hole; ``+right`` is screen-x and
+    ``+up`` is screen-y. ``n = normalize(fwd + sx·right + sy·up)``.
     """
-    # Screen coordinates in [-1, 1], scaled by the half-FOV tangent.
-    sx = (2.0 * (px + 0.5) / res - 1.0) * tan_half_fov   # right (+phi_hat)
-    sy = (1.0 - 2.0 * (py + 0.5) / res) * tan_half_fov   # up    (-theta_hat)
-
-    n_rhat = -1.0      # forward, toward the black hole
-    n_thetahat = -sy   # up is decreasing theta
-    n_phihat = sx
-    n = np.array([n_rhat, n_thetahat, n_phihat], dtype=float)
-    n /= np.linalg.norm(n)
-    return n
+    sx = (2.0 * (px + 0.5) / res - 1.0) * tan_half_fov   # right
+    sy = (1.0 - 2.0 * (py + 0.5) / res) * tan_half_fov   # up
+    n = fwd + sx * right + sy * up
+    return n / np.linalg.norm(n)
 
 
 # --------------------------------------------------------------------------- #
 # Ray classification
 # --------------------------------------------------------------------------- #
-def trace_pixel(r_cam, theta_cam, phi_cam, a, n, n_steps, d_lambda,
-                r_max, r_plus, disk_params=None):
+def trace_pixel(pos3, n, a, n_steps, d_lambda, r_max, r_plus, horizon_eps,
+                adaptive_floor, disk_params=None):
     """Trace one photon and return (outcome, r_min, disk_color, transmittance).
 
-    outcome:  'captured' (fell to horizon -> shadow),
+    outcome:  'captured' (fell to the horizon -> shadow),
               'escaped'  (reached r_max  -> background),
               'undecided' (ran out of steps near the photon sphere).
-    r_min:        closest approach radius along the path (for ring glow).
+    r_min:        closest-approach Kerr radius along the path (for the ring glow).
     disk_color:   (3,) accumulated disk emission (zeros if disk_params is None).
     transmittance: remaining transmittance through the disk (1.0 if no disk).
     """
-    p_cov = zamo_photon_momentum(r_cam, theta_cam, a, n[0], n[1], n[2])
-    x0 = np.array([0.0, r_cam, theta_cam, phi_cam], dtype=float)
+    x0, p_cov0 = make_null_initial_conditions(pos3, n, a)
 
-    # Escaping rays overflow harmlessly once they shoot past r_max (we filter to
-    # finite values below); near-horizon Delta->0 also trips invalid warnings.
+    # Near-horizon r→r₊ and far-field overflow can both trip FP warnings; the
+    # integrator's CKS-6 stop conditions handle termination, so silence them.
     with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-        x, p = integrate_null_geodesic(x0, p_cov, a, n_steps, d_lambda)
+        x, p = integrate_null_geodesic(
+            x0, p_cov0, a, n_steps, d_lambda,
+            r_max=r_max, horizon_eps=horizon_eps, adaptive_floor=adaptive_floor,
+        )
 
     disk_color = np.zeros(3, dtype=float)
     transmittance = 1.0
@@ -161,31 +129,28 @@ def trace_pixel(r_cam, theta_cam, phi_cam, a, n, n_steps, d_lambda,
         with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
             disk_color, transmittance = march_disk(x, p, disk_params)
 
-    r_series = x[:, R]
-    finite = np.isfinite(r_series)
-    r_finite = r_series[finite]
-    if r_finite.size == 0:
+    # Kerr radius r along the (finite) path — closest approach feeds the ring glow.
+    xs = x[:, X]
+    ys = x[:, Y]
+    zs = x[:, Z]
+    finite = np.isfinite(xs) & np.isfinite(ys) & np.isfinite(zs)
+    if not np.any(finite):
         return "captured", r_plus, disk_color, transmittance
+    r_series = np.array([
+        kerr_radius(float(xi), float(yi), float(zi), a)
+        for xi, yi, zi in zip(xs[finite], ys[finite], zs[finite])
+    ])
+    r_min = float(r_series.min())
 
-    # Closest-approach radius for the photon-ring glow: use the ANALYTIC radial
-    # turning point (root of Formula-6 R(r)), not the min over discrete samples.
-    # The sampled min aliases near perihelion and beads the glow along the polar
-    # axis; the analytic root is smooth in the ray parameters. Only computed for
-    # non-captured rays (captured pixels render black, so r_min is unused).
-    E = -p_cov[T]
-    L_z = p_cov[PH]
-    Q = carter_Q(theta_cam, p_cov[TH], E, L_z, a)
-
-    if np.any(r_finite >= r_max):
-        r_min = radial_turning_point(E, L_z, Q, a, r_cam, r_plus)
+    # Escape: the final point reached r_max (rho); background light.
+    rho_last = float(np.sqrt(xs[finite][-1] ** 2 + ys[finite][-1] ** 2
+                             + zs[finite][-1] ** 2))
+    r_last = float(r_series[-1])
+    if rho_last >= r_max:
         return "escaped", r_min, disk_color, transmittance
-
-    r_last = float(r_finite[-1])
-    # The integrator stops when Delta < its horizon threshold; a small final r
-    # means the photon plunged through the horizon.
-    if r_last < 2.0:
+    # Capture: stopped at the horizon margin.
+    if r_last <= r_plus + horizon_eps + 1e-6:
         return "captured", r_plus, disk_color, transmittance
-    r_min = radial_turning_point(E, L_z, Q, a, r_cam, r_plus)
     return "undecided", r_min, disk_color, transmittance
 
 
@@ -205,25 +170,21 @@ def ring_glow(r_min, peak, sigma, gain, color):
 
 
 # --------------------------------------------------------------------------- #
-# Pipe B — volumetric accretion disk
+# Pipe B — volumetric accretion disk (CKS)
 # --------------------------------------------------------------------------- #
 def march_disk(x, p_cov, dp):
-    # KNOWN ARTIFACT: near-polar-axis seam caused by discrete λ-step
-    # aliasing at the θ=π/2 disk-plane crossing. Fix for Taichi renderer:
-    # detect θ=π/2 crossing analytically (bisect between steps where
-    # sign(θ-π/2) flips) and sample exactly at the crossing point.
-    """Accumulate disk emission along an already-traced geodesic.
+    """Accumulate disk emission along an already-traced CKS geodesic.
 
-    Implements Formulas 5/3 (gas velocity), 8 (g-factor) and 9 (emission) of
-    skills/kerr-physics/SKILL.md. Marches the recorded geodesic samples; at each
-    sample inside the disk bounding box it adds redshifted blackbody emission and
-    attenuates the running transmittance.
+    Implements Formulas CKS-8 (gas velocity), CKS-9 (g-factor) and 9 (emission)
+    of skills/kerr-physics/SKILL.md. Marches the recorded geodesic samples; at
+    each sample inside the equatorial-slab bounding box it adds redshifted
+    blackbody emission and attenuates the running transmittance.
 
     Parameters
     ----------
-    x      : (N, 4) Boyer-Lindquist coordinates [t, r, theta, phi].
-    p_cov  : (N, 4) covariant photon momenta     [p_t, p_r, p_theta, p_phi].
-    dp     : dict of disk parameters (see render()).
+    x      : (N, 4) CKS coordinates       [t, x, y, z].
+    p_cov  : (N, 4) covariant photon momenta [p_t, p_x, p_y, p_z].
+    dp     : dict of disk parameters (see build_disk_params()).
 
     Returns
     -------
@@ -234,14 +195,18 @@ def march_disk(x, p_cov, dp):
     transmittance = 1.0
 
     half_pi = 0.5 * np.pi
+    a = dp["a"]
     sigma_theta = dp["theta_half_width"] * dp["vertical_sigma_frac"]
-    ds = dp["d_lambda"]  # emission weight per Mino-time step
+    ds = dp["d_lambda"]  # emission weight per CKS affine step
 
     for i in range(x.shape[0]):
-        r = x[i, R]
-        theta = x[i, TH]
-        if not (np.isfinite(r) and np.isfinite(theta)):
+        xi, yi, zi = x[i, X], x[i, Y], x[i, Z]
+        if not (np.isfinite(xi) and np.isfinite(yi) and np.isfinite(zi)):
             continue
+
+        r = kerr_radius(float(xi), float(yi), float(zi), a)
+        cos_th = min(max(zi / r, -1.0), 1.0)
+        theta = np.arccos(cos_th)
 
         # Bounding box: thin equatorial slab between r_inner and r_outer.
         dz = theta - half_pi
@@ -254,12 +219,11 @@ def march_disk(x, p_cov, dp):
         if not np.all(np.isfinite(p)):
             continue
 
-        # Formula 3/5 — gas 4-velocity at this point.
-        u = gas_four_velocity(r, theta, dp["a"], dp["r_isco"],
-                              dp["E_I"], dp["L_I"])
+        # Formula CKS-8 — gas 4-velocity at this point.
+        u = gas_four_velocity_cks(float(xi), float(yi), float(zi), a)
 
-        # Formula 8 — g-factor (p_cov used as-is; NOT divided by Delta).
-        denom = p[T] * u[T] + p[R] * u[R] + p[TH] * u[TH] + p[PH] * u[PH]
+        # Formula CKS-9 — g-factor (Cartesian dot product; p_cov used as-is).
+        denom = p[T] * u[T] + p[X] * u[X] + p[Y] * u[Y] + p[Z] * u[Z]
         if not np.isfinite(denom) or abs(denom) < 1e-12:
             continue
         g = g_factor(p, u)
@@ -282,16 +246,10 @@ def march_disk(x, p_cov, dp):
 
 
 def build_disk_params(cfg: dict, a: float, d_lambda: float) -> dict:
-    """Assemble disk parameters + frozen ISCO constants (Formula 4) from config."""
-    bh = cfg["black_hole"]
+    """Assemble disk parameters from config (CKS-8 needs no frozen ISCO constants)."""
     d = cfg["disk"]
-    r_isco = float(bh["r_isco"])
-    E_I, L_I = isco_conserved_quantities(r_isco, a)
     return {
         "a": a,
-        "r_isco": r_isco,
-        "E_I": E_I,
-        "L_I": L_I,
         "r_inner": float(d["r_inner"]),
         "r_outer": float(d["r_outer"]),
         "theta_half_width": float(d["theta_half_width"]),
@@ -310,7 +268,7 @@ def render(cfg: dict, res: int, with_disk: bool = False) -> np.ndarray:
     th = cfg["thumb"]
 
     a = float(bh["spin"])
-    r_plus = float(bh["r_plus"])
+    r_plus = _horizon_radius(a)
 
     # Preview framing overrides the cinematic camera when present (see config).
     r_cam = float(th.get("camera_radius", cam["default_radius"]))
@@ -321,6 +279,8 @@ def render(cfg: dict, res: int, with_disk: bool = False) -> np.ndarray:
     n_steps = int(rcfg["max_steps_pipe_a"])
     d_lambda = float(rcfg["d_lambda_pipe_a"])
     r_max = float(rcfg["r_max"])
+    horizon_eps = float(rcfg["horizon_epsilon"])
+    adaptive_floor = float(rcfg["adaptive_step_floor"])
 
     bg_top = np.array(th["background_top"], dtype=float)
     bg_bottom = np.array(th["background_bottom"], dtype=float)
@@ -332,6 +292,13 @@ def render(cfg: dict, res: int, with_disk: bool = False) -> np.ndarray:
     gamma = float(th["gamma"])
 
     tan_half_fov = np.tan(np.deg2rad(fov_deg) / 2.0)
+
+    # Camera position in CKS Cartesian (spin axis = +z); look at the origin.
+    st, ct = np.sin(theta_cam), np.cos(theta_cam)
+    pos = np.array([r_cam * st * np.cos(phi_cam),
+                    r_cam * st * np.sin(phi_cam),
+                    r_cam * ct], dtype=float)
+    fwd, right, up = camera_basis(pos)
 
     disk_params = build_disk_params(cfg, a, d_lambda) if with_disk else None
 
@@ -345,10 +312,10 @@ def render(cfg: dict, res: int, with_disk: bool = False) -> np.ndarray:
     for py in range(res):
         bg = background_color(py, res, bg_top, bg_bottom)
         for px in range(res):
-            n = camera_ray_direction(px, py, res, tan_half_fov)
+            n = pixel_direction(px, py, res, tan_half_fov, fwd, right, up)
             outcome, r_min, disk_color, transmittance = trace_pixel(
-                r_cam, theta_cam, phi_cam, a, n,
-                n_steps, d_lambda, r_max, r_plus, disk_params,
+                pos, n, a, n_steps, d_lambda, r_max, r_plus, horizon_eps,
+                adaptive_floor, disk_params,
             )
 
             if outcome == "captured":
@@ -366,8 +333,6 @@ def render(cfg: dict, res: int, with_disk: bool = False) -> np.ndarray:
                                      ring_gain, ring_col)
 
             # Composite: disk emission in front, background attenuated behind it.
-            # Disk emission accumulated before the ray plunges shows the disk
-            # both in front of and (via lensing) behind the shadow.
             color = disk_color + transmittance * bg_layer
             img[py, px] = color
 
@@ -376,8 +341,8 @@ def render(cfg: dict, res: int, with_disk: bool = False) -> np.ndarray:
             print(f"  row {py + 1}/{res}  ({elapsed:.1f}s)")
 
     # Reinhard tone map compresses the huge g^4 Doppler dynamic range (the
-    # approaching limb is 10-100x the receding one) so both limbs stay visible
-    # instead of the bright side clipping to flat white. Then gamma encode.
+    # approaching limb is far brighter than the receding one) so both limbs stay
+    # visible instead of the bright side clipping to flat white. Then gamma encode.
     img = img * exposure
     img = img / (1.0 + img)
     img = np.clip(img, 0.0, 1.0)

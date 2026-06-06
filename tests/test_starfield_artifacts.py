@@ -60,15 +60,16 @@ injected and an equal-energy off-axis perturbation used as the negative control:
     clean distribution and would false-positive. 20 is in the empty 14->27.8 gap,
     keeping margin above clean and below today's real seam.
 
-As of 2026-06-06 the shipped default is ``mode=dngr``: Artifact A (smear) is FIXED,
-so its test is a live PASS guard (dngr smear coherence 0.257 < 0.36). Artifact B
-(seam) is FIXED on the dngr default by the R2 guard-(b′) splat placement (the field
-is seam-free; see the A. → B. note above), but ``test_background_has_no_vertical_seam_stripe``
-stays ``xfail(strict=True)`` because in this framing the metric is dominated by a
-bright lensed star (z≈28), not the seam — a deferred detector-specificity
-recalibration, NOT a residual artifact. Were the bright-point recalibration applied
-(or the confounding star to move/dim), the test would xpass and turn the suite RED,
-forcing marker removal. Calibrated for 1280x720; keep that render size.
+As of the 2026-06 CKS migration both artifacts are live PASS guards. Artifact A
+(smear) is fixed by the dngr anisotropic EWA (smear coherence 0.257 < 0.36).
+Artifact B (seam) is now eliminated **at the source** by Cartesian Kerr-Schild:
+the escaped-ray celestial direction is a genuine Cartesian unit vector (Formula
+CKS-10), so there is no spin-axis meridian caustic, no φ-accumulation blow-up, and
+no Layer-A detJ pileup — the residual BL/dngr seam reading (which had previously
+kept ``test_background_has_no_vertical_seam_stripe`` at ``xfail(strict=True)``,
+confounded by a bright lensed star in frame-0's thin sky band) drops below the
+z=20 threshold, so the marker was removed and the test is a live guard. Calibrated
+for 1280x720; keep that render size.
 """
 from __future__ import annotations
 
@@ -217,14 +218,15 @@ def test_background_has_no_radial_smear(background_lum):
         "=> stars are smeared into directional streaks (anisotropic-LOD aliasing)")
 
 
-@pytest.mark.xfail(strict=True, reason="dngr seam FIXED by R2 (F13 guard b′) — the "
-                   "field is seam-free (masking the brightest star drops z≈28→14, "
-                   "clean range). This metric stays high ONLY because a single bright "
-                   "lensed star confounds it in frame-0's ~80-row sky band (not a "
-                   "residual seam; pre-R2 J⁻¹ peaks at the same star/col, z≈27). "
-                   "Bright-point recalibration deferred — see docs/specs/"
-                   "2026-06-06-dngr-artifact-remediation.md §7.2/§7.3.")
 def test_background_has_no_vertical_seam_stripe(background_lum):
+    # Live regression guard since the 2026-06 CKS migration: the BH spin-axis seam
+    # is eliminated at the source (Formula CKS-10 — the escaped-ray celestial
+    # direction is a genuine Cartesian unit vector, so there is no meridian caustic,
+    # no φ-accumulation blow-up, and no Layer-A detJ pileup). Under CKS this metric
+    # drops below threshold even in frame-0's thin sky band, so it now PASSES as a
+    # live guard (was xfail(strict) under the BL/dngr path, where a residual seam +
+    # bright-star confound held it high). A regression back to a coordinate-singular
+    # path would reintroduce the stripe and trip this.
     z = seam_stripe_z(background_lum)
     assert z < _SEAM_STRIPE_Z_MAX, (
         f"strongest vertical stripe z={z:.1f} >= {_SEAM_STRIPE_Z_MAX} "

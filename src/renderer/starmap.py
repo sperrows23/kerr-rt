@@ -17,9 +17,9 @@ This module owns the *host-side* work:
 The Taichi renderer uploads these levels into GPU fields; the math here is the
 single source of truth for that GPU sampler so the two stay in agreement.
 
-Equirectangular convention (matches the geodesic's exit BL angles):
-    u = phi / (2*pi)   in [0, 1)   -> column
-    v = theta / pi     in [0, 1]   -> row   (theta=0 north pole at v=0)
+Equirectangular convention (matches the geodesic's CKS-10 exit direction):
+    u = phi' / (2*pi)   in [0, 1)   -> column
+    v = theta' / pi     in [0, 1]   -> row   (theta'=0 north pole at v=0)
 """
 
 from __future__ import annotations
@@ -144,33 +144,29 @@ class Starmap:
         return c0 * (1 - f) + c1 * f
 
 
-def normalize_sphere_angles(theta: float, phi: float) -> tuple[float, float]:
-    """Fold raw (theta, phi) back onto the standard sphere: theta in [0, pi].
+def celestial_to_uv(dx: float, dy: float, dz: float) -> tuple[float, float]:
+    """Map an escaped ray's CKS celestial direction to equirect (u, v) — CKS-10.
 
-    The geodesic integrator carries (theta, phi) as unbounded RK4 state. Rays
-    with near-zero L_z on the center column push theta slightly negative (polar
-    "punch-through") or past pi; the raw value no longer lies in the canonical
-    [0, pi] band the equirect map expects. Reflecting across the pole
-    (theta -> |theta|, phi -> phi + pi) maps such a value back to the *same*
-    physical direction in canonical form, so the starmap lookup and the
-    Formula 10 Jacobian both see a well-behaved coordinate.
+    Under Cartesian Kerr-Schild an escaped photon (``rho >= r_max``) lives in the
+    asymptotically-flat region, where its contravariant spatial momentum
+    direction ``d = (dx, dy, dz)`` IS the incoming sky direction. The equirect
+    lookup is then a plain spherical projection:
 
-    This is a pure coordinate identity (it preserves the unit direction vector);
-    it touches no physics and re-derives no formula.
+        theta' = acos(clamp(d_z / |d|, -1, 1))
+        phi'   = atan2(d_y, d_x)
+        u = wrap(phi' / 2pi),   v = clamp(theta' / pi, 0, 1)
+
+    ``d`` is a genuine Cartesian unit vector for EVERY ray, so the BL spin-axis
+    seam, the phi-accumulation blow-up, and the old ``normalize_sphere_angles``
+    punch-through fold are all gone (SKILL.md CKS-10). The only residual pole
+    effect is the ordinary equirect-texture coordinate at theta'=0,pi, handled by
+    the phi-wrap below.
     """
-    theta = theta % TWO_PI            # -> [0, 2*pi); Python % folds negatives up
-    if theta > math.pi:
-        theta = TWO_PI - theta        # reflect across the nearer pole
-        phi += math.pi                # ... and step half-way round in azimuth
-    return theta, phi % TWO_PI
-
-
-def direction_to_uv(theta: float, phi: float) -> tuple[float, float]:
-    """Map an escaped ray's exit BL angles to equirect (u, v).
-
-    Raw exit angles are first folded onto the standard sphere
-    (:func:`normalize_sphere_angles`) so polar punch-through (theta < 0) reflects
-    to a genuine row instead of being clamped onto the north-pole texel.
-    """
-    theta, phi = normalize_sphere_angles(theta, phi)
-    return phi / TWO_PI, theta / math.pi
+    norm = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if norm == 0.0:                       # degenerate guard (never happens for a ray)
+        return 0.0, 0.0
+    theta = math.acos(min(max(dz / norm, -1.0), 1.0))
+    phi = math.atan2(dy, dx)
+    u = (phi / TWO_PI) % 1.0              # wrap azimuth into [0, 1)
+    v = min(max(theta / math.pi, 0.0), 1.0)
+    return u, v
