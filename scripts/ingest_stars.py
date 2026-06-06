@@ -32,10 +32,19 @@ through SKILL.md:
   * Ballesteros (2012, EPL 97 34008) B-V -> effective temperature:
         T = 4600 * ( 1/(0.92*BV + 1.7) + 1/(0.92*BV + 0.62) )   [K]
 
-Input: the Yale Bright Star Catalogue, 5th ed. (Hoffleit & Warren 1991; ADC/
-VizieR ``V/50``, the fixed-column ``bsc5.dat`` ascii file). Every numeric
-parameter (paths, magnitude limit, flux zero-point) comes from
-``configs/render.yaml`` under ``starfield:`` — no hardcoded values (project rule).
+Two input formats are supported, dispatched by ``starfield.format``
+(``auto`` → by file extension):
+
+  * **HYG / ATHYG** (``.csv``) — the HYG-like database derived from AT-HYG v3.2
+    (Hipparcos + Tycho-2 + Gaia), a header-row CSV. Columns used: ``ra`` (hours),
+    ``dec`` (degrees), ``mag`` (apparent V), ``ci`` (B−V). The Sun (``id`` 0 /
+    ``proper`` "Sol") is skipped — it is the observer's star, not background sky.
+  * **Yale Bright Star Catalogue**, 5th ed. (``.dat``; Hoffleit & Warren 1991;
+    ADC/VizieR ``V/50``, the fixed-column ``bsc5.dat`` ascii file).
+
+Both feed the *same* per-star transforms below, so the catalogue choice changes only
+the reader. Every numeric parameter (paths, magnitude limit, flux zero-point) comes
+from ``configs/render.yaml`` under ``starfield:`` — no hardcoded values (project rule).
 
 This is **Part A (offline ingest) only** — Phase 1 of the §8 DNGR rearchitecture.
 It writes a data file and touches no renderer code; the GPU star-gather path
@@ -44,13 +53,14 @@ It writes a data file and touches no renderer code; the GPU star-gather path
 Usage
 -----
     uv run python scripts/ingest_stars.py                       # uses render.yaml
-    uv run python scripts/ingest_stars.py --src assets/bsc5.dat --out assets/stars_bsc.npy
+    uv run python scripts/ingest_stars.py --src assets/bsc5.dat --format bsc5
     uv run python scripts/ingest_stars.py --mag-limit 5.0 -v
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import sys
 from pathlib import Path
 
@@ -170,31 +180,92 @@ def parse_bsc5_record(line: str):
     return theta, phi, vmag, bv
 
 
+# --------------------------------------------------------------------------- #
+# HYG / ATHYG v3.2 CSV parser (header row; RA in hours, Dec in degrees)
+# --------------------------------------------------------------------------- #
+def parse_hyg_row(row: dict):
+    """Parse one HYG/ATHYG CSV record -> (theta', phi', Vmag, B-V), or None to skip.
+
+    Uses the named columns ``ra`` (hours), ``dec`` (deg), ``mag`` (apparent V) and
+    ``ci`` (B-V). The Sun (``id`` 0 / ``proper`` "Sol") is skipped — it is the
+    observer's own star, not part of the background sky. Rows with no ``mag`` are
+    skipped; a blank ``ci`` falls back to ``_DEFAULT_BV``.
+    """
+    if row.get("proper", "").strip() == "Sol" or row.get("id", "").strip() == "0":
+        return None
+
+    vmag = _f(row.get("mag", ""))
+    if vmag is None:
+        return None  # no photometry -> nothing to render
+
+    ra_hours = _f(row.get("ra", ""))
+    dec_deg = _f(row.get("dec", ""))
+    if ra_hours is None or dec_deg is None:
+        return None  # no usable position
+
+    bv = _f(row.get("ci", ""))
+    if bv is None:
+        bv = _DEFAULT_BV
+
+    ra_rad = np.deg2rad(ra_hours * 15.0)   # hours -> degrees -> radians
+    dec_rad = np.deg2rad(dec_deg)
+    theta, phi = radec_to_theta_phi(ra_rad, dec_rad)
+    return theta, phi, vmag, bv
+
+
+# --------------------------------------------------------------------------- #
+# Format dispatch + catalog builder
+# --------------------------------------------------------------------------- #
+def resolve_format(fmt: str, src_path: Path) -> str:
+    """Resolve ``auto`` to ``hyg`` (.csv) or ``bsc5`` (anything else, e.g. .dat)."""
+    fmt = (fmt or "auto").lower()
+    if fmt != "auto":
+        return fmt
+    return "hyg" if Path(src_path).suffix.lower() == ".csv" else "bsc5"
+
+
+def _iter_records(src_path: Path, fmt: str):
+    """Yield ``(theta', phi', Vmag, B-V)`` for every usable star in ``src_path``."""
+    if fmt == "hyg":
+        with open(src_path, "r", encoding="utf-8", errors="replace", newline="") as fh:
+            for row in csv.DictReader(fh):
+                rec = parse_hyg_row(row)
+                if rec is not None:
+                    yield rec
+    elif fmt == "bsc5":
+        with open(src_path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                rec = parse_bsc5_record(line)
+                if rec is not None:
+                    yield rec
+    else:
+        raise ValueError(f"Unknown catalogue format {fmt!r} (expected hyg|bsc5).")
+
+
 def build_catalog(
     src_path: Path,
     mag_limit: float,
     mag_zero_point: float = 0.0,
+    fmt: str = "auto",
 ) -> np.ndarray:
-    """Parse a BSC5 file -> float32 array ``[N, 5]`` = (theta', phi', r, g, b).
+    """Parse a star catalogue -> float32 array ``[N, 5]`` = (theta', phi', r, g, b).
 
+    ``fmt`` selects the reader (``auto`` → by extension; see ``resolve_format``).
     Stars fainter than ``mag_limit`` (apparent V) are dropped.
     """
+    fmt = resolve_format(fmt, src_path)
     rows: list[list[float]] = []
-    with open(src_path, "r", encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            rec = parse_bsc5_record(line)
-            if rec is None:
-                continue
-            theta, phi, vmag, bv = rec
-            if vmag > mag_limit:
-                continue
-            flux = star_flux_rgb(vmag, bv, mag_zero_point)
-            rows.append([theta, phi, float(flux[0]), float(flux[1]), float(flux[2])])
+    for theta, phi, vmag, bv in _iter_records(src_path, fmt):
+        if vmag > mag_limit:
+            continue
+        flux = star_flux_rgb(vmag, bv, mag_zero_point)
+        rows.append([theta, phi, float(flux[0]), float(flux[1]), float(flux[2])])
 
     if not rows:
         raise ValueError(
-            f"No usable stars parsed from {src_path} (mag_limit={mag_limit}). "
-            "Is this a Yale Bright Star Catalogue (V/50) bsc5.dat file?"
+            f"No usable stars parsed from {src_path} (format={fmt}, "
+            f"mag_limit={mag_limit}). Expected a HYG/ATHYG csv or a Yale Bright "
+            "Star Catalogue (V/50) bsc5.dat file."
         )
     return np.asarray(rows, dtype=np.float32)
 
@@ -215,6 +286,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="override starfield.catalog_path (output .npy)")
     parser.add_argument("--mag-limit", type=float, default=None,
                         help="override starfield.mag_limit (drop fainter stars)")
+    parser.add_argument("--format", choices=("auto", "hyg", "bsc5"), default=None,
+                        help="override starfield.format (auto = by file extension)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="print a summary of the ingested catalog")
     args = parser.parse_args(argv)
@@ -230,6 +303,7 @@ def main(argv: list[str] | None = None) -> int:
     out = _resolve(args.out if args.out is not None else sf["catalog_path"])
     mag_limit = args.mag_limit if args.mag_limit is not None else float(sf["mag_limit"])
     mag_zero_point = float(sf.get("mag_zero_point", 0.0))
+    fmt = args.format if args.format is not None else str(sf.get("format", "auto"))
 
     if not src.exists():
         print(
@@ -242,7 +316,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    catalog = build_catalog(src, mag_limit, mag_zero_point)
+    catalog = build_catalog(src, mag_limit, mag_zero_point, fmt)
 
     out.parent.mkdir(parents=True, exist_ok=True)
     np.save(out, catalog)

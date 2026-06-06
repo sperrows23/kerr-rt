@@ -23,8 +23,19 @@ What it guarantees, per frame (frame 0 of ``camera_matrix.json``, disk on):
      pinned reference within tolerance. Drift flags a change in the disk emission
      / redshift chain (Formulas 3/4/5/8/9).
   4. Spin-axis seam (A4) — no sharp vertical luminance discontinuity at the center
-     column (the spin-axis meridian caustic). Guards the committed center-seam
-     fold-saturation fix against a silent regression from a future LOD change.
+     column (the spin-axis meridian caustic). Under the legacy ``texture`` default
+     this guarded the committed center-seam fold-saturation fix (~1.9× baseline).
+     The 2026-06-06 switch to the ``dngr`` default briefly drove this coarse
+     center-column metric to ~15× (the Layer-A meridian star-pileup, Artifact B),
+     which then **landed the R2 fix** (SKILL.md Formula 13 guard (b′): undeflected
+     proper-separation splat placement on the seam — see
+     docs/specs/2026-06-06-dngr-artifact-remediation.md §7.2). With R2 the center
+     ratio is back to ~2.06× (off-seam baseline), so this is again a **live PASS
+     guard**: it catches a reintroduced central meridian seam in either mode. (The
+     dedicated, location-agnostic ``test_background_has_no_vertical_seam_stripe``
+     stays ``xfail`` — but only because a single bright lensed star confounds it in
+     this framing's thin sky band, NOT a residual seam; that detector's bright-point
+     recalibration is deferred.)
 
 CUDA is mandatory (the backend is LOCKED to ``ti.init(arch=ti.cuda)`` per
 CLAUDE.md). On a host without a working CUDA backend the whole module skips
@@ -73,8 +84,11 @@ _DISK_MAX_REF = 12.7707       # peak HDR (disk emission edge); rel tol below
 _DISK_MAX_RTOL = 0.05
 
 # Spin-axis seam guard (A4): max tolerated ratio of the center-column luminance
-# jump to the median background jump. Measured ≈1.9× on the fixed code path; a
-# reintroduced static band is a dominant vertical discontinuity (many× median).
+# jump to the median background jump. Measured ≈1.9× on the legacy texture path
+# (the fold-saturation fix) and ≈2.06× on the dngr default after the R2 splat-
+# placement fix (SKILL.md F13 guard (b′)); a reintroduced static band is a dominant
+# vertical discontinuity (many× median — the pre-R2 dngr pileup measured ≈15×).
+# 6.0 sits in the empty gap above both fixed modes and well below a real seam.
 _SEAM_JUMP_OVER_MEDIAN_MAX = 6.0
 
 
@@ -179,10 +193,11 @@ def test_disk_peak_matches_reference(beauty_frame):
 
 
 def test_no_spin_axis_seam(beauty_frame):
-    # The center "static" seam (spin-axis meridian caustic) would reappear as a
-    # sharp vertical luminance discontinuity at the center column if a future LOD
-    # change regressed the committed fold-saturation fix. Pin it to a smoothness
-    # bound relative to the surrounding sky.
+    # The center "static" seam (spin-axis meridian caustic) shows as a sharp
+    # vertical luminance discontinuity at the center column. The legacy texture
+    # fold-saturation fix held this to ~1.9×; the dngr R2 splat-placement fix
+    # (SKILL.md F13 guard (b′)) holds it to ~2.06× — both well under the 6.0 limit.
+    # (Pre-R2 the dngr Layer-A meridian pileup spiked this to ~15×.)
     jump = beauty_frame["seam_center_jump"]
     baseline = max(beauty_frame["seam_bg_median"], 1e-9)
     assert jump / baseline <= _SEAM_JUMP_OVER_MEDIAN_MAX

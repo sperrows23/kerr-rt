@@ -584,19 +584,48 @@ det J = (∂θ′/∂x)(∂φ′/∂y) − (∂θ′/∂y)(∂φ′/∂x)
 where `(det J₀, sinθ′₀)` is the **flat-space (undeflected) per-pixel footprint**.
 At critical curves `det J → 0` (paper's `δ⁻ → 0`) so `μ → ∞`; clamp `min(μ, MAG_MAX)`.
 
-**⚠ Refinement notes — FLAGGED 2026-06-04, pending owner approval:**
+**✓ Refinement notes — APPROVED by the project owner 2026-06-05** (resolved before
+the §8 render-path landing; PROJECT.md §6/§8):
 
-- **Normalization (the `det J₀` term):** the bare `μ = 1/|det J·sinθ′|` of `plus.md`
-  equals 1 in flat space *only* if `(x, y)` carry true local-sky solid-angle units.
-  With raw **pixel-index** differences, `det J` carries a constant `(rad/pixel)²`
-  factor and a finite-FOV geometric baseline — the same effect Formula 10 records as
-  "undeflected-corner LOD ≈ 2.3 (≈ ideal 1.74 + geometric)". Divide by the flat-space
-  footprint so `μ → 1` undeflected. (Compute `det J₀·sinθ′₀` from an undeflected
-  reference render, or analytically from the pixel's local-sky solid angle.)
-- **Boundary rules (inherit Formula 10 v1.4 verbatim):** if any neighbor used in the
-  difference did **not** `ESCAPE`, or if the footprint straddles the spin-axis seam
-  (`J > j_fold`), `det J` is invalid → clamp `μ = 1` (do not brighten). This mirrors
-  the `outcome != ESCAPED → max_lod` and `J > _J_FOLD` guards already in the LOD path.
+- **(a) Normalization (the `det J₀` term) — APPROVED.** The bare
+  `μ = 1/|det J·sinθ′|` equals 1 in flat space *only* if `(x, y)` carry true
+  local-sky solid-angle units. With raw **pixel-index** differences, `det J` carries
+  a constant `(rad/pixel)²` factor and a finite-FOV geometric baseline — the same
+  effect Formula 10 records as "undeflected-corner LOD ≈ 2.3 (≈ ideal 1.74 +
+  geometric)". Divide by the flat-space footprint so `μ → 1` undeflected. **Resolution:**
+  compute `det J₀·sinθ′₀` with the **same finite-difference estimator** applied to the
+  *undeflected camera-ray celestial directions* (the straight-ray exit map), so the
+  `(rad/pixel)²` + geometric baseline cancels exactly and `μ → 1` with no black hole.
+- **(b) Boundary rules (inherit Formula 10 v1.4 verbatim) — APPROVED.** If any neighbor
+  used in the difference did **not** `ESCAPE`, or if the footprint straddles the
+  spin-axis seam (`J > j_fold`), `det J` is invalid → clamp `μ = 1` (do not brighten).
+  This mirrors the `outcome != ESCAPED → max_lod` and `J > _J_FOLD` guards already in
+  the LOD path. **Resolution:** additionally treat the minor ellipse axis
+  `δ⁻ < caustic_delta_min` as on-caustic and clamp `μ = min(μ, mag_clip)` so a
+  critical curve cannot produce an unbounded splat.
+- **(b′) Layer-A splat placement when `det J` is invalid (R2 — APPROVED owner 2026-06-06).**
+  When guard (b) marks `det J` invalid (a non-ESCAPED neighbour, or a fold footprint
+  `J > j_fold` / `δ⁺ > j_fold`), the star's screen-space offset must **NOT** be computed
+  from `J⁻¹`. On the spin-axis seam neighbour pixels straddle the celestial pole, so
+  `Δφ′ ≈ ±π` ⇒ `|det J|` is large ⇒ `J⁻¹ → 0`, which collapses **every** polar-cell
+  star to `d ≈ 0`, piling them onto the meridian (the observed seam pileup). Instead
+  place the splat by the star's **true proper angular separation under the undeflected
+  exit map**, scaled by the flat-space per-pixel footprint `dΩ = |det J₀·sinθ′₀|`
+  already computed for the guard-(a) μ normalization:
+
+  ```
+  d² = ( Δθ′² + sin²θ′·Δφ′² ) / dΩ        # screen-pixel², isotropic undeflected footprint
+       where Δθ′ = θ′_star − θ′,  Δφ′ = wrap_pi(φ′_star − φ′)
+  ```
+
+  i.e. the great-circle separation divided by the undeflected angular pixel size
+  `√dΩ`. On-axis stars then keep their real angular spacing (only genuinely-near stars
+  splat), and μ is already clamped to 1 here by guard (b), so seam stars stay sharp
+  point-like at base flux. This makes the polar gather degenerate gracefully to the
+  no-lens geometry exactly where the lensed Jacobian is unusable. It is the principled
+  replacement for the Formula-10 `j_fold` coarse-mip collapse (PROJECT.md §8, `δ⁻→0`
+  caustic marker); porting the same regularization into the Formula-10 LOD path is a
+  separate, not-yet-applied follow-up tracked in docs/specs/2026-06-06-dngr-artifact-remediation.md §7.2.
 
 ### 3. Energy-conserving point flux and truncated Gaussian PSF
 
@@ -611,8 +640,9 @@ I_pixel(d)  = I_final · exp( −d² / (2σ²) )           # truncated Gaussian 
   unresolved point-source *flux*). They are physically independent, exactly as the
   paper keeps frequency shift (ray-trace step vii) separate from beam solid angle
   (A.2). For a **static** camera with stars at the celestial sphere, `g ≈ 1`; the
-  factor only bites under camera motion — keep it as a hook. *(g⁴ choice flagged
-  2026-06-04, pending owner approval.)*
+  factor only bites under camera motion — keep it as a hook. *(g⁴ choice **APPROVED**
+  2026-06-05: volumetric g⁴ exponent, exposed as a per-pixel hook that defaults to a
+  no-op (g≡1) until a moving-observer g-factor lands — config `starfield.g_beaming`.)*
 - **`d`** is the screen-space distance from the pixel center to the star's projected
   center; `σ` is config-driven (paper sets the beam's initial radius to twice the
   pixel separation, targeting a ≤2% peak-to-trough flicker). The truncation `|d| < d_max`
@@ -669,7 +699,7 @@ src/renderer/geodesic.py         ← Formulas 1, 6, 7
 src/renderer/disk.py             ← Formulas 2, 3, 4, 5, 8, 9
 src/renderer/starmap.py          ← Formula 10
 src/renderer/taichi_renderer.py  ← Formulas 10, 13 (screen-space Jacobian, μ, star splat)
-scripts/ingest_stars.py          ← Formula 13 catalog pre-processing (BSC5 → {θ′, φ′, flux_rgb}.npy; I_base·chroma folded into flux)
+scripts/ingest_stars.py          ← Formula 13 catalog pre-processing (HYG/ATHYG csv or BSC5 → {θ′, φ′, flux_rgb}.npy; I_base·chroma folded into flux)
 tests/test_geodesic.py           ← Conservation tests (Formula 6 conserved quantities)
 configs/render.yaml              ← a, r_isco, WIDTH, HEIGHT, step counts, stars:*
 ```
@@ -686,6 +716,11 @@ configs/render.yaml              ← a, r_isco, WIDTH, HEIGHT, step counts, star
 | v1.3 | **F10:** Added 2π normalization to the LOD formula — φ spans 2π radians across the 16384-texel starmap width, so dividing by 2π correctly maps the angular footprint to a texel footprint. Also switched to raw per-pixel exit deltas (δθ, δφ) rather than dividing by δu=1/WIDTH. The missing factor caused LOD to saturate at max mip for all background pixels, collapsing the LOD-on render to near-black. |
 | v1.4 | **F10:** Added the screen-space Jacobian amendment (eliminate the offset ray; difference exit directions of neighbor pixels in a second shading kernel; same J/L; captured-neighbor ⇒ max_lod). **F11 (new):** FP32-stable factored discriminant Δ = y(y+2k). **F12 (new):** singularity-free polar potential Θ_u(u) for the u=cosθ state transform, with the `v_r=Δ·p_r → v_y=Δ·p_r` invariant migration, `p_θ=−v_u/√(1−u²)` recovery, and the approved polar guard on dφ/dt only. All three approved by the project owner 2026-06-02 for the renderer optimization (PROJECT.md §6). |
 | v1.5 | **F13 (new):** Hybrid DNGR point-star magnification — screen-space ray-bundle Jacobian J (2×2 generalization of F10's scalar J), magnification μ = \|det J₀·sinθ′₀\|/\|det J·sinθ′\|, and energy-conserving point flux `I_base·μ·g⁴` with a truncated-Gaussian PSF. Verified against `REFERENCE_dngr_paper.md` (James et al. 2015, A.2/A.3.1/A.7) on 2026-06-04. Resolves the F10 fidelity-note divergences #1 (point-star blur) and #2 (anisotropy). **⚠ Three guards FLAGGED pending owner approval:** (a) μ normalization by the flat-space footprint `det J₀·sinθ′₀`; (b) ESCAPE/`j_fold` boundary clamp `μ=1` (inherited from F10 v1.4); (c) g⁴ exponent choice for stars. |
+| v1.6 | **F13 guards APPROVED (owner, 2026-06-05)** and the DNGR render path landed (PROJECT.md §8 Phases 2–5): (a) μ normalized by the FD undeflected-reference footprint so μ→1 in flat space; (b) boundary clamp μ=1 on non-ESCAPED neighbours / `J>j_fold`, plus `δ⁻<caustic_delta_min ⇒ μ=min(μ,mag_clip)`; (c) volumetric g⁴ as a `starfield.g_beaming` hook (default g≡1). Two decoupled sky layers in `taichi_renderer.py`: Layer A point-star energy gather (`flux·μ·g⁴·PSF`, cell-grid candidate query) and Layer B anisotropic-EWA diffuse Milky-Way fetch; gated by `starfield.mode: texture\|dngr` (texture default reproduces v1.4 golden frames bit-for-bit). |
+| v1.7 | **F13 guard (b′) ADDED + APPROVED (owner, 2026-06-06):** Layer-A splat *placement* rule when `det J` is invalid (spin-axis seam / non-ESCAPED neighbour). The shipped code positioned the splat with the degenerate `J⁻¹`, collapsing all polar-cell stars onto the meridian (the "Artifact B" seam pileup, ≈15× the off-seam jump). (b′) places the splat by the star's true proper angular separation `d² = (Δθ′²+sin²θ′·Δφ′²)/dΩ` under the undeflected footprint `dΩ=|det J₀·sinθ′₀|` (the guard-(a) quantity), so seam stars keep real angular spacing at μ=1. Resolves the dngr-default seam (`test_no_spin_axis_seam`, `test_background_has_no_vertical_seam_stripe`). The matching Formula-10 `texture`-LOD regularization is a separate follow-up (spec §7.2), **not** part of this revision. |
 
-*Last verified: 2026-06-04 (F13 against `REFERENCE_dngr_paper.md`). Do not update
-formulas without re-verifying against primary sources listed in each section.*
+*Last verified: 2026-06-06 (F13 guard (b′) Layer-A splat-placement rule approved +
+landed; (b′) is a placement regularization derived from the already-verified guard-(a)
+undeflected footprint, not a new physics formula — F13 μ/PSF still match
+`REFERENCE_dngr_paper.md` A.2/A.3.1/A.7). Do not update formulas without re-verifying
+against primary sources listed in each section.*

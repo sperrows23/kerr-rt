@@ -84,6 +84,35 @@ _N_LEVELS = 0
 _MAX_LOD = 0.0
 _STARMAP_WIDTH = 0
 
+# --- DNGR background (Formula 13 / PROJECT.md §8), populated only in mode=dngr --- #
+# Layer A — point-star catalog binned into an equirect (θ′,φ′) cell grid, stored
+# CSR-style: stars sorted by cell, with per-cell [start, count] into the sorted
+# arrays. Off-plane candidate counts stay O(1–10), so the per-pixel gather is cheap.
+cat_theta: ti.Field = None        # type: ignore[assignment]  (N,) sorted by cell
+cat_phi: ti.Field = None          # type: ignore[assignment]  (N,)
+cat_flux: ti.Field = None         # type: ignore[assignment]  (N,3) linear RGB flux
+cell_start: ti.Field = None       # type: ignore[assignment]  (rows*cols,)
+cell_count: ti.Field = None       # type: ignore[assignment]  (rows*cols,)
+# Layer B — second equirect mip pyramid for the diffuse Milky-Way band.
+mw_flat: ti.Field = None          # type: ignore[assignment]
+mw_off: ti.Field = None           # type: ignore[assignment]
+mw_w: ti.Field = None             # type: ignore[assignment]
+mw_h: ti.Field = None             # type: ignore[assignment]
+_MW_N_LEVELS = 1
+_MW_MAX_LOD = 0.0
+_MW_WIDTH = 16384.0
+# Formula-13 scalars (baked at setup from configs/render.yaml: starfield.*).
+_DNGR = 0                  # 0 = texture (legacy F10), 1 = dngr (two-layer)
+_STAR_COLS = 720
+_STAR_ROWS = 360
+_STAR_CELL_R = 1           # cell-neighbourhood half-width searched per pixel
+_STAR_PSF = 1.3            # Gaussian PSF σ (screen pixels)
+_PSF_TRUNC = 3.0           # splat truncation in units of σ
+_MAG_CLIP = 50.0           # cap on lensing magnification μ
+_CAUSTIC_DMIN = 1.0e-3     # δ⁻ below this ⇒ on a caustic
+_EWA_MAX_TAPS = 8          # max anisotropic taps for Layer B
+_G_BEAMING = 0             # volumetric g⁴ star-beaming hook (0 ⇒ g≡1)
+
 # Output image (set per render call to match resolution).
 pixels: ti.Field = None           # type: ignore[assignment]
 _RES = 0
@@ -98,8 +127,61 @@ _FW = 0
 _FH = 0
 
 
+def _pack_pyramid(sm: Starmap):
+    """Pack every mip level's RGB into one contiguous f16 buffer + per-level meta.
+
+    Returns ``(flat_all, offsets, ws, hs)`` — the same layout the kernel samplers
+    index (``base + (y*w + x)*3``). Shared by the legacy starmap and the DNGR
+    diffuse (Layer B) pyramid uploads.
+    """
+    offsets, ws, hs, parts = [], [], [], []
+    off = 0
+    for lv in sm.levels:
+        h, w = lv.shape[:2]
+        offsets.append(off)
+        hs.append(h)
+        ws.append(w)
+        flat = np.ascontiguousarray(lv, dtype=np.float16).ravel()
+        parts.append(flat)
+        off += flat.size
+    return (np.concatenate(parts),
+            np.asarray(offsets, dtype=np.int32),
+            np.asarray(ws, dtype=np.int32),
+            np.asarray(hs, dtype=np.int32))
+
+
+def _build_star_grid(catalog: np.ndarray, cols: int, rows: int):
+    """Bin a point-star catalog ``[N,5]=(θ′,φ′,r,g,b)`` into an equirect cell grid.
+
+    Returns sorted ``(theta, phi, flux[N,3])`` plus CSR ``(cell_start, cell_count)``
+    over ``rows*cols`` cells (row = θ′/π·rows, col = φ′/2π·cols), matching the
+    in-kernel cell math. Stars are grouped by cell so the per-pixel gather only
+    scans the few cells overlapping its footprint.
+    """
+    theta = catalog[:, 0].astype(np.float32)
+    phi = catalog[:, 1].astype(np.float32)
+    flux = catalog[:, 2:5].astype(np.float32)
+
+    col = np.clip((phi / _TWO_PI * cols).astype(np.int64), 0, cols - 1)
+    row = np.clip((theta / math.pi * rows).astype(np.int64), 0, rows - 1)
+    cell = row * cols + col
+
+    order = np.argsort(cell, kind="stable")
+    cell_sorted = cell[order]
+    n_cells = rows * cols
+    counts = np.bincount(cell_sorted, minlength=n_cells).astype(np.int32)
+    starts = np.zeros(n_cells, dtype=np.int32)
+    starts[1:] = np.cumsum(counts)[:-1]
+    return theta[order], phi[order], flux[order], starts, counts
+
+
 def setup_renderer(cfg: dict) -> Starmap:
     """Initialise Taichi (CUDA), load the starmap, and upload its mip pyramid.
+
+    In ``starfield.mode: dngr`` it additionally uploads the Formula-13 point-star
+    cell grid (Layer A) and the diffuse Milky-Way pyramid (Layer B). In
+    ``texture`` mode those fields are allocated as size-1 dummies (the kernels'
+    dngr branch is never taken) so the legacy path is byte-for-byte unchanged.
 
     Returns the host-side :class:`Starmap` (kept alive so the GPU upload's source
     arrays and the reference sampler remain available to callers/tests).
@@ -107,6 +189,10 @@ def setup_renderer(cfg: dict) -> Starmap:
     global star_flat, star_off, star_w, star_h
     global _N_LEVELS, _MAX_LOD, _STARMAP_WIDTH
     global _DELTA_MIN, _SIN2_MIN, _J_FOLD
+    global cat_theta, cat_phi, cat_flux, cell_start, cell_count
+    global mw_flat, mw_off, mw_w, mw_h, _MW_N_LEVELS, _MW_MAX_LOD, _MW_WIDTH
+    global _DNGR, _STAR_COLS, _STAR_ROWS, _STAR_CELL_R, _STAR_PSF, _PSF_TRUNC
+    global _MAG_CLIP, _CAUSTIC_DMIN, _EWA_MAX_TAPS, _G_BEAMING
 
     # Integration-scheme constants from config (baked into kernels at first JIT).
     _DELTA_MIN = float(cfg["render"]["horizon_epsilon"])
@@ -146,17 +232,101 @@ def setup_renderer(cfg: dict) -> Starmap:
     star_w.from_numpy(np.asarray(ws, dtype=np.int32))
     star_h.from_numpy(np.asarray(hs, dtype=np.int32))
 
+    _setup_dngr(cfg)
     return sm
+
+
+def _setup_dngr(cfg: dict) -> None:
+    """Load + upload the Formula-13 DNGR fields (Layer A catalog grid, Layer B
+    diffuse pyramid) when ``starfield.mode == dngr``; else allocate size-1 dummies.
+
+    All Formula-13 scalars are baked into module globals here so the kernels JIT
+    against them (the same pattern as ``_J_FOLD`` / ``_MAX_LOD``).
+    """
+    global cat_theta, cat_phi, cat_flux, cell_start, cell_count
+    global mw_flat, mw_off, mw_w, mw_h, _MW_N_LEVELS, _MW_MAX_LOD, _MW_WIDTH
+    global _DNGR, _STAR_COLS, _STAR_ROWS, _STAR_CELL_R, _STAR_PSF, _PSF_TRUNC
+    global _MAG_CLIP, _CAUSTIC_DMIN, _EWA_MAX_TAPS, _G_BEAMING
+
+    sf = cfg.get("starfield", {})
+    _DNGR = 1 if str(sf.get("mode", "texture")) == "dngr" else 0
+    _STAR_COLS = int(sf.get("star_grid_cols", 720))
+    _STAR_ROWS = int(sf.get("star_grid_rows", 360))
+    _STAR_CELL_R = int(sf.get("star_cell_radius", 1))
+    _STAR_PSF = float(sf.get("star_psf_px", 1.3))
+    _PSF_TRUNC = float(sf.get("psf_trunc_sigma", 3.0))
+    _MAG_CLIP = float(sf.get("mag_clip", 50.0))
+    _CAUSTIC_DMIN = float(sf.get("caustic_delta_min", 1.0e-3))
+    _EWA_MAX_TAPS = int(sf.get("ewa_max_taps", 8))
+    _G_BEAMING = 1 if bool(sf.get("g_beaming", False)) else 0
+
+    if _DNGR == 1:
+        # --- Layer A: point-star catalog → CSR cell grid ---
+        cat_path = _ROOT / sf["catalog_path"]
+        if not cat_path.exists():
+            raise FileNotFoundError(
+                f"starfield.mode=dngr needs the ingested catalog {cat_path}; "
+                "run `python scripts/ingest_stars.py` first.")
+        catalog = np.load(cat_path)
+        th_s, ph_s, fl_s, starts, counts = _build_star_grid(
+            catalog, _STAR_COLS, _STAR_ROWS)
+        n_stars = int(th_s.shape[0])
+        n_cells = _STAR_ROWS * _STAR_COLS
+
+        cat_theta = ti.field(dtype=ti.f32, shape=n_stars)
+        cat_phi = ti.field(dtype=ti.f32, shape=n_stars)
+        cat_flux = ti.field(dtype=ti.f32, shape=(n_stars, 3))
+        cell_start = ti.field(dtype=ti.i32, shape=n_cells)
+        cell_count = ti.field(dtype=ti.i32, shape=n_cells)
+        cat_theta.from_numpy(th_s)
+        cat_phi.from_numpy(ph_s)
+        cat_flux.from_numpy(np.ascontiguousarray(fl_s))
+        cell_start.from_numpy(starts)
+        cell_count.from_numpy(counts)
+
+        # --- Layer B: diffuse Milky-Way mip pyramid ---
+        mw = Starmap.load(str(_ROOT / sf["diffuse_map"]))
+        _MW_WIDTH = float(sf.get("diffuse_width", mw.levels[0].shape[1]))
+        _MW_MAX_LOD = float(mw.max_lod)
+        _MW_N_LEVELS = len(mw.levels)
+        mflat, moff, mws, mhs = _pack_pyramid(mw)
+        mw_flat = ti.field(dtype=ti.f16, shape=mflat.size)
+        mw_off = ti.field(dtype=ti.i32, shape=_MW_N_LEVELS)
+        mw_w = ti.field(dtype=ti.i32, shape=_MW_N_LEVELS)
+        mw_h = ti.field(dtype=ti.i32, shape=_MW_N_LEVELS)
+        mw_flat.from_numpy(mflat)
+        mw_off.from_numpy(moff)
+        mw_w.from_numpy(mws)
+        mw_h.from_numpy(mhs)
+    else:
+        # texture mode — size-1 dummies so the kernels JIT (dngr branch unused).
+        cat_theta = ti.field(dtype=ti.f32, shape=1)
+        cat_phi = ti.field(dtype=ti.f32, shape=1)
+        cat_flux = ti.field(dtype=ti.f32, shape=(1, 3))
+        cell_start = ti.field(dtype=ti.i32, shape=1)
+        cell_count = ti.field(dtype=ti.i32, shape=1)
+        mw_flat = ti.field(dtype=ti.f16, shape=1)
+        mw_off = ti.field(dtype=ti.i32, shape=1)
+        mw_w = ti.field(dtype=ti.i32, shape=1)
+        mw_h = ti.field(dtype=ti.i32, shape=1)
+        _MW_N_LEVELS = 1
+        _MW_MAX_LOD = 0.0
+        _MW_WIDTH = 16384.0
 
 
 def _horizon_constants(a: float) -> tuple[float, float]:
     """Precompute FP32-stable horizon constants (optimization Phase 1.1 / Formula 11).
 
     Returns ``(k_horizon, r_plus)`` with ``k_horizon = √(1−a²)`` and the *true*
-    outer horizon ``r₊ = 1 + k_horizon``. NOTE: this is derived from ``a`` in
-    Python (like E_I/L_I and tan_half_fov), NOT read from ``configs.black_hole.r_plus``
-    — that config key is mislabeled (it holds k=√(1−a²)≈0.0447, and is consumed by
-    scripts/thumb.py as an r_floor) so it must not be repurposed here.
+    outer horizon ``r₊ = 1 + k_horizon``. Derived from ``a`` here (like E_I/L_I and
+    tan_half_fov) rather than read from ``configs.black_hole.r_plus`` so it can never
+    drift out of sync with ``black_hole.spin``: r₊ is a *function* of a, so the
+    config key (1.0447 for a=0.999) is a derived-value duplication that silently
+    desyncs if a is edited. The config key is still consumed verbatim by the CPU
+    preview path (``scripts/thumb.py`` / ``seam_diag.py``) as the
+    ``radial_turning_point`` r_floor (= the horizon, which is correct at a=0.999);
+    those readers should be migrated to derive r₊ too. FLAGGED — CPU path, out of
+    scope for the GPU audit.
     """
     k = math.sqrt(1.0 - a * a)
     return k, 1.0 + k
@@ -574,6 +744,15 @@ def render_pipe_a(res: int, tan_half_fov: float, r_cam: float,
                 else:
                     sp, c_sp = _rk4_step_kahan(sp, c_sp, Ep, Lp, Qp, a,
                                                k_horizon, r_plus, d_lambda)
+                    # Per-step φ-wrap into (−π, π] — identical to render_beauty_physics.
+                    # Without it a near-pole passage (dφ/dλ = Lz/sin²θ) inflates the
+                    # raw accumulated φ past f32's fractional precision, so the exit
+                    # azimuth collapses to noise across the spin-axis meridian. φ is
+                    # cyclic and never on the RHS of `_deriv` (Kerr is axisymmetric),
+                    # so folding it each step is an exact coordinate identity.
+                    phi_wp = sp[2] - _TWO_PI * ti.round(sp[2] / _TWO_PI)
+                    sp = vec6(sp[0], sp[1], phi_wp, sp[3], sp[4], sp[5])
+                    c_sp = vec6(c_sp[0], c_sp[1], 0.0, c_sp[3], c_sp[4], c_sp[5])
                     if _delta_y(sp[0], k_horizon) < _DELTA_MIN or sp[0] < r_capture:
                         out_p = _CAPTURED
                     elif sp[0] >= y_escape:
@@ -586,6 +765,10 @@ def render_pipe_a(res: int, tan_half_fov: float, r_cam: float,
                 else:
                     so, c_so = _rk4_step_kahan(so, c_so, Eo, Lo, Qo, a,
                                                k_horizon, r_plus, d_lambda)
+                    # Per-step φ-wrap into (−π, π] (see the primary ray above).
+                    phi_wo = so[2] - _TWO_PI * ti.round(so[2] / _TWO_PI)
+                    so = vec6(so[0], so[1], phi_wo, so[3], so[4], so[5])
+                    c_so = vec6(c_so[0], c_so[1], 0.0, c_so[3], c_so[4], c_so[5])
                     if _delta_y(so[0], k_horizon) < _DELTA_MIN or so[0] < r_capture:
                         out_o = _CAPTURED
                     elif so[0] >= y_escape:
@@ -619,7 +802,13 @@ def render_pipe_a(res: int, tan_half_fov: float, r_cam: float,
                     d_ph = d_ph - 2.0 * math.pi * ti.round(d_ph / (2.0 * math.pi))
                     sin_th = ti.sin(th_p_n)
                     J = ti.sqrt(d_th * d_th + sin_th * sin_th * d_ph * d_ph)
-                    lod = ti.log(_STARMAP_WIDTH * J / (2.0 * math.pi)) / ti.log(2.0)  # log2
+                    # Fold saturation — identical to _screen_jacobian_lod: a footprint
+                    # spanning the spin-axis meridian caustic (J > _J_FOLD) collapses
+                    # to the uniform coarsest mip instead of an aliased mid-mip fetch.
+                    if J > _J_FOLD:
+                        lod = _MAX_LOD
+                    else:
+                        lod = ti.log(_STARMAP_WIDTH * J / (2.0 * math.pi)) / ti.log(2.0)  # log2
                 else:
                     # Offset ray dived into the chaotic edge → huge footprint.
                     lod = _MAX_LOD
@@ -847,13 +1036,236 @@ def _screen_jacobian_lod(py, px, height, width, th_p, ph_p):
     return lod
 
 
-@ti.kernel
-def render_beauty_shade(width: int, height: int, lod_enabled: int):
-    """Kernel 2 (Phase 2.4 split): screen-space LOD + starmap lookup + composite.
+# --------------------------------------------------------------------------- #
+# DNGR background (Formula 13) — Layer B diffuse sampler + Layer A star gather
+# --------------------------------------------------------------------------- #
+@ti.func
+def _wrap_pi(x):
+    """Fold an angular difference into (−π, π] (φ is periodic)."""
+    return x - _TWO_PI * ti.round(x / _TWO_PI)
 
-    Reads ``exit_buf`` (this pixel + neighbors) and ``disk_buf``; computes the
-    Formula-10 LOD from neighbor exit deltas; samples the lensed starmap; and
-    writes ``frame_pixels = disk_rgb + transmittance·background``.
+
+@ti.func
+def _mw_texel(level, x, y):
+    base = mw_off[level]
+    w = mw_w[level]
+    idx = base + (y * w + x) * 3
+    return vec3(
+        ti.cast(mw_flat[idx + 0], ti.f32),
+        ti.cast(mw_flat[idx + 1], ti.f32),
+        ti.cast(mw_flat[idx + 2], ti.f32),
+    )
+
+
+@ti.func
+def _mw_sample_level(level, u, v):
+    w = mw_w[level]
+    h = mw_h[level]
+    uu = u - ti.floor(u)
+    vv = ti.min(ti.max(v, 0.0), 1.0)
+    fu = uu * w - 0.5
+    fv = vv * h - 0.5
+    x0 = ti.cast(ti.floor(fu), ti.i32)
+    y0 = ti.cast(ti.floor(fv), ti.i32)
+    du = fu - ti.floor(fu)
+    dv = fv - ti.floor(fv)
+    ix0 = x0 % w
+    if ix0 < 0:
+        ix0 += w
+    ix1 = (ix0 + 1) % w
+    iy0 = ti.min(ti.max(y0, 0), h - 1)
+    iy1 = ti.min(ti.max(y0 + 1, 0), h - 1)
+    c00 = _mw_texel(level, ix0, iy0)
+    c10 = _mw_texel(level, ix1, iy0)
+    c01 = _mw_texel(level, ix0, iy1)
+    c11 = _mw_texel(level, ix1, iy1)
+    top = c00 * (1.0 - du) + c10 * du
+    bot = c01 * (1.0 - du) + c11 * du
+    return top * (1.0 - dv) + bot * dv
+
+
+@ti.func
+def _mw_sample_trilinear(u, v, lod):
+    L = ti.min(ti.max(lod, 0.0), _MW_MAX_LOD)
+    l0 = ti.cast(ti.floor(L), ti.i32)
+    l1 = ti.min(l0 + 1, _MW_N_LEVELS - 1)
+    l0 = ti.min(l0, _MW_N_LEVELS - 1)
+    f = L - ti.floor(L)
+    f = f * f * (3.0 - 2.0 * f)
+    c0 = _mw_sample_level(l0, u, v)
+    c1 = _mw_sample_level(l1, u, v)
+    return c0 * (1.0 - f) + c1 * f
+
+
+@ti.func
+def _dngr_shade(py, px, height, width, th_p, ph_p, d_omega):
+    """Formula 13 two-layer background for one escaped pixel.
+
+    Builds the screen-space 2×2 beam Jacobian J = ∂(θ′,φ′)/∂(pixel) from the +x/+y
+    neighbour exit directions (same stencil as ``_screen_jacobian_lod``), then:
+      * Layer B — anisotropic (EWA) fetch of the diffuse Milky-Way map along the
+        footprint ellipse's major axis;
+      * Layer A — gathers catalog stars in the overlapping cells and adds
+        ``flux · μ · g⁴ · exp(−d²/2σ²)`` with the lensing magnification
+        ``μ = dΩ_pixel / |det J · sinθ′|`` (normalized so μ→1 in flat space).
+    Boundary rules (Formula 13 guard b, approved 2026-06-05): a non-ESCAPED
+    neighbour or a fold footprint ``δ⁺ > j_fold`` ⇒ μ=1 and the diffuse layer
+    falls back to the coarsest mip (matches the legacy seam handling). On that
+    same invalid-``det J`` branch the Layer-A splat is *placed* by guard (b′)
+    (approved 2026-06-06): the undeflected proper-separation footprint
+    ``d² = (Δθ′² + sin²θ′·Δφ′²)/dΩ`` instead of the degenerate ``J⁻¹`` — this
+    removes the spin-axis meridian star-pileup (Artifact B).
+    Returns the combined background radiance (diffuse + stars).
+    """
+    nx = px + 1 if px + 1 < width else px - 1
+    ny = py + 1 if py + 1 < height else py - 1
+    sgn_x = 1.0 if px + 1 < width else -1.0
+    sgn_y = 1.0 if py + 1 < height else -1.0
+    out_x = exit_buf[py, nx, 2]
+    out_y = exit_buf[ny, px, 2]
+    valid = (out_x < 1.5 and out_x > 0.5) and (out_y < 1.5 and out_y > 0.5)
+
+    sin_th = ti.sin(th_p)
+    dthx = 0.0
+    dphx = 0.0
+    dthy = 0.0
+    dphy = 0.0
+    detJ = 0.0
+    delta_plus = 0.0     # δ⁺ major ellipse axis (angular, sinθ-weighted)
+    delta_minus = 0.0    # δ⁻ minor ellipse axis
+    if valid:
+        th_x = ti.acos(ti.min(ti.max(exit_buf[py, nx, 0], -1.0), 1.0))
+        ph_x = exit_buf[py, nx, 1]
+        th_y = ti.acos(ti.min(ti.max(exit_buf[ny, px, 0], -1.0), 1.0))
+        ph_y = exit_buf[ny, px, 1]
+        dthx = (th_x - th_p) * sgn_x
+        dphx = _wrap_pi(ph_x - ph_p) * sgn_x
+        dthy = (th_y - th_p) * sgn_y
+        dphy = _wrap_pi(ph_y - ph_p) * sgn_y
+        detJ = dthx * dphy - dthy * dphx
+        # Singular values of the sinθ-weighted angular Jacobian → ellipse axes.
+        cx0, cx1 = dthx, sin_th * dphx
+        cy0, cy1 = dthy, sin_th * dphy
+        a11 = cx0 * cx0 + cx1 * cx1
+        a22 = cy0 * cy0 + cy1 * cy1
+        a12 = cx0 * cy0 + cx1 * cy1
+        tr = a11 + a22
+        det2 = a11 * a22 - a12 * a12
+        disc = ti.sqrt(ti.max(tr * tr - 4.0 * det2, 0.0))
+        delta_plus = ti.sqrt(ti.max(0.5 * (tr + disc), 0.0))
+        delta_minus = ti.sqrt(ti.max(0.5 * (tr - disc), 0.0))
+
+    usable = valid and (delta_plus <= _J_FOLD)
+
+    # --- magnification μ (Formula 13 §2; normalized by the flat-space footprint) ---
+    mu = 1.0
+    src = ti.abs(detJ) * sin_th
+    if usable and src > 1e-20:
+        mu = ti.min(d_omega / src, _MAG_CLIP)
+    # caustic guard (Formula 13 §2 guard b): δ⁻→0 ⇒ critical curve ⇒ keep μ capped.
+    if usable and delta_minus < _CAUSTIC_DMIN:
+        mu = ti.min(mu, _MAG_CLIP)
+
+    u = ph_p / _TWO_PI
+    u = u - ti.floor(u)
+    v = ti.min(ti.max(th_p / math.pi, 0.0), 1.0)
+
+    # --- Layer B: anisotropic EWA fetch of the diffuse map ---
+    diffuse = vec3(0.0, 0.0, 0.0)
+    if usable:
+        Wd = _MW_WIDTH
+        Hd = 0.5 * _MW_WIDTH
+        pxu = dphx / _TWO_PI * Wd
+        pxv = dthx / math.pi * Hd
+        pyu = dphy / _TWO_PI * Wd
+        pyv = dthy / math.pi * Hd
+        lenx = ti.sqrt(pxu * pxu + pxv * pxv)
+        leny = ti.sqrt(pyu * pyu + pyv * pyv)
+        maj_u, maj_v, maj, minr = pxu, pxv, lenx, leny
+        if leny > lenx:
+            maj_u, maj_v, maj, minr = pyu, pyv, leny, lenx
+        ntaps = ti.cast(ti.min(ti.ceil(maj / ti.max(minr, 1.0)),
+                               ti.cast(_EWA_MAX_TAPS, ti.f32)), ti.i32)
+        if ntaps < 1:
+            ntaps = 1
+        lod = ti.log(ti.max(minr, 1.0)) / ti.log(2.0)
+        acc = vec3(0.0, 0.0, 0.0)
+        for t in range(ntaps):
+            f = (ti.cast(t, ti.f32) + 0.5) / ti.cast(ntaps, ti.f32) - 0.5
+            acc += _mw_sample_trilinear(u + f * maj_u / Wd, v + f * maj_v / Hd, lod)
+        diffuse = acc / ti.cast(ntaps, ti.f32)
+    else:
+        diffuse = _mw_sample_trilinear(u, v, _MW_MAX_LOD)
+
+    # --- Layer A: point-star energy gather (flux · μ · g⁴ · Gaussian PSF) ---
+    # Placement of each catalog star's splat (its screen-space offset from the
+    # pixel centre) follows Formula 13 guards (b) + (b′):
+    #   * `usable` (det J a valid beam Jacobian): lensed placement
+    #       (dpx, dpy) = J⁻¹ · (Δθ′, Δφ′)        — stars follow the lensing.
+    #   * NOT `usable` (det J invalid: non-ESCAPED neighbour, or fold δ⁺>j_fold —
+    #     the spin-axis seam): guard (b′). J⁻¹ is degenerate there (Δφ′≈±π ⇒
+    #     |det J| large ⇒ J⁻¹→0), which would collapse every polar-cell star to
+    #     d≈0 and pile them onto the meridian (the seam pileup). Instead place
+    #     the splat by the star's TRUE proper angular separation under the
+    #     undeflected footprint dΩ (the guard-(a) quantity, `d_omega`):
+    #         d² = (Δθ′² + sin²θ′·Δφ′²) / dΩ   [screen-pixel²]
+    #     i.e. great-circle separation / undeflected angular pixel size √dΩ, so
+    #     polar stars keep their real spacing. μ is already clamped to 1 here, so
+    #     seam stars stay sharp point-like at base flux. The gather now runs for
+    #     every escaped pixel (the old `valid`-only gate left a star-free band
+    #     around the shadow silhouette and on the seam); placement degenerates to
+    #     the no-lens geometry exactly where the lensed Jacobian is unusable.
+    stars = vec3(0.0, 0.0, 0.0)
+    g4 = 1.0   # _G_BEAMING hook: g≡1 for a static camera at the celestial sphere
+    two_sig2 = 2.0 * _STAR_PSF * _STAR_PSF
+    d_max2 = (_PSF_TRUNC * _STAR_PSF) ** 2
+    inv_det = 0.0
+    if usable and ti.abs(detJ) > 1e-20:
+        inv_det = 1.0 / detJ
+    # Only gather when a placement metric is available: lensed J⁻¹ (usable) or the
+    # undeflected footprint dΩ (guard b′). dΩ≈0 (degenerate pixel) ⇒ skip.
+    if (usable and ti.abs(detJ) > 1e-20) or (not usable and d_omega > 1e-20):
+        ci = ti.cast(u * _STAR_COLS, ti.i32)
+        cj = ti.cast(v * _STAR_ROWS, ti.i32)
+        for dj in range(-_STAR_CELL_R, _STAR_CELL_R + 1):
+            jj = cj + dj
+            if jj >= 0 and jj < _STAR_ROWS:
+                for di in range(-_STAR_CELL_R, _STAR_CELL_R + 1):
+                    ii = (ci + di) % _STAR_COLS
+                    if ii < 0:
+                        ii += _STAR_COLS
+                    cell = jj * _STAR_COLS + ii
+                    start = cell_start[cell]
+                    cnt = cell_count[cell]
+                    for sidx in range(start, start + cnt):
+                        dth = cat_theta[sidx] - th_p
+                        dph = _wrap_pi(cat_phi[sidx] - ph_p)
+                        d2 = 0.0
+                        if usable:
+                            # lensed placement: screen offset = J⁻¹ · (Δθ′, Δφ′)
+                            dpx = (dphy * dth - dthy * dph) * inv_det
+                            dpy = (-dphx * dth + dthx * dph) * inv_det
+                            d2 = dpx * dpx + dpy * dpy
+                        else:
+                            # guard (b′): undeflected proper-separation placement
+                            d2 = (dth * dth + sin_th * sin_th * dph * dph) / d_omega
+                        if d2 < d_max2:
+                            wgt = ti.exp(-d2 / two_sig2) * mu * g4
+                            stars += vec3(cat_flux[sidx, 0], cat_flux[sidx, 1],
+                                          cat_flux[sidx, 2]) * wgt
+    return diffuse + stars
+
+
+@ti.kernel
+def render_beauty_shade(width: int, height: int, lod_enabled: int, mode: int,
+                        tan_half_x: float, tan_half_y: float, projection_mode: int):
+    """Kernel 2 (Phase 2.4 split): background lookup + composite.
+
+    ``mode == 0`` (texture): the legacy Formula-10 path — screen-space LOD from
+    neighbour exit deltas, single trilinear lensed-starmap fetch (byte-for-byte
+    unchanged). ``mode == 1`` (dngr): the Formula-13 two-layer background
+    (``_dngr_shade``: anisotropic diffuse + magnified point-star gather). Either
+    way it writes ``frame_pixels = disk_rgb + transmittance·background``.
     """
     for py, px in ti.ndrange(height, width):
         out_p = exit_buf[py, px, 2]
@@ -862,14 +1274,27 @@ def render_beauty_shade(width: int, height: int, lod_enabled: int):
             u_p_exit = exit_buf[py, px, 0]
             ph_p_exit = exit_buf[py, px, 1]
             th_p_n = ti.acos(ti.min(ti.max(u_p_exit, -1.0), 1.0))
-            u = ph_p_exit / (2.0 * math.pi)
-            u = u - ti.floor(u)
-            v = ti.min(ti.max(th_p_n / math.pi, 0.0), 1.0)
-
-            lod = 0.0
-            if lod_enabled == 1:
-                lod = _screen_jacobian_lod(py, px, height, width, th_p_n, ph_p_exit)
-            bg = _sample_trilinear(u, v, lod)
+            if mode == 1:
+                # Undeflected per-pixel solid angle dΩ_pixel (μ normalization, F13 §2a).
+                d_omega = 0.0
+                if projection_mode == 1:
+                    lat_cam = (py + 0.5) / height * math.pi
+                    d_omega = ti.sin(lat_cam) * (_TWO_PI / width) * (math.pi / height)
+                else:
+                    sx = (2.0 * (px + 0.5) / width - 1.0) * tan_half_x
+                    sy = (1.0 - 2.0 * (py + 0.5) / height) * tan_half_y
+                    inv_len = 1.0 / ti.sqrt(1.0 + sx * sx + sy * sy)
+                    d_omega = (4.0 * tan_half_x * tan_half_y / (width * height)) \
+                        * inv_len * inv_len * inv_len
+                bg = _dngr_shade(py, px, height, width, th_p_n, ph_p_exit, d_omega)
+            else:
+                u = ph_p_exit / (2.0 * math.pi)
+                u = u - ti.floor(u)
+                v = ti.min(ti.max(th_p_n / math.pi, 0.0), 1.0)
+                lod = 0.0
+                if lod_enabled == 1:
+                    lod = _screen_jacobian_lod(py, px, height, width, th_p_n, ph_p_exit)
+                bg = _sample_trilinear(u, v, lod)
 
         disk_col = vec3(disk_buf[py, px, 0], disk_buf[py, px, 1], disk_buf[py, px, 2])
         transm = disk_buf[py, px, 3]
@@ -966,7 +1391,12 @@ def render_beauty_frame(cfg: dict, cam_frame: dict, width: int, height: int,
     adaptive_floor = float(rcfg["adaptive_step_floor"])
     depth_infinity = float(rcfg["depth_infinity"])
     projection_mode = 1 if str(rcfg.get("projection_mode", "perspective")) == "equirect" else 0
-    bound_sin_half = float(d["bounding_sin_theta_half"])
+    # Disk-slab |u|=|cosθ| early-out bound, DERIVED from its source parameter
+    # (single source of truth): |θ−π/2| < θ_half  ⇔  |cosθ| < sin(θ_half), exactly
+    # the slab test re-checked inside `_disk_emit`. The old config literal
+    # `bounding_sin_theta_half` duplicated sin(θ_half) and silently desynced the
+    # bounding box whenever `disk.theta_half_width` was edited (the config-sync bug).
+    bound_sin_half = math.sin(float(d["theta_half_width"]))
 
     # Formula 4 — frozen ISCO conserved quantities for the plunging gas (Pipe B).
     E_I, L_I = 0.0, 0.0
@@ -993,7 +1423,10 @@ def render_beauty_frame(cfg: dict, cam_frame: dict, width: int, height: int,
         float(d["vertical_sigma_frac"]), float(d["T_0"]),
         float(d["emission_coeff"]), float(d["absorption_coeff"]),
     )
-    render_beauty_shade(width, height, 1 if lod_enabled else 0)
+    # starfield.mode: dngr ⇒ Formula-13 two-layer background; else legacy F10 texture.
+    dngr_mode = 1 if str(cfg.get("starfield", {}).get("mode", "texture")) == "dngr" else 0
+    render_beauty_shade(width, height, 1 if lod_enabled else 0, dngr_mode,
+                        tan_half_x, tan_half_y, projection_mode)
     ti.sync()
     if return_depth:
         # Review #3: a non-finite disk sample (RK4 overshoot at the inner edge)

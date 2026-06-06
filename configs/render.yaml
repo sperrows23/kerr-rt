@@ -1,7 +1,10 @@
 black_hole:
-  spin: 0.999
-  r_isco: 1.182
-  r_plus: 1.0447   # outer horizon r+ = 1 + sqrt(1 - a^2), a=0.999 (true horizon radius)
+  spin: 0.999      # a — the single source of truth; r_isco and r_plus below are FUNCTIONS of it
+  r_isco: 1.182    # DERIVED (Formula 2 of a=0.999). Duplicated literal — re-derive if spin changes
+  r_plus: 1.0447   # DERIVED: r+ = 1 + sqrt(1-a^2), a=0.999 (true horizon). The GPU path computes
+                   # this from `spin` (_horizon_constants) and ignores this key; only the CPU preview
+                   # (thumb.py / seam_diag.py) still reads it as the radial_turning_point r_floor.
+                   # Kept only for that path — it silently desyncs if `spin` is edited (FLAGGED).
 
 render:
   width: 3840
@@ -24,26 +27,53 @@ render:
 disk:
   r_inner: 1.182
   r_outer: 25.0
-  theta_half_width: 0.15   # |θ - π/2| < this for bounding box
+  theta_half_width: 0.15   # |θ - π/2| < this for bounding box (single source of truth for the slab)
   T_0: 1.0e4               # inner reference temperature (Decision B: T = T_0·(6/r)^0.75)
   emission_coeff: 8.0      # volumetric emission scale (visualization)
   absorption_coeff: 1.5    # volumetric absorption scale (visualization)
   vertical_sigma_frac: 0.5 # gaussian scale height as fraction of theta_half_width
-  bounding_sin_theta_half: 0.14944  # = sin(theta_half_width=0.15); optimization Phase 3.3 |u| early-out
+  # NOTE: the Phase-3.3 |u|=|cosθ| disk-slab early-out bound is now DERIVED in code
+  # as sin(theta_half_width) (renderer.render_beauty_frame) — the old hardcoded
+  # `bounding_sin_theta_half: 0.14944` literal duplicated it and desynced whenever
+  # theta_half_width was edited, so it was removed (config-sync fix).
 
 # Background starmap for Pipe A escaped-ray lookup (Formula 10 differential mip LOD).
 starmap:
   path: star_image/starmap_2020_16k.exr
   width: 16384             # equirect map width; LOD uses log2(width)
 
-# Point-star catalog (Formula 13 / PROJECT.md §8 Layer A). Part A = offline ingest
-# only: scripts/ingest_stars.py reads source_catalog and writes catalog_path. The
-# DNGR GPU star-gather render path (§8 Phases 2-5) is not wired up yet.
+# DNGR background (Formula 13 / PROJECT.md §8): two decoupled sky layers.
+#  - Layer A: point-star catalog gathered as energy and brightened by the per-pixel
+#    lensing magnification mu (stars stay sharp, do not smear).
+#  - Layer B: low-frequency Milky-Way texture sampled with an anisotropic EWA filter.
+# mode=texture keeps the legacy Formula-10 baked-starmap path (golden frames intact);
+# mode=dngr activates both layers. scripts/ingest_stars.py reads source_catalog
+# (format auto: .csv=HYG/ATHYG, else V/50 bsc5.dat) and writes catalog_path.
 starfield:
-  source_catalog: assets/bsc5.dat    # raw Yale Bright Star Catalogue (V/50 bsc5.dat, ascii)
-  catalog_path: assets/stars_bsc.npy # ingest output: float32 [N,5] = theta', phi', flux_r, flux_g, flux_b
-  mag_limit: 6.5                     # drop stars fainter than this apparent V mag (~naked-eye limit)
-  mag_zero_point: 0.0                # linear flux = 10^(-0.4*(Vmag - mag_zero_point)); sets overall scale
+  mode: dngr              # texture | dngr  (dngr = Formula-13 Hybrid; default since 2026-06-06, fixes radial star-smear Artifact A)
+  format: auto             # auto | hyg | bsc5  (auto -> by source_catalog extension)
+  source_catalog: star_image/hyglike_from_athyg_v32.csv  # HYG/ATHYG v3.2 csv (or a V/50 bsc5.dat)
+  catalog_path: assets/stars.npy   # ingest output: float32 [N,5] = theta', phi', flux_r, flux_g, flux_b
+  mag_limit: 8.0           # drop stars fainter than this apparent V mag. Set to 8.0 (NOT 6.5)
+                           # to butt against the diffuse map's bright-star cutoff: milkyway_2020_16k
+                           # OMITS stars brighter than ~8.0 (Hipparcos/Tycho stripped), so Layer A must
+                           # cover <=8.0 or stars in 6.5-8.0 fall out of BOTH layers. Do NOT exceed ~8.0
+                           # or Layer A re-adds Tycho stars (~8.0-11.5) the diffuse map already contains
+                           # (double-count). This cutoff is the A/B energy boundary (sub-agent review 2026-06-06).
+  mag_zero_point: 0.0      # linear flux = 10^(-0.4*(Vmag - mag_zero_point)); sets overall scale
+  # --- Layer A: point-star gather (Formula 13) ---
+  star_grid_cols: 720      # equirect candidate-cell grid columns (azimuth phi')
+  star_grid_rows: 360      # equirect candidate-cell grid rows (colatitude theta')
+  star_psf_px: 1.3         # Gaussian PSF sigma in screen pixels (A.3.1 anti-flicker splat)
+  psf_trunc_sigma: 3.0     # truncate the splat at |d| < psf_trunc_sigma * sigma (pixels)
+  mag_clip: 50.0           # cap on lensing brightness gain mu (caustic safety)
+  caustic_delta_min: 1.0e-3 # minor ellipse axis delta- below this => on a caustic => clamp mu
+  g_beaming: false         # volumetric g^4 Doppler hook for stars (false => g==1; static camera)
+  # --- Layer B: diffuse Milky Way (anisotropic EWA) ---
+  diffuse_map: star_image/milkyway_2020_16k.exr  # low-frequency galaxy band (Layer B only)
+  diffuse_width: 16384     # equirect diffuse map width; LOD uses log2(width)
+  ewa_max_taps: 8          # max anisotropic taps along the major ellipse axis
+  jacobian: finite_diff    # finite_diff | geodesic_deviation (FD shipped; deviation = future upgrade)
 
 camera:
   default_radius: 6.03
