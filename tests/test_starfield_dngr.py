@@ -13,6 +13,7 @@ The host μ check mirrors, in NumPy, the *exact* arithmetic of the kernel's
 μ = dΩ / |det J · sinθ′| = 1 everywhere. This is the regression guard for
 Formula-13 guard (a) — owner-approved 2026-06-05.
 """
+
 from __future__ import annotations
 
 import json
@@ -86,23 +87,26 @@ def test_magnification_normalizes_to_one_in_flat_space():
 def test_build_star_grid_csr_is_consistent():
     cols, rows = 8, 4
     # Four stars placed in known cells (θ′ row = θ′/π·rows, φ′ col = φ′/2π·cols).
-    catalog = np.array([
-        [0.05, 0.05, 1.0, 0.0, 0.0],                      # row 0, col 0
-        [math.pi - 0.05, 2 * math.pi - 0.05, 0.0, 1.0, 0.0],  # row 3, col 7
-        [math.pi / 2, math.pi, 0.0, 0.0, 1.0],            # row 2, col 4
-        [math.pi / 2, math.pi, 0.5, 0.5, 0.5],            # row 2, col 4 (same cell)
-    ], dtype=np.float32)
+    catalog = np.array(
+        [
+            [0.05, 0.05, 1.0, 0.0, 0.0],  # row 0, col 0
+            [math.pi - 0.05, 2 * math.pi - 0.05, 0.0, 1.0, 0.0],  # row 3, col 7
+            [math.pi / 2, math.pi, 0.0, 0.0, 1.0],  # row 2, col 4
+            [math.pi / 2, math.pi, 0.5, 0.5, 0.5],  # row 2, col 4 (same cell)
+        ],
+        dtype=np.float32,
+    )
 
     theta, _phi, flux, starts, counts = tr._build_star_grid(catalog, cols, rows)
 
-    assert counts.sum() == catalog.shape[0]               # every star binned once
+    assert counts.sum() == catalog.shape[0]  # every star binned once
     assert theta.shape == (4,) and flux.shape == (4, 3)
     assert starts.shape == (rows * cols,)
     # The shared cell (row 2, col 4) holds exactly two stars.
     shared = 2 * cols + 4
     assert counts[shared] == 2
     s = starts[shared]
-    block = flux[s:s + counts[shared]]
+    block = flux[s : s + counts[shared]]
     assert np.allclose(np.sort(block[:, 2]), [0.5, 1.0])  # both blue-channel stars
     # CSR offsets are a prefix sum of counts.
     assert starts[0] == 0
@@ -117,10 +121,10 @@ def dngr_frame() -> dict:
     if not _CAMERA_PATH.exists():
         pytest.skip(f"camera_matrix.json not found at {_CAMERA_PATH}")
     if not _CATALOG_PATH.exists():
-        pytest.skip(f"ingested catalog not found at {_CATALOG_PATH} "
-                    "(run scripts/ingest_stars.py)")
+        pytest.skip(f"ingested catalog not found at {_CATALOG_PATH} (run scripts/ingest_stars.py)")
 
     import taichi as ti
+
     try:
         ti.init(arch=ti.cuda)
     except Exception as exc:  # pragma: no cover - host without CUDA
@@ -129,12 +133,14 @@ def dngr_frame() -> dict:
         pytest.skip(f"CUDA backend unavailable (Taichi selected {ti.cfg.arch})")
 
     cfg = tr.load_config()
-    if "diffuse_map" in cfg.get("starfield", {}):
-        if not (_ROOT / cfg["starfield"]["diffuse_map"]).exists():
-            pytest.skip("diffuse Milky-Way map not present")
+    if (
+        "diffuse_map" in cfg.get("starfield", {})
+        and not (_ROOT / cfg["starfield"]["diffuse_map"]).exists()
+    ):
+        pytest.skip("diffuse Milky-Way map not present")
     cfg["starfield"]["mode"] = "dngr"
 
-    with open(_CAMERA_PATH, "r", encoding="utf-8-sig") as fh:
+    with open(_CAMERA_PATH, encoding="utf-8-sig") as fh:
         frames = json.load(fh)
     cam = frames[0]
 

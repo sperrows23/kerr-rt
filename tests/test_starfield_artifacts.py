@@ -71,6 +71,7 @@ confounded by a bright lensed star in frame-0's thin sky band) drops below the
 z=20 threshold, so the marker was removed and the test is a live guard. Calibrated
 for 1280x720; keep that render size.
 """
+
 from __future__ import annotations
 
 import json
@@ -85,9 +86,9 @@ _ROOT = Path(__file__).resolve().parents[1]
 _CAMERA_PATH = _ROOT / "camera_matrix.json"
 
 _RENDER_W, _RENDER_H = 1280, 720
-_SMEAR_COHERENCE_MAX = 0.36   # bright-feature structure-tensor coherence (streaky => high)
-_SEAM_STRIPE_Z_MAX = 20.0     # strongest thin vertical stripe, MAD-z over columns
-                              # (clean fields score 9-14; real seam 27.8+ -> 20 has margin)
+_SMEAR_COHERENCE_MAX = 0.36  # bright-feature structure-tensor coherence (streaky => high)
+_SEAM_STRIPE_Z_MAX = 20.0  # strongest thin vertical stripe, MAD-z over columns
+# (clean fields score 9-14; real seam 27.8+ -> 20 has margin)
 
 
 # --------------------------------------------------------------------------- #
@@ -98,12 +99,13 @@ def _boxblur(a: np.ndarray, k: int) -> np.ndarray:
     out = a.astype(np.float64)
     for axis in (0, 1):
         pad = k // 2
-        ap = np.pad(out, [(pad, pad) if ax == axis else (0, 0) for ax in (0, 1)],
-                    mode="reflect")
+        ap = np.pad(out, [(pad, pad) if ax == axis else (0, 0) for ax in (0, 1)], mode="reflect")
         cs = np.cumsum(ap, axis=axis)
         csz = np.concatenate([np.zeros_like(np.take(cs, [0], axis=axis)), cs], axis=axis)
-        hi = [slice(None), slice(None)]; lo = [slice(None), slice(None)]
-        hi[axis] = slice(k, None); lo[axis] = slice(0, -k)
+        hi = [slice(None), slice(None)]
+        lo = [slice(None), slice(None)]
+        hi[axis] = slice(k, None)
+        lo[axis] = slice(0, -k)
         out = (csz[tuple(hi)] - csz[tuple(lo)]) / k
     return out
 
@@ -139,10 +141,13 @@ def smear_coherence(lum: np.ndarray) -> float:
         return 0.0
     bright = hp > np.percentile(pos, 99.5)
     gy, gx = np.gradient(lum)
-    Jxx = _boxblur(gx * gx, 7); Jyy = _boxblur(gy * gy, 7); Jxy = _boxblur(gx * gy, 7)
+    Jxx = _boxblur(gx * gx, 7)
+    Jyy = _boxblur(gy * gy, 7)
+    Jxy = _boxblur(gx * gy, 7)
     tr_ = Jxx + Jyy
     disc = np.sqrt(np.maximum(tr_ * tr_ / 4 - (Jxx * Jyy - Jxy * Jxy), 0.0))
-    l1 = tr_ / 2 + disc; l2 = tr_ / 2 - disc
+    l1 = tr_ / 2 + disc
+    l2 = tr_ / 2 - disc
     coh = np.where(l1 + l2 > 1e-20, (l1 - l2) / (l1 + l2 + 1e-20), 0.0)
     w = gx * gx + gy * gy
     denom = w[bright].sum()
@@ -164,7 +169,7 @@ def seam_stripe_z(lum: np.ndarray) -> float:
     vcoh = (a[1:] * a[:-1]).sum(axis=0) / ((a * a).sum(axis=0) + 1e-20)
     amp = np.sqrt((a * a).mean(axis=0))
     score = vcoh * amp
-    m = score.size // 20                      # drop outer 5% (reflect-pad boundary)
+    m = score.size // 20  # drop outer 5% (reflect-pad boundary)
     core = score[m:-m]
     med = np.median(core)
     mad = np.median(np.abs(core - med)) * 1.4826 + 1e-20
@@ -180,6 +185,7 @@ def background_lum() -> np.ndarray:
         pytest.skip(f"camera_matrix.json not found at {_CAMERA_PATH}")
 
     import taichi as ti
+
     try:
         ti.init(arch=ti.cuda)
     except Exception as exc:  # pragma: no cover - host without CUDA
@@ -199,12 +205,11 @@ def background_lum() -> np.ndarray:
         if not (_ROOT / cfg["starmap"]["path"]).exists():
             pytest.skip("texture default but baked starmap missing")
 
-    with open(_CAMERA_PATH, "r", encoding="utf-8-sig") as fh:
+    with open(_CAMERA_PATH, encoding="utf-8-sig") as fh:
         cam = json.load(fh)[0]
 
     tr.setup_renderer(cfg)
-    hdr = tr.render_beauty_frame(cfg, cam, _RENDER_W, _RENDER_H,
-                                 with_disk=False, lod_enabled=True)
+    hdr = tr.render_beauty_frame(cfg, cam, _RENDER_W, _RENDER_H, with_disk=False, lod_enabled=True)
     return np.nan_to_num(hdr).sum(axis=2)
 
 
@@ -215,7 +220,8 @@ def test_background_has_no_radial_smear(background_lum):
     coh = smear_coherence(background_lum)
     assert coh < _SMEAR_COHERENCE_MAX, (
         f"bright-feature coherence {coh:.3f} >= {_SMEAR_COHERENCE_MAX} "
-        "=> stars are smeared into directional streaks (anisotropic-LOD aliasing)")
+        "=> stars are smeared into directional streaks (anisotropic-LOD aliasing)"
+    )
 
 
 def test_background_has_no_vertical_seam_stripe(background_lum):
@@ -230,4 +236,5 @@ def test_background_has_no_vertical_seam_stripe(background_lum):
     z = seam_stripe_z(background_lum)
     assert z < _SEAM_STRIPE_Z_MAX, (
         f"strongest vertical stripe z={z:.1f} >= {_SEAM_STRIPE_Z_MAX} "
-        "=> a thin tall vertical seam/streak exists in the background")
+        "=> a thin tall vertical seam/streak exists in the background"
+    )

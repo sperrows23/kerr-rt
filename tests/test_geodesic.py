@@ -30,17 +30,17 @@ import numpy as np
 import pytest
 import yaml
 
+from renderer.geodesic import (
+    axial_angular_momentum,
+    carter_Q,
+    energy,
+    integrate_null_geodesic,
+    make_null_initial_conditions,
+    null_norm,
+)
+
 # --- Implementation under test ---------------------------------------------- #
 # Source of truth for all formulas inside these functions: the kerr-physics skill.
-from renderer.metric import inverse_metric_cks
-from renderer.geodesic import (
-    make_null_initial_conditions,
-    integrate_null_geodesic,
-    energy,
-    axial_angular_momentum,
-    null_norm,
-    carter_Q,
-)
 
 # --------------------------------------------------------------------------- #
 # Config / fixtures
@@ -61,7 +61,7 @@ DIR0 = (-1.0, 0.35, -0.45)
 
 @pytest.fixture(scope="module")
 def config() -> dict:
-    with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+    with open(CONFIG_PATH, encoding="utf-8") as fh:
         return yaml.safe_load(fh)
 
 
@@ -111,6 +111,7 @@ def _relative_drift(series: np.ndarray) -> float:
 # 1. Energy:  E = -p_t
 # --------------------------------------------------------------------------- #
 
+
 def test_energy_conserved(trajectory):
     p_cov = trajectory["p_cov"]
     E = np.array([energy(p) for p in p_cov])
@@ -121,10 +122,11 @@ def test_energy_conserved(trajectory):
 # 2. Axial angular momentum:  L_z = x p_y - y p_x
 # --------------------------------------------------------------------------- #
 
+
 def test_angular_momentum_conserved(trajectory):
     x = trajectory["x"]
     p_cov = trajectory["p_cov"]
-    L_z = np.array([axial_angular_momentum(xi, pi) for xi, pi in zip(x, p_cov)])
+    L_z = np.array([axial_angular_momentum(xi, pi) for xi, pi in zip(x, p_cov, strict=False)])
     assert _relative_drift(L_z) < 1e-4
 
 
@@ -133,12 +135,13 @@ def test_angular_momentum_conserved(trajectory):
 #    Inverse metric comes from the implementation (CKS-3, kerr-physics skill).
 # --------------------------------------------------------------------------- #
 
+
 def test_null_condition_preserved(trajectory):
     a = trajectory["a"]
     x = trajectory["x"]
     p_cov = trajectory["p_cov"]
 
-    norms = np.array([null_norm(xi, pi, a) for xi, pi in zip(x, p_cov)])
+    norms = np.array([null_norm(xi, pi, a) for xi, pi in zip(x, p_cov, strict=False)])
     # null_norm returns g^{ab} p_a p_b = 2H; require |H| < 1e-6 => |2H| < 2e-6.
     assert np.max(np.abs(0.5 * norms)) < 1e-6
 
@@ -147,11 +150,12 @@ def test_null_condition_preserved(trajectory):
 # 4. Carter constant (NULL form, CKS->BL diagnostic from the implementation).
 # --------------------------------------------------------------------------- #
 
+
 def test_carter_constant_conserved(trajectory):
     a = trajectory["a"]
     x = trajectory["x"]
     p_cov = trajectory["p_cov"]
-    Q = np.array([carter_Q(xi, pi, a) for xi, pi in zip(x, p_cov)])
+    Q = np.array([carter_Q(xi, pi, a) for xi, pi in zip(x, p_cov, strict=False)])
     assert _relative_drift(Q) < 1e-4
 
 
@@ -160,14 +164,15 @@ def test_carter_constant_conserved(trajectory):
 # changes to the integrator that shift the physics get caught.
 # --------------------------------------------------------------------------- #
 
+
 def test_conserved_quantities_regression(trajectory, num_regression):
     a = trajectory["a"]
     x = trajectory["x"]
     p_cov = trajectory["p_cov"]
 
     E = np.array([energy(p) for p in p_cov])
-    L_z = np.array([axial_angular_momentum(xi, pi) for xi, pi in zip(x, p_cov)])
-    Q = np.array([carter_Q(xi, pi, a) for xi, pi in zip(x, p_cov)])
+    L_z = np.array([axial_angular_momentum(xi, pi) for xi, pi in zip(x, p_cov, strict=False)])
+    Q = np.array([carter_Q(xi, pi, a) for xi, pi in zip(x, p_cov, strict=False)])
 
     # Sample at a fixed set of indices so the golden file is compact and stable.
     idx = np.linspace(0, x.shape[0] - 1, 11).astype(int)
@@ -181,5 +186,5 @@ def test_conserved_quantities_regression(trajectory, num_regression):
             "L_z": L_z[idx],
             "Q": Q[idx],
         },
-        default_tolerance=dict(atol=1e-8, rtol=1e-8),
+        default_tolerance={"atol": 1e-8, "rtol": 1e-8},
     )

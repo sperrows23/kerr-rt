@@ -56,7 +56,7 @@ _CONFIG_PATH = _ROOT / "configs" / "render.yaml"
 
 def load_config(path: Path = _CONFIG_PATH) -> dict:
     # Explicit utf-8: this box defaults to cp949 and the config has θ/π/· bytes.
-    with open(path, "r", encoding="utf-8") as fh:
+    with open(path, encoding="utf-8") as fh:
         return yaml.safe_load(fh)
 
 
@@ -90,10 +90,10 @@ _CAPTURED = 2
 # GPU fields (populated by setup_renderer)
 # --------------------------------------------------------------------------- #
 # Starmap mip pyramid, packed into one flat f16 buffer with per-level metadata.
-star_flat: ti.Field = None        # type: ignore[assignment]
-star_off: ti.Field = None         # type: ignore[assignment]
-star_w: ti.Field = None           # type: ignore[assignment]
-star_h: ti.Field = None           # type: ignore[assignment]
+star_flat: ti.Field = None  # type: ignore[assignment]
+star_off: ti.Field = None  # type: ignore[assignment]
+star_w: ti.Field = None  # type: ignore[assignment]
+star_h: ti.Field = None  # type: ignore[assignment]
 _N_LEVELS = 0
 _MAX_LOD = 0.0
 _STARMAP_WIDTH = 0
@@ -102,41 +102,41 @@ _STARMAP_WIDTH = 0
 # Layer A — point-star catalog binned into an equirect (θ′,φ′) cell grid, stored
 # CSR-style: stars sorted by cell, with per-cell [start, count] into the sorted
 # arrays. Off-plane candidate counts stay O(1–10), so the per-pixel gather is cheap.
-cat_theta: ti.Field = None        # type: ignore[assignment]  (N,) sorted by cell
-cat_phi: ti.Field = None          # type: ignore[assignment]  (N,)
-cat_flux: ti.Field = None         # type: ignore[assignment]  (N,3) linear RGB flux
-cell_start: ti.Field = None       # type: ignore[assignment]  (rows*cols,)
-cell_count: ti.Field = None       # type: ignore[assignment]  (rows*cols,)
+cat_theta: ti.Field = None  # type: ignore[assignment]  (N,) sorted by cell
+cat_phi: ti.Field = None  # type: ignore[assignment]  (N,)
+cat_flux: ti.Field = None  # type: ignore[assignment]  (N,3) linear RGB flux
+cell_start: ti.Field = None  # type: ignore[assignment]  (rows*cols,)
+cell_count: ti.Field = None  # type: ignore[assignment]  (rows*cols,)
 # Layer B — second equirect mip pyramid for the diffuse Milky-Way band.
-mw_flat: ti.Field = None          # type: ignore[assignment]
-mw_off: ti.Field = None           # type: ignore[assignment]
-mw_w: ti.Field = None             # type: ignore[assignment]
-mw_h: ti.Field = None             # type: ignore[assignment]
+mw_flat: ti.Field = None  # type: ignore[assignment]
+mw_off: ti.Field = None  # type: ignore[assignment]
+mw_w: ti.Field = None  # type: ignore[assignment]
+mw_h: ti.Field = None  # type: ignore[assignment]
 _MW_N_LEVELS = 1
 _MW_MAX_LOD = 0.0
 _MW_WIDTH = 16384.0
 # Formula-13 scalars (baked at setup from configs/render.yaml: starfield.*).
-_DNGR = 0                  # 0 = texture (legacy F10), 1 = dngr (two-layer)
+_DNGR = 0  # 0 = texture (legacy F10), 1 = dngr (two-layer)
 _STAR_COLS = 720
 _STAR_ROWS = 360
-_STAR_CELL_R = 1           # cell-neighbourhood half-width searched per pixel
-_STAR_PSF = 1.3            # Gaussian PSF σ (screen pixels)
-_PSF_TRUNC = 3.0           # splat truncation in units of σ
-_MAG_CLIP = 50.0           # cap on lensing magnification μ
-_CAUSTIC_DMIN = 1.0e-3     # δ⁻ below this ⇒ on a caustic
-_EWA_MAX_TAPS = 8          # max anisotropic taps for Layer B
-_G_BEAMING = 0             # volumetric g⁴ star-beaming hook (0 ⇒ g≡1)
+_STAR_CELL_R = 1  # cell-neighbourhood half-width searched per pixel
+_STAR_PSF = 1.3  # Gaussian PSF σ (screen pixels)
+_PSF_TRUNC = 3.0  # splat truncation in units of σ
+_MAG_CLIP = 50.0  # cap on lensing magnification μ
+_CAUSTIC_DMIN = 1.0e-3  # δ⁻ below this ⇒ on a caustic
+_EWA_MAX_TAPS = 8  # max anisotropic taps for Layer B
+_G_BEAMING = 0  # volumetric g⁴ star-beaming hook (0 ⇒ g≡1)
 
 # Output image (set per render call to match resolution).
-pixels: ti.Field = None           # type: ignore[assignment]
+pixels: ti.Field = None  # type: ignore[assignment]
 _RES = 0
 
 # Beauty-pass output (non-square, set per frame render).
-frame_pixels: ti.Field = None     # type: ignore[assignment]
+frame_pixels: ti.Field = None  # type: ignore[assignment]
 # Kernel-split hand-off buffers (Phase 2.4): physics kernel writes, shading reads.
-exit_buf: ti.Field = None         # type: ignore[assignment]  (H,W,3): cosθ′, φ′, outcome
-disk_buf: ti.Field = None         # type: ignore[assignment]  (H,W,4): disk_rgb + transmittance
-depth_pixels: ti.Field = None     # type: ignore[assignment]  (H,W): transmittance-weighted Z (3.4)
+exit_buf: ti.Field = None  # type: ignore[assignment]  (H,W,3): cosθ′, φ′, outcome
+disk_buf: ti.Field = None  # type: ignore[assignment]  (H,W,4): disk_rgb + transmittance
+depth_pixels: ti.Field = None  # type: ignore[assignment]  (H,W): transmittance-weighted Z (3.4)
 _FW = 0
 _FH = 0
 
@@ -158,10 +158,12 @@ def _pack_pyramid(sm: Starmap):
         flat = np.ascontiguousarray(lv, dtype=np.float16).ravel()
         parts.append(flat)
         off += flat.size
-    return (np.concatenate(parts),
-            np.asarray(offsets, dtype=np.int32),
-            np.asarray(ws, dtype=np.int32),
-            np.asarray(hs, dtype=np.int32))
+    return (
+        np.concatenate(parts),
+        np.asarray(offsets, dtype=np.int32),
+        np.asarray(ws, dtype=np.int32),
+        np.asarray(hs, dtype=np.int32),
+    )
 
 
 def _build_star_grid(catalog: np.ndarray, cols: int, rows: int):
@@ -209,7 +211,7 @@ def setup_renderer(cfg: dict) -> Starmap:
     global _MAG_CLIP, _CAUSTIC_DMIN, _EWA_MAX_TAPS, _G_BEAMING
 
     # Integration-scheme constants from config (baked into kernels at first JIT).
-    _HORIZON_EPS = float(cfg["render"]["horizon_epsilon"])   # CKS-6 capture margin
+    _HORIZON_EPS = float(cfg["render"]["horizon_epsilon"])  # CKS-6 capture margin
     _J_FOLD = float(cfg["render"].get("j_fold", 0.15))
 
     mem_gb = float(cfg["render"]["device_memory_gb"])
@@ -279,10 +281,10 @@ def _setup_dngr(cfg: dict) -> None:
         if not cat_path.exists():
             raise FileNotFoundError(
                 f"starfield.mode=dngr needs the ingested catalog {cat_path}; "
-                "run `python scripts/ingest_stars.py` first.")
+                "run `python scripts/ingest_stars.py` first."
+            )
         catalog = np.load(cat_path)
-        th_s, ph_s, fl_s, starts, counts = _build_star_grid(
-            catalog, _STAR_COLS, _STAR_ROWS)
+        th_s, ph_s, fl_s, starts, counts = _build_star_grid(catalog, _STAR_COLS, _STAR_ROWS)
         n_stars = int(th_s.shape[0])
         n_cells = _STAR_ROWS * _STAR_COLS
 
@@ -340,14 +342,14 @@ def _horizon_radius(a: float) -> float:
 
 def _alloc_output(res: int) -> None:
     global pixels, _RES
-    if pixels is None or _RES != res:
+    if pixels is None or res != _RES:
         pixels = ti.field(dtype=ti.f32, shape=(res, res, 3))
         _RES = res
 
 
 def _alloc_frame(width: int, height: int) -> None:
     global frame_pixels, exit_buf, disk_buf, depth_pixels, _FW, _FH
-    if frame_pixels is None or _FW != width or _FH != height:
+    if frame_pixels is None or width != _FW or height != _FH:
         frame_pixels = ti.field(dtype=ti.f32, shape=(height, width, 3))
         exit_buf = ti.field(dtype=ti.f32, shape=(height, width, 3))
         disk_buf = ti.field(dtype=ti.f32, shape=(height, width, 4))
@@ -375,8 +377,8 @@ def _cks_f_l(x, y, z, a):
     r = _kerr_radius(x, y, z, a)
     r2 = r * r
     a2 = a * a
-    D = r2 * r2 + a2 * z * z          # r⁴ + a²z²
-    S = r2 + a2                       # r² + a²
+    D = r2 * r2 + a2 * z * z  # r⁴ + a²z²
+    S = r2 + a2  # r² + a²
     f = 2.0 * r2 * r / D
     l = vec4(1.0, (r * x + a * y) / S, (r * y - a * x) / S, z / r)
     return f, l
@@ -399,7 +401,7 @@ def _metric_cks(x, y, z, a):
 def _inv_metric_cks(x, y, z, a):
     """Exact inverse g^αβ = η^αβ − f l^α l^β — Formula CKS-3 (l is η-null)."""
     f, l = _cks_f_l(x, y, z, a)
-    lu = vec4(-l[0], l[1], l[2], l[3])   # l^α = η^αγ l_γ : l^t = −l_t = −1
+    lu = vec4(-l[0], l[1], l[2], l[3])  # l^α = η^αγ l_γ : l^t = −l_t = −1
     eta = vec4(-1.0, 1.0, 1.0, 1.0)
     M = ti.Matrix.zero(ti.f32, 4, 4)
     for i in ti.static(range(4)):
@@ -435,8 +437,8 @@ def _eom(s, a):
     r = ti.sqrt(ti.max(half + ti.sqrt(half * half + a2 * z * z), 1e-12))
     r2 = r * r
     r3 = r2 * r
-    D = r2 * r2 + a2 * z * z          # r⁴ + a²z²
-    S = r2 + a2                       # r² + a²
+    D = r2 * r2 + a2 * z * z  # r⁴ + a²z²
+    S = r2 + a2  # r² + a²
 
     f = 2.0 * r3 / D
     l_x = (r * x + a * y) / S
@@ -507,16 +509,16 @@ def _photon_momentum_cks(cx, cy, cz, nx, ny, nz, a):
     lapse = 1.0 / ti.sqrt(-gi[0, 0])
     u_obs = vec4(0.0, 0.0, 0.0, 0.0)
     for i in ti.static(range(4)):
-        u_obs[i] = -lapse * gi[0, i]              # u_obs^α = −α g^{tα}
+        u_obs[i] = -lapse * gi[0, i]  # u_obs^α = −α g^{tα}
 
     N = vec4(0.0, nx, ny, nz)
-    gNu = N.dot(g @ u_obs)                        # g_μν N^μ u_obs^ν
-    Nprime = N + gNu * u_obs                      # now g·(N′, u_obs) = 0
+    gNu = N.dot(g @ u_obs)  # g_μν N^μ u_obs^ν
+    Nprime = N + gNu * u_obs  # now g·(N′, u_obs) = 0
     s_hat = Nprime / ti.sqrt(Nprime.dot(g @ Nprime))
-    p_up = u_obs + s_hat                          # E_loc = 1; null automatically
-    p_cov = g @ p_up                              # lower index
+    p_up = u_obs + s_hat  # E_loc = 1; null automatically
+    p_cov = g @ p_up  # lower index
     E = -p_cov[0]
-    return p_cov / E                              # scale so E = −p_t = 1
+    return p_cov / E  # scale so E = −p_t = 1
 
 
 @ti.func
@@ -539,8 +541,7 @@ def _exit_cos_phi(s, a):
 
 
 @ti.func
-def _trace_to_exit(cx, cy, cz, nx, ny, nz, a, r_plus, r_max,
-                   n_steps, d_lambda, adaptive_floor):
+def _trace_to_exit(cx, cy, cz, nx, ny, nz, a, r_plus, r_max, n_steps, d_lambda, adaptive_floor):
     """Integrate one null geodesic to its outcome (capture / escape).
 
     Returns ``(outcome, cosθ′, φ′)``. Adaptive affine step (Formula CKS-5):
@@ -592,8 +593,8 @@ def _texel(level, x, y):
 def _sample_level(level, u, v):
     w = star_w[level]
     h = star_h[level]
-    uu = u - ti.floor(u)                          # wrap φ (periodic)
-    vv = ti.min(ti.max(v, 0.0), 1.0)              # clamp θ
+    uu = u - ti.floor(u)  # wrap φ (periodic)
+    vv = ti.min(ti.max(v, 0.0), 1.0)  # clamp θ
     fu = uu * w - 0.5
     fv = vv * h - 0.5
     x0 = ti.cast(ti.floor(fu), ti.i32)
@@ -649,7 +650,7 @@ def _gas_four_velocity_cks(x, y, z, a):
     """
     r = _kerr_radius(x, y, z, a)
     r15 = ti.pow(r, 1.5)
-    Omega = 1.0 / (r15 + a)                                   # Formula 3
+    Omega = 1.0 / (r15 + a)  # Formula 3
     u_t = (1.0 + a / r15) / ti.sqrt(ti.max(1.0 - 3.0 / r + 2.0 * a / r15, 1e-9))
     u_x = -Omega * y * u_t
     u_y = Omega * x * u_t
@@ -671,8 +672,9 @@ def _blackbody_rgb(temp):
 
 
 @ti.func
-def _disk_emit_cks(x, y, z, p_cov, a, r_inner, r_outer,
-                   theta_half, sigma_frac, T_0, emis_c, absb_c, ds):
+def _disk_emit_cks(
+    x, y, z, p_cov, a, r_inner, r_outer, theta_half, sigma_frac, T_0, emis_c, absb_c, ds
+):
     """One volumetric disk sample at a CKS geodesic point → (emission RGB, dτ).
 
     Returns ``vec4(emission_r, emission_g, emission_b, dtau)``; the running pixel
@@ -693,10 +695,9 @@ def _disk_emit_cks(x, y, z, p_cov, a, r_inner, r_outer,
     if (ti.abs(dz_ang) < theta_half) and (r >= r_inner) and (r <= r_outer):
         u4 = _gas_four_velocity_cks(x, y, z, a)
         E = -p_cov[0]
-        denom = (p_cov[0] * u4[0] + p_cov[1] * u4[1]
-                 + p_cov[2] * u4[2] + p_cov[3] * u4[3])
+        denom = p_cov[0] * u4[0] + p_cov[1] * u4[1] + p_cov[2] * u4[2] + p_cov[3] * u4[3]
         if ti.abs(denom) > 1e-12:
-            g = -E / denom                       # Formula CKS-9
+            g = -E / denom  # Formula CKS-9
             if g > 0.0:
                 # Decision B temperature model: T = T_0·(6/r)^0.75.
                 T_emit = T_0 * ti.pow(6.0 / r, 0.75)
@@ -704,10 +705,14 @@ def _disk_emit_cks(x, y, z, p_cov, a, r_inner, r_outer,
                 chroma = _blackbody_rgb(T_obs)
                 sigma_theta = theta_half * sigma_frac
                 density = ti.exp(-0.5 * (dz_ang / sigma_theta) ** 2)
-                g4 = g * g * g * g                # Formula 9 (3D volume: g⁴)
+                g4 = g * g * g * g  # Formula 9 (3D volume: g⁴)
                 emission = emis_c * density * g4 * ds
-                out = vec4(emission * chroma[0], emission * chroma[1],
-                           emission * chroma[2], absb_c * density * ds)
+                out = vec4(
+                    emission * chroma[0],
+                    emission * chroma[1],
+                    emission * chroma[2],
+                    absb_c * density * ds,
+                )
     return out
 
 
@@ -715,14 +720,29 @@ def _disk_emit_cks(x, y, z, p_cov, a, r_inner, r_outer,
 # Pipe A preview kernel (square, inline offset-ray LOD)
 # --------------------------------------------------------------------------- #
 @ti.kernel
-def render_pipe_a(res: int, tan_half_fov: float,
-                  cx: float, cy: float, cz: float,
-                  fwd_x: float, fwd_y: float, fwd_z: float,
-                  rgt_x: float, rgt_y: float, rgt_z: float,
-                  up_x: float, up_y: float, up_z: float,
-                  a: float, r_plus: float, r_max: float,
-                  n_steps: int, d_lambda: float, adaptive_floor: float,
-                  lod_enabled: int):
+def render_pipe_a(
+    res: int,
+    tan_half_fov: float,
+    cx: float,
+    cy: float,
+    cz: float,
+    fwd_x: float,
+    fwd_y: float,
+    fwd_z: float,
+    rgt_x: float,
+    rgt_y: float,
+    rgt_z: float,
+    up_x: float,
+    up_y: float,
+    up_z: float,
+    a: float,
+    r_plus: float,
+    r_max: float,
+    n_steps: int,
+    d_lambda: float,
+    adaptive_floor: float,
+    lod_enabled: int,
+):
     """Pipe A: trace one primary + one offset ray per pixel; sample the lensed sky.
 
     Camera position and basis (fwd/right/up) are **world Cartesian = CKS** — no
@@ -752,12 +772,12 @@ def render_pipe_a(res: int, tan_half_fov: float,
         noy *= invo
         noz *= invo
 
-        out_p, cos_p, ph_p = _trace_to_exit(cx, cy, cz, npx, npy, npz, a,
-                                            r_plus, r_max, n_steps, d_lambda,
-                                            adaptive_floor)
-        out_o, cos_o, ph_o = _trace_to_exit(cx, cy, cz, nox, noy, noz, a,
-                                            r_plus, r_max, n_steps, d_lambda,
-                                            adaptive_floor)
+        out_p, cos_p, ph_p = _trace_to_exit(
+            cx, cy, cz, npx, npy, npz, a, r_plus, r_max, n_steps, d_lambda, adaptive_floor
+        )
+        out_o, cos_o, ph_o = _trace_to_exit(
+            cx, cy, cz, nox, noy, noz, a, r_plus, r_max, n_steps, d_lambda, adaptive_floor
+        )
 
         col = vec3(0.0, 0.0, 0.0)
         if out_p == _ESCAPED:
@@ -792,20 +812,41 @@ def render_pipe_a(res: int, tan_half_fov: float,
 # Beauty kernel — Pipe A (lensed background) + Pipe B (volumetric disk)
 # --------------------------------------------------------------------------- #
 @ti.kernel
-def render_beauty_physics(width: int, height: int,
-                          cx: float, cy: float, cz: float,
-                          fwd_x: float, fwd_y: float, fwd_z: float,
-                          rgt_x: float, rgt_y: float, rgt_z: float,
-                          up_x: float, up_y: float, up_z: float,
-                          tan_half_x: float, tan_half_y: float,
-                          a: float, r_plus: float,
-                          r_max: float, n_steps: int, d_lambda: float,
-                          adaptive_floor: float, disk_enabled: int,
-                          projection_mode: int, depth_infinity: float,
-                          r_inner: float, r_outer: float,
-                          theta_half: float, bound_sin_half: float,
-                          sigma_frac: float, T_0: float, emis_c: float,
-                          absb_c: float):
+def render_beauty_physics(
+    width: int,
+    height: int,
+    cx: float,
+    cy: float,
+    cz: float,
+    fwd_x: float,
+    fwd_y: float,
+    fwd_z: float,
+    rgt_x: float,
+    rgt_y: float,
+    rgt_z: float,
+    up_x: float,
+    up_y: float,
+    up_z: float,
+    tan_half_x: float,
+    tan_half_y: float,
+    a: float,
+    r_plus: float,
+    r_max: float,
+    n_steps: int,
+    d_lambda: float,
+    adaptive_floor: float,
+    disk_enabled: int,
+    projection_mode: int,
+    depth_infinity: float,
+    r_inner: float,
+    r_outer: float,
+    theta_half: float,
+    bound_sin_half: float,
+    sigma_frac: float,
+    T_0: float,
+    emis_c: float,
+    absb_c: float,
+):
     """Kernel 1 (Phase 2.4 split): trace ONE primary ray per pixel (no offset ray).
 
     Writes the per-pixel exit state to ``exit_buf`` (cosθ′, φ′, outcome), the
@@ -828,8 +869,8 @@ def render_beauty_physics(width: int, height: int,
         nz = fwd_z
         if projection_mode == 1:
             # Equirectangular 360° ray-gen: screen → (lon, lat) → camera-basis dir.
-            lon = (px + 0.5) / width * _TWO_PI                 # azimuth ∈ [0, 2π)
-            lat = (py + 0.5) / height * math.pi                # polar ∈ [0, π]
+            lon = (px + 0.5) / width * _TWO_PI  # azimuth ∈ [0, 2π)
+            lat = (py + 0.5) / height * math.pi  # polar ∈ [0, π]
             d_fwd = ti.sin(lat) * ti.cos(lon)
             d_rgt = ti.sin(lat) * ti.sin(lon)
             d_up = ti.cos(lat)
@@ -856,9 +897,9 @@ def render_beauty_physics(width: int, height: int,
 
         disk_col = vec3(0.0, 0.0, 0.0)
         transm = 1.0
-        ray_length = 0.0          # accumulated affine path length (depth proxy)
-        weighted_depth = 0.0      # Σ ray_length·contribution  (optimization Phase 3.4)
-        total_emission = 0.0      # Σ contribution
+        ray_length = 0.0  # accumulated affine path length (depth proxy)
+        weighted_depth = 0.0  # Σ ray_length·contribution  (optimization Phase 3.4)
+        total_emission = 0.0  # Σ contribution
 
         step = 0
         while step < n_steps and out_p == _RUNNING:
@@ -882,12 +923,28 @@ def render_beauty_physics(width: int, height: int,
                 # Pipe B: accumulate disk emission at the current point.
                 # optimization Phase 3.3 bounding-box early-out: |cosθ| < sin θ_half (≡ the
                 # slab test) and r within the radial band.
-                if disk_enabled == 1 and ti.abs(z / r) < bound_sin_half \
-                        and r >= r_inner and r <= r_outer:
+                if (
+                    disk_enabled == 1
+                    and ti.abs(z / r) < bound_sin_half
+                    and r >= r_inner
+                    and r <= r_outer
+                ):
                     p_cov = vec4(s[4], s[5], s[6], s[7])
-                    ev = _disk_emit_cks(x, y, z, p_cov, a,
-                                        r_inner, r_outer, theta_half, sigma_frac,
-                                        T_0, emis_c, absb_c, local_h)
+                    ev = _disk_emit_cks(
+                        x,
+                        y,
+                        z,
+                        p_cov,
+                        a,
+                        r_inner,
+                        r_outer,
+                        theta_half,
+                        sigma_frac,
+                        T_0,
+                        emis_c,
+                        absb_c,
+                        local_h,
+                    )
                     disk_col += transm * vec3(ev[0], ev[1], ev[2])
                     contribution = transm * (ev[0] + ev[1] + ev[2])
                     weighted_depth += ray_length * contribution
@@ -1051,8 +1108,8 @@ def _dngr_shade(py, px, height, width, th_p, ph_p, d_omega):
     dthy = 0.0
     dphy = 0.0
     detJ = 0.0
-    delta_plus = 0.0     # δ⁺ major ellipse axis (angular, sinθ-weighted)
-    delta_minus = 0.0    # δ⁻ minor ellipse axis
+    delta_plus = 0.0  # δ⁺ major ellipse axis (angular, sinθ-weighted)
+    delta_minus = 0.0  # δ⁻ minor ellipse axis
     if valid:
         th_x = ti.acos(ti.min(ti.max(exit_buf[py, nx, 0], -1.0), 1.0))
         ph_x = exit_buf[py, nx, 1]
@@ -1104,8 +1161,9 @@ def _dngr_shade(py, px, height, width, th_p, ph_p, d_omega):
         maj_u, maj_v, maj, minr = pxu, pxv, lenx, leny
         if leny > lenx:
             maj_u, maj_v, maj, minr = pyu, pyv, leny, lenx
-        ntaps = ti.cast(ti.min(ti.ceil(maj / ti.max(minr, 1.0)),
-                               ti.cast(_EWA_MAX_TAPS, ti.f32)), ti.i32)
+        ntaps = ti.cast(
+            ti.min(ti.ceil(maj / ti.max(minr, 1.0)), ti.cast(_EWA_MAX_TAPS, ti.f32)), ti.i32
+        )
         if ntaps < 1:
             ntaps = 1
         lod = ti.log(ti.max(minr, 1.0)) / ti.log(2.0)
@@ -1123,7 +1181,7 @@ def _dngr_shade(py, px, height, width, th_p, ph_p, d_omega):
     #   * NOT `usable`: guard (b′) — undeflected proper-separation placement
     #       d² = (Δθ′² + sin²θ′·Δφ′²) / dΩ, μ clamped to 1 (stars stay sharp).
     stars = vec3(0.0, 0.0, 0.0)
-    g4 = 1.0   # _G_BEAMING hook: g≡1 for a static camera at the celestial sphere
+    g4 = 1.0  # _G_BEAMING hook: g≡1 for a static camera at the celestial sphere
     two_sig2 = 2.0 * _STAR_PSF * _STAR_PSF
     d_max2 = (_PSF_TRUNC * _STAR_PSF) ** 2
     inv_det = 0.0
@@ -1154,14 +1212,22 @@ def _dngr_shade(py, px, height, width, th_p, ph_p, d_omega):
                             d2 = (dth * dth + sin_th * sin_th * dph * dph) / d_omega
                         if d2 < d_max2:
                             wgt = ti.exp(-d2 / two_sig2) * mu * g4
-                            stars += vec3(cat_flux[sidx, 0], cat_flux[sidx, 1],
-                                          cat_flux[sidx, 2]) * wgt
+                            stars += (
+                                vec3(cat_flux[sidx, 0], cat_flux[sidx, 1], cat_flux[sidx, 2]) * wgt
+                            )
     return diffuse + stars
 
 
 @ti.kernel
-def render_beauty_shade(width: int, height: int, lod_enabled: int, mode: int,
-                        tan_half_x: float, tan_half_y: float, projection_mode: int):
+def render_beauty_shade(
+    width: int,
+    height: int,
+    lod_enabled: int,
+    mode: int,
+    tan_half_x: float,
+    tan_half_y: float,
+    projection_mode: int,
+):
     """Kernel 2 (Phase 2.4 split): background lookup + composite.
 
     ``mode == 0`` (texture): the legacy Formula-10 path — screen-space LOD from
@@ -1172,7 +1238,7 @@ def render_beauty_shade(width: int, height: int, lod_enabled: int, mode: int,
     for py, px in ti.ndrange(height, width):
         out_p = exit_buf[py, px, 2]
         bg = vec3(0.0, 0.0, 0.0)
-        if out_p < 1.5 and out_p > 0.5:        # escaped
+        if out_p < 1.5 and out_p > 0.5:  # escaped
             cos_exit = exit_buf[py, px, 0]
             ph_p_exit = exit_buf[py, px, 1]
             th_p_n = ti.acos(ti.min(ti.max(cos_exit, -1.0), 1.0))
@@ -1186,8 +1252,12 @@ def render_beauty_shade(width: int, height: int, lod_enabled: int, mode: int,
                     sx = (2.0 * (px + 0.5) / width - 1.0) * tan_half_x
                     sy = (1.0 - 2.0 * (py + 0.5) / height) * tan_half_y
                     inv_len = 1.0 / ti.sqrt(1.0 + sx * sx + sy * sy)
-                    d_omega = (4.0 * tan_half_x * tan_half_y / (width * height)) \
-                        * inv_len * inv_len * inv_len
+                    d_omega = (
+                        (4.0 * tan_half_x * tan_half_y / (width * height))
+                        * inv_len
+                        * inv_len
+                        * inv_len
+                    )
                 bg = _dngr_shade(py, px, height, width, th_p_n, ph_p_exit, d_omega)
             else:
                 u = ph_p_exit / (2.0 * math.pi)
@@ -1220,7 +1290,7 @@ def _camera_basis(pos, fwd, world_up=(0.0, 0.0, 1.0)):
     wu = np.asarray(world_up, dtype=float)
     right = np.cross(f, wu)
     nrm = np.linalg.norm(right)
-    if nrm < 1e-8:                       # looking along the spin axis: pick any ⟂
+    if nrm < 1e-8:  # looking along the spin axis: pick any ⟂
         right = np.cross(f, np.array([1.0, 0.0, 0.0]))
         nrm = np.linalg.norm(right)
     right = right / nrm
@@ -1253,26 +1323,48 @@ def render_pipe_a_image(cfg: dict, res: int, lod_enabled: bool) -> np.ndarray:
 
     # Camera position in CKS Cartesian (spin axis = +z); look at the origin.
     st, ct = math.sin(theta_cam), math.cos(theta_cam)
-    pos = np.array([r_cam * st * math.cos(phi_cam),
-                    r_cam * st * math.sin(phi_cam),
-                    r_cam * ct], dtype=float)
+    pos = np.array(
+        [r_cam * st * math.cos(phi_cam), r_cam * st * math.sin(phi_cam), r_cam * ct], dtype=float
+    )
     fwd, right, up = _camera_basis(pos, -pos)
 
     _alloc_output(res)
-    render_pipe_a(res, tan_half_fov,
-                  float(pos[0]), float(pos[1]), float(pos[2]),
-                  float(fwd[0]), float(fwd[1]), float(fwd[2]),
-                  float(right[0]), float(right[1]), float(right[2]),
-                  float(up[0]), float(up[1]), float(up[2]),
-                  a, r_plus, r_max, n_steps, d_lambda, adaptive_floor,
-                  1 if lod_enabled else 0)
+    render_pipe_a(
+        res,
+        tan_half_fov,
+        float(pos[0]),
+        float(pos[1]),
+        float(pos[2]),
+        float(fwd[0]),
+        float(fwd[1]),
+        float(fwd[2]),
+        float(right[0]),
+        float(right[1]),
+        float(right[2]),
+        float(up[0]),
+        float(up[1]),
+        float(up[2]),
+        a,
+        r_plus,
+        r_max,
+        n_steps,
+        d_lambda,
+        adaptive_floor,
+        1 if lod_enabled else 0,
+    )
     ti.sync()
     return pixels.to_numpy()
 
 
-def render_beauty_frame(cfg: dict, cam_frame: dict, width: int, height: int,
-                        with_disk: bool = True, lod_enabled: bool = True,
-                        return_depth: bool = False):
+def render_beauty_frame(
+    cfg: dict,
+    cam_frame: dict,
+    width: int,
+    height: int,
+    with_disk: bool = True,
+    lod_enabled: bool = True,
+    return_depth: bool = False,
+):
     """Render one beauty frame (Pipe A + Pipe B) for a camera_matrix.json entry.
 
     ``cam_frame`` carries the Blender camera in **world Cartesian** coordinates
@@ -1329,31 +1421,56 @@ def render_beauty_frame(cfg: dict, cam_frame: dict, width: int, height: int,
     # Phase 2.4 kernel split: physics pass writes exit_buf/disk_buf, shading pass
     # computes the screen-space-Jacobian LOD and composites.
     render_beauty_physics(
-        width, height,
-        float(pos[0]), float(pos[1]), float(pos[2]),
-        float(fwd[0]), float(fwd[1]), float(fwd[2]),
-        float(right[0]), float(right[1]), float(right[2]),
-        float(up[0]), float(up[1]), float(up[2]),
-        tan_half_x, tan_half_y,
-        a, r_plus, r_max, n_steps, d_lambda,
-        adaptive_floor, 1 if with_disk else 0,
-        projection_mode, depth_infinity,
-        float(d["r_inner"]), float(d["r_outer"]),
-        float(d["theta_half_width"]), bound_sin_half,
-        float(d["vertical_sigma_frac"]), float(d["T_0"]),
-        float(d["emission_coeff"]), float(d["absorption_coeff"]),
+        width,
+        height,
+        float(pos[0]),
+        float(pos[1]),
+        float(pos[2]),
+        float(fwd[0]),
+        float(fwd[1]),
+        float(fwd[2]),
+        float(right[0]),
+        float(right[1]),
+        float(right[2]),
+        float(up[0]),
+        float(up[1]),
+        float(up[2]),
+        tan_half_x,
+        tan_half_y,
+        a,
+        r_plus,
+        r_max,
+        n_steps,
+        d_lambda,
+        adaptive_floor,
+        1 if with_disk else 0,
+        projection_mode,
+        depth_infinity,
+        float(d["r_inner"]),
+        float(d["r_outer"]),
+        float(d["theta_half_width"]),
+        bound_sin_half,
+        float(d["vertical_sigma_frac"]),
+        float(d["T_0"]),
+        float(d["emission_coeff"]),
+        float(d["absorption_coeff"]),
     )
     # starfield.mode: dngr ⇒ Formula-13 two-layer background; else legacy F10 texture.
     dngr_mode = 1 if str(cfg.get("starfield", {}).get("mode", "texture")) == "dngr" else 0
-    render_beauty_shade(width, height, 1 if lod_enabled else 0, dngr_mode,
-                        tan_half_x, tan_half_y, projection_mode)
+    render_beauty_shade(
+        width, height, 1 if lod_enabled else 0, dngr_mode, tan_half_x, tan_half_y, projection_mode
+    )
     ti.sync()
     if return_depth:
         # A non-finite disk sample (RK4 overshoot at the inner edge) could leave
         # NaN/±inf in the Z pass; map any non-finite depth to the no-hit sentinel
         # so a poisoned pixel reads as "empty", never as a finite garbage Z.
-        depth = np.nan_to_num(depth_pixels.to_numpy(), nan=depth_infinity,
-                              posinf=depth_infinity, neginf=depth_infinity)
+        depth = np.nan_to_num(
+            depth_pixels.to_numpy(),
+            nan=depth_infinity,
+            posinf=depth_infinity,
+            neginf=depth_infinity,
+        )
         return frame_pixels.to_numpy(), depth
     return frame_pixels.to_numpy()
 
@@ -1365,9 +1482,16 @@ def _rotate_z(vec, dphi: float):
     return [c * x - s * y, s * x + c * y, z]
 
 
-def render_beauty_frame_mb(cfg: dict, cam_frame: dict, width: int, height: int,
-                           shutter_arc: float, with_disk: bool = True,
-                           lod_enabled: bool = True, return_depth: bool = False):
+def render_beauty_frame_mb(
+    cfg: dict,
+    cam_frame: dict,
+    width: int,
+    height: int,
+    shutter_arc: float,
+    with_disk: bool = True,
+    lod_enabled: bool = True,
+    return_depth: bool = False,
+):
     """Temporal motion blur (optimization Phase 4.2) by host-side averaging of jittered sub-frames.
 
     Renders ``render.motion_blur_samples`` copies of the frame with the camera
@@ -1377,12 +1501,13 @@ def render_beauty_frame_mb(cfg: dict, cam_frame: dict, width: int, height: int,
     """
     samples = int(cfg["render"]["motion_blur_samples"])
     if samples <= 1 or shutter_arc == 0.0:
-        return render_beauty_frame(cfg, cam_frame, width, height,
-                                   with_disk, lod_enabled, return_depth)
+        return render_beauty_frame(
+            cfg, cam_frame, width, height, with_disk, lod_enabled, return_depth
+        )
 
     depth_inf = float(cfg["render"]["depth_infinity"])
     acc = None
-    depth_sum = None   # Σ of finite (disk-hit) depths only
+    depth_sum = None  # Σ of finite (disk-hit) depths only
     depth_hits = None  # per-pixel count of sub-frames that hit the disk
     for i in range(samples):
         # Symmetric jitter across the shutter window: [−arc/2, +arc/2].
@@ -1393,8 +1518,7 @@ def render_beauty_frame_mb(cfg: dict, cam_frame: dict, width: int, height: int,
         jf["fwd"] = _rotate_z(cam_frame["fwd"], dphi)
         jf["up"] = _rotate_z(cam_frame["up"], dphi)
         jf["right"] = _rotate_z(cam_frame["right"], dphi)
-        out = render_beauty_frame(cfg, jf, width, height, with_disk, lod_enabled,
-                                  return_depth)
+        out = render_beauty_frame(cfg, jf, width, height, with_disk, lod_enabled, return_depth)
         hdr = out[0] if return_depth else out
         acc = hdr.astype(np.float64) if acc is None else acc + hdr
         if return_depth:
@@ -1412,9 +1536,7 @@ def render_beauty_frame_mb(cfg: dict, cam_frame: dict, width: int, height: int,
 
     hdr_mean = (acc / samples).astype(np.float32)
     if return_depth:
-        depth_mean = np.where(depth_hits > 0.0,
-                              depth_sum / np.maximum(depth_hits, 1.0),
-                              depth_inf)
+        depth_mean = np.where(depth_hits > 0.0, depth_sum / np.maximum(depth_hits, 1.0), depth_inf)
         return hdr_mean, depth_mean.astype(np.float32)
     return hdr_mean
 
