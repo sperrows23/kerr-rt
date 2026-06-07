@@ -489,6 +489,33 @@ photon ring + g⁴-beamed approaching edge. The CKS affine-vs-Mino emission meas
 reweights the Doppler half-frame ratio to ≈4.3× (was 7.77× under BL) and required
 recalibrating `emission_coeff`/`absorption_coeff` ~1/30 (see §4 + render.yaml).
 
+**Starless Layer-B + deeper catalog (2026-06-07).** Root-caused the wide-FOV
+*edge star-elongation*: the DNGR Layer-B diffuse plate (`milkyway_2020_16k.exr`) still
+carried the **full baked point-star field** — measured ~2% of lit pixels were sharp
+local-max spikes (>10× neighbourhood), identical to `starmap_2020_16k` (the config's old
+claim that milkyway "omits stars brighter than ~8.0" was **empirically false**). The
+anisotropic EWA footprint, which grows to ~2.3× at the 90° screen corner, stretches every
+such point source into a directional streak (Layer A's J⁻¹ point splats stay round — the
+streaks are 100% Layer B; verified by isolated-layer corner renders, BH out of frame so
+zero lensing). **Fix:** Layer B now points at `starmap_final.exr`, an owner-produced
+StarNet2-cleaned plate (workflow in `star_image/starmap_workflow.md`: StarNet2 + a
+gnomonic-reprojection polar pass for the ERP-stretched poles). Sharp >10× spikes drop **46×
+to 0.045%**; corner diffuse mean drops 124× and bright-pixel count 2957→0. With Layer B now
+starless, **every** visible star must come from Layer A, so `mag_limit` 8.0 → **11.0**
+(~Tycho-2) and `assets/stars.npy` re-ingested **41 410 → 115 324 stars** to repopulate the
+faint field as sharp, correctly-lensed point sources (the *Interstellar*/DNGR intent).
+*Verified:* full suite 44 passed; corner render shows round catalog stars, no streaks.
+The acceptance metric is now a permanent tool — `scripts/check_starless_map.py`
+(luminance → separable equirect box-mean → local-contrast spike count; floor =
+band median, i.e. median over the *positive* pixels, since a cleaned plate is
+mostly hard zeros). It exits non-zero unless sharp >10× spikes ≤ 0.05% of lit
+pixels; `starmap_final` passes at 0.031%, `starmap_2020`/`milkyway_2020` fail at
+~2.1% (the disproof, reproduced). Run it on any candidate Layer-B plate.
+**Open follow-up:** with the starless plate the diffuse band reads dim — an owner
+`--no-disk` test render confirmed the background is on the dark side. Cross-layer
+brightness is set by `starfield.mag_zero_point` (currently 0.0); a look-tuning
+pass on it is expected once a real BH frame is graded. Not a correctness bug.
+
 The full 5-phase optimization from `guid.md` (the now-superseded source spec) is
 **complete** and committed. Condensed history (the Phase-1 `[y,u,…]` / Θ_u / φ-wrap
 work below predates and is **superseded by** the CKS migration above):
@@ -708,6 +735,14 @@ are documented, not yet applied — confirmed present on inspection:
   stars *brighter* than ~8.0, so 6.5–8.0 stars fell out of both layers — fixed by
   `mag_limit: 6.5 → 8.0` and re-ingesting (`assets/stars.npy`: 8 877 → 41 410 stars).
   The smear test is now a *live* PASS guard (xfail dropped). See spec §7.1.
+  **SUPERSEDED (2026-06-07):** the "diffuse map omits stars brighter than ~8.0"
+  premise was **measured false** — `milkyway_2020_16k` carried the full baked star
+  field (sharp-spike density identical to `starmap_2020`). That field is what EWA
+  smeared into *edge* streaks at wide FOV (distinct from the photon-ring smear S6
+  fixed). Resolved by swapping Layer B to the StarNet2-starless `starmap_final.exr`
+  and, since Layer B is now starless, raising `mag_limit 8.0 → 11.0` so Layer A
+  alone carries the star field (`assets/stars.npy`: 41 410 → 115 324). See §6
+  2026-06-07.
 - **S7 — Coarse GPU-regression metrics are insensitive to the visible artifacts.**
   🚩 **FLAGGED (2026-06-06).** `test_no_spin_axis_seam` passed `texture` at 1.9×
   (limit 6) *while the blocky seam stripe is plainly visible* — a low-frequency
@@ -851,7 +886,8 @@ starfield:
   format: auto               # auto | hyg | bsc5
   source_catalog: star_image/hyglike_from_athyg_v32.csv
   catalog_path: assets/stars.npy            # {θ',φ',flux_rgb}
-  diffuse_map: star_image/milkyway_2020_16k.exr   # Layer B only (low-freq)
+  mag_limit: 11.0            # Layer A catalog depth (~Tycho-2); was 8.0 — see §6 2026-06-07
+  diffuse_map: star_image/starmap_final.exr   # Layer B only — STARLESS (low-freq); was milkyway_2020_16k.exr
   star_grid_cols: 720; star_grid_rows: 360  # Layer-A candidate cell grid
   star_psf_px: 1.3           # gaussian PSF σ (px)
   mag_clip: 50.0             # cap on lensing brightness gain (caustic safety)
@@ -876,18 +912,22 @@ frames bit-for-bit; keep `pytest` green + a new `test_starfield_dngr.py`.
 | 1 | Catalog ingest → `{θ′,φ′,flux_rgb}.npy`; B−V→RGB reuse | ✅ **shipped** — `scripts/ingest_stars.py`; HYG/ATHYG csv **+** BSC5; blackbody-from-B−V |
 | 2 | FD beam Jacobian + `mag`; ellipse `(δ⁺,δ⁻,µ)` | ✅ **shipped** — `_dngr_shade` (μ→1 flat verified) |
 | 3 | Layer A star gather (cell grid) + PSF splat | ✅ **shipped** — CSR cell grid + Gaussian PSF |
-| 4 | Layer B anisotropic EWA diffuse fetch | ✅ **shipped** — `milkyway_2020_16k.exr`, EWA major-axis taps |
-| 5 | Config gate, A/B harness, validation suite | ✅ **shipped** — `mode` gate + `tests/test_starfield_dngr.py` |
+| 4 | Layer B anisotropic EWA diffuse fetch | ✅ **shipped** — `starfield.diffuse_map` (STARLESS `starmap_final.exr` since 2026-06-07; was `milkyway_2020_16k.exr`), EWA major-axis taps |
+| 5 | Config gate, A/B harness, validation suite | ✅ **shipped** — `mode` gate + `tests/test_starfield_dngr.py`; Layer-B starless gate = `scripts/check_starless_map.py` |
 | 6 (opt) | Geodesic-deviation Jacobian upgrade | **open** — future fidelity upgrade (new ODE) |
 
 **Decisions of record (resolved 2026-06-05):** catalog scope = **HYG/ATHYG v3.2** (the
 owner-supplied csv; BSC5 still supported) with **blackbody-from-B−V** colour; Jacobian
 method = **finite-difference** (FD-first, per the recommendation; geodesic deviation
-deferred to Phase 6); diffuse map = **keep the Milky-Way equirect**
-(`milkyway_2020_16k.exr`) with anisotropic EWA. **Still open:** Phase 6 geodesic-
+deferred to Phase 6); diffuse map = **a STARLESS Milky-Way equirect** with anisotropic
+EWA — originally `milkyway_2020_16k.exr`, **superseded 2026-06-07** by `starmap_final.exr`
+(StarNet2-cleaned) because the milkyway plate still carried the full baked point-star
+field, which EWA smears into edge streaks (§6 2026-06-07). **Still open:** Phase 6 geodesic-
 deviation Jacobian (gated on a new SKILL.md deviation-ODE formula); a quantitative
 Einstein-ring brightness regression (the current suite asserts finiteness + point-star
-sharpness + flat-space μ→1, not ring photometry).
+sharpness + flat-space μ→1, not ring photometry); **Layer-B/Layer-A brightness grade** —
+the starless plate halves the diffuse mean, so the background reads dim (owner `--no-disk`
+test confirmed); tune `starfield.mag_zero_point` (currently 0.0) against a graded BH frame.
 
 ---
 

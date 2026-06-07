@@ -70,12 +70,18 @@ starfield:
   format: auto             # auto | hyg | bsc5  (auto -> by source_catalog extension)
   source_catalog: star_image/hyglike_from_athyg_v32.csv  # HYG/ATHYG v3.2 csv (or a V/50 bsc5.dat)
   catalog_path: assets/stars.npy   # ingest output: float32 [N,5] = theta', phi', flux_r, flux_g, flux_b
-  mag_limit: 8.0           # drop stars fainter than this apparent V mag. Set to 8.0 (NOT 6.5)
-                           # to butt against the diffuse map's bright-star cutoff: milkyway_2020_16k
-                           # OMITS stars brighter than ~8.0 (Hipparcos/Tycho stripped), so Layer A must
-                           # cover <=8.0 or stars in 6.5-8.0 fall out of BOTH layers. Do NOT exceed ~8.0
-                           # or Layer A re-adds Tycho stars (~8.0-11.5) the diffuse map already contains
-                           # (double-count). This cutoff is the A/B energy boundary (sub-agent review 2026-06-06).
+  mag_limit: 11.0          # drop stars fainter than this apparent V mag. Set to 11.0 (~Tycho-2
+                           # completeness). RATIONALE REVISED 2026-06-07: Layer B is now the
+                           # StarNet2-starless plate (starmap_final.exr), which carries ~zero point
+                           # sources (acceptance metric: sharp >10x spikes 2.05%->0.045%), so the old
+                           # "A/B energy boundary at 8.0 to avoid double-counting milkyway's baked
+                           # stars" is void — that boundary assumed the diffuse map contained the
+                           # Tycho field, which it does NOT (the milkyway_2020 vs starmap_2020 spike
+                           # density was measured identical: the old comment was empirically false).
+                           # With a truly starless Layer B, EVERY visible star must come from Layer A,
+                           # so the catalog now extends to ~11 to repopulate the faint field as sharp,
+                           # correctly-lensed point sources (Interstellar/DNGR approach). Re-run
+                           # scripts/ingest_stars.py after changing this (mag_limit is applied at ingest).
   mag_zero_point: 0.0      # linear flux = 10^(-0.4*(Vmag - mag_zero_point)); sets overall scale
   # --- Layer A: point-star gather (Formula 13) ---
   star_grid_cols: 720      # equirect candidate-cell grid columns (azimuth phi')
@@ -86,7 +92,14 @@ starfield:
   caustic_delta_min: 1.0e-3 # minor ellipse axis delta- below this => on a caustic => clamp mu
   g_beaming: false         # volumetric g^4 Doppler hook for stars (false => g==1; static camera)
   # --- Layer B: diffuse Milky Way (anisotropic EWA) ---
-  diffuse_map: star_image/milkyway_2020_16k.exr  # low-frequency galaxy band (Layer B only)
+  diffuse_map: star_image/starmap_final.exr  # STARLESS galaxy band (Layer B only). Was
+                           # milkyway_2020_16k.exr, but that plate still carried the full baked
+                           # point-star field (verified: ~2% of lit px were sharp >10x spikes), which
+                           # the anisotropic EWA footprint smears into directional streaks at wide-FOV
+                           # screen edges (the edge-elongation artifact). starmap_final.exr is
+                           # starmap_2020_16k run through StarNet2 + a gnomonic-reprojection polar pass
+                           # (see star_image/starmap_workflow.md): sharp >10x spikes drop 46x to 0.045%,
+                           # so EWA has no point sources to stretch. Stars are now drawn ONLY by Layer A.
   diffuse_width: 16384     # equirect diffuse map width; LOD uses log2(width)
   ewa_max_taps: 8          # max anisotropic taps along the major ellipse axis
   jacobian: finite_diff    # finite_diff | geodesic_deviation (FD shipped; deviation = future upgrade)

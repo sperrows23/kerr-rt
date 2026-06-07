@@ -133,7 +133,9 @@ starfield:
   format: auto             # auto | hyg | bsc5  (auto -> by source_catalog extension)
   source_catalog: star_image/hyglike_from_athyg_v32.csv
   catalog_path: assets/stars.npy            # ingest output (.npy written here)
-  mag_limit: 6.5           # drop stars fainter than this apparent V (~naked-eye)
+  mag_limit: 11.0          # drop stars fainter than this apparent V (~Tycho-2; raised
+                           # from 6.5→8.0→11.0 — Layer B is now starless, so Layer A
+                           # alone carries the full star field; see PROJECT.md §6 2026-06-07)
   mag_zero_point: 0.0      # flux = 10^(-0.4*(Vmag - mag_zero_point)); overall scale
 ```
 
