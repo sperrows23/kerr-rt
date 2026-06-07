@@ -56,6 +56,9 @@ python scripts/thumb.py --res 256 --frame 0
 
 # CUDA smoke test (confirms sm_120 / Blackwell JIT)
 python tests/cuda_smoke_test.py
+
+# DNGR Layer-B starless gate (no args = check the configured diffuse_map)
+python scripts/check_starless_map.py
 ```
 
 ---

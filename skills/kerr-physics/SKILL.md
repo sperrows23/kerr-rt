@@ -461,6 +461,21 @@ Where our architecture structurally diverges from DNGR (the part to review):
    celestial sphere is `r = ∞`. Small truncation residual; raise `r_max` or
    extrapolate if {θ′, φ′} convergence ever matters. Not the dominant effect.
 
+> **Status note (2026-06-07):** divergences 1 & 2 above describe the *legacy
+> `texture` mode* and are **resolved in the shipped `dngr` mode** (Formula 13,
+> §8). Stars now come from the point-star catalog (Layer A) and are brightened by
+> µ, not blurred — they stay sharp. Layer B (the EWA-filtered diffuse plate) is
+> now a **genuinely starless** map (`starmap_final.exr`); EWA only ever sees
+> low-frequency dust/galaxy light, so the "EWA still blurs point stars" caveat in
+> item 2 no longer bites in practice. The acceptance bar for a Layer-B plate is
+> **no resolvable point sources**: every feature must be broader than the widest
+> per-pixel EWA footprint (≈ the 90°-corner minor axis), i.e. no isolated local
+> maxima above the smooth diffuse band (measured: sharp >10× spikes ≤ ~0.05% of
+> lit pixels). A plate that merely *dims* stars is NOT acceptable — the smear
+> depends on a point source being present, not on its brightness. This bar is
+> enforced by `scripts/check_starless_map.py` (run it on any candidate Layer-B
+> plate; it exits non-zero unless the >10× spike fraction clears 0.05%).
+
 Verified separately: the brown "starless" wash in `scripts/gpu_test_disk.png`
 is the **lensed/embedded accretion disk** (camera at `r=18`, inside `r_outer=25`,
 near the equatorial plane → nearly every ray accumulates disk emission), NOT

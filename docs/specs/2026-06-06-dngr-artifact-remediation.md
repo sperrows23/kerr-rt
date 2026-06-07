@@ -339,6 +339,15 @@ i.e. the tests are sound to *guide* this fix, which was the owner's gating premi
 
 ### 7.1 Artifact A (smear) — RESOLVED (`dngr` promoted)
 
+> **⚠ Superseded in part (2026-06-07):** the premise below that `milkyway_2020_16k`
+> "omits everything brighter than ~8.0" was later **measured false** — the milkyway
+> plate carried the full baked star field (sharp-spike density identical to
+> `starmap_2020`). The `mag_limit: 6.5 → 8.0` "A/B energy boundary" reasoning is
+> therefore void. Layer B was swapped to the StarNet2-starless `starmap_final.exr`
+> and `mag_limit` raised to **11.0** (Layer A now carries the entire star field;
+> `assets/stars.npy` re-ingested to 115 324 stars). See PROJECT.md §6 (2026-06-07).
+> The §7.1 smear resolution itself (anisotropic EWA, `dngr` default) still stands.
+
 Owner decision: **promote `dngr` to default AND close the magnitude-coverage gap.**
 
 The default-switch review found a real gap a naïve flip would have shipped:
