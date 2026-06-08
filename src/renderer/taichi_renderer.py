@@ -115,6 +115,7 @@ mw_h: ti.Field = None  # type: ignore[assignment]
 _MW_N_LEVELS = 1
 _MW_MAX_LOD = 0.0
 _MW_WIDTH = 16384.0
+_MW_GAIN = 1.0  # Layer-B diffuse brightness multiplier (starfield.diffuse_gain)
 # Formula-13 scalars (baked at setup from configs/render.yaml: starfield.*).
 _DNGR = 0  # 0 = texture (legacy F10), 1 = dngr (two-layer)
 _STAR_COLS = 720
@@ -259,7 +260,7 @@ def _setup_dngr(cfg: dict) -> None:
     against them (the same pattern as ``_J_FOLD`` / ``_MAX_LOD``).
     """
     global cat_theta, cat_phi, cat_flux, cell_start, cell_count
-    global mw_flat, mw_off, mw_w, mw_h, _MW_N_LEVELS, _MW_MAX_LOD, _MW_WIDTH
+    global mw_flat, mw_off, mw_w, mw_h, _MW_N_LEVELS, _MW_MAX_LOD, _MW_WIDTH, _MW_GAIN
     global _DNGR, _STAR_COLS, _STAR_ROWS, _STAR_CELL_R, _STAR_PSF, _PSF_TRUNC
     global _MAG_CLIP, _CAUSTIC_DMIN, _EWA_MAX_TAPS, _G_BEAMING
 
@@ -274,6 +275,7 @@ def _setup_dngr(cfg: dict) -> None:
     _CAUSTIC_DMIN = float(sf.get("caustic_delta_min", 1.0e-3))
     _EWA_MAX_TAPS = int(sf.get("ewa_max_taps", 8))
     _G_BEAMING = 1 if bool(sf.get("g_beaming", False)) else 0
+    _MW_GAIN = float(sf.get("diffuse_gain", 1.0))  # Layer-B brightness multiplier (render-time)
 
     if _DNGR == 1:
         # --- Layer A: point-star catalog → CSR cell grid ---
@@ -1174,6 +1176,7 @@ def _dngr_shade(py, px, height, width, th_p, ph_p, d_omega):
         diffuse = acc / ti.cast(ntaps, ti.f32)
     else:
         diffuse = _mw_sample_trilinear(u, v, _MW_MAX_LOD)
+    diffuse *= _MW_GAIN  # Layer-B brightness control (starfield.diffuse_gain; 1.0 = identity)
 
     # --- Layer A: point-star energy gather (flux · μ · g⁴ · Gaussian PSF) ---
     # Placement of each catalog star's splat follows Formula 13 guards (b) + (b′):

@@ -100,7 +100,8 @@ def beauty_frame() -> dict:
     read independently:
       nan_count     : number of NaN pixels in the HDR buffer
       doppler_ratio : max(left, right) / min(left, right) half-frame mean luminance
-      disk_max      : peak HDR value (the g⁴-beamed disk edge, Pipe B)
+      disk_max      : peak disk emission (g⁴-beamed disk edge, Pipe B) — read from
+                      disk_buf RGB, so it is independent of background star brightness
     """
     if not _CAMERA_PATH.exists():
         pytest.skip(f"camera_matrix.json not found at {_CAMERA_PATH}")
@@ -140,9 +141,13 @@ def beauty_frame() -> dict:
     right = float(lum[:, w // 2 :].mean())
     doppler_ratio = max(left, right) / max(min(left, right), 1e-9)
 
-    # With the disk on, the global peak pixel IS the beamed disk edge (frame max
-    # == disk_buf max), so hdr.max() guards the disk emission peak via public API.
-    disk_max = float(np.nan_to_num(hdr).max())
+    # Disk emission peak (Pipe B) read straight from the disk buffer's RGB, so the
+    # guard is robust to background brightness: with luminous Layer-A stars the
+    # global frame max can be a lensed star, not the disk. disk_buf = (disk_rgb,
+    # transmittance) and the final pixel is disk_rgb + transm*bg, so the max over
+    # disk_buf[..., :3] is the beamed disk edge independent of the sky behind it
+    # (at the peak transm≈0, so it matches the historical frame-max reference).
+    disk_max = float(np.nan_to_num(tr.disk_buf.to_numpy()[:, :, :3]).max())
 
     # Spin-axis meridian seam guard (A4). The committed center-seam fix collapses
     # escaped pixels straddling the spin-axis meridian caustic to the coarsest mip,

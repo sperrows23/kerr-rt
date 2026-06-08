@@ -15,3 +15,4 @@ camera_matrix.json
 # Preview / diagnostic / GPU-test images
 scripts/*.png
 
+gemini_api/

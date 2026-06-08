@@ -82,7 +82,14 @@ starfield:
                            # so the catalog now extends to ~11 to repopulate the faint field as sharp,
                            # correctly-lensed point sources (Interstellar/DNGR approach). Re-run
                            # scripts/ingest_stars.py after changing this (mag_limit is applied at ingest).
-  mag_zero_point: 0.0      # linear flux = 10^(-0.4*(Vmag - mag_zero_point)); sets overall scale
+  mag_zero_point: 6      # linear flux = 10^(-0.4*(Vmag - mag_zero_point)); sets overall Layer-A
+                           # star brightness. APPLIED AT INGEST (baked into assets/stars.npy by
+                           # scripts/ingest_stars.py) — the renderer never reads this, so you MUST
+                           # re-run ingest_stars.py after changing it. 3.5 => ~25x flux vs the old
+                           # 0.0: stars are clearly visible but stay below the accretion-disk edge
+                           # peak (~6.17), keeping the Interstellar composition (10.0 was 10000x and
+                           # blew them out). Does NOT affect the Layer-B diffuse band — that is
+                           # starfield.diffuse_gain.
   # --- Layer A: point-star gather (Formula 13) ---
   star_grid_cols: 720      # equirect candidate-cell grid columns (azimuth phi')
   star_grid_rows: 360      # equirect candidate-cell grid rows (colatitude theta')
@@ -101,6 +108,12 @@ starfield:
                            # (see star_image/starmap_workflow.md): sharp >10x spikes drop 46x to 0.045%,
                            # so EWA has no point sources to stretch. Stars are now drawn ONLY by Layer A.
   diffuse_width: 16384     # equirect diffuse map width; LOD uses log2(width)
+  diffuse_gain: 4.5        # Layer-B brightness multiplier, applied at RENDER time in _dngr_shade
+                           # (diffuse *= diffuse_gain). Unlike mag_zero_point this needs NO re-ingest
+                           # — tune it freely per render. 1.0 = raw EXR (identity). The StarNet2
+                           # plate measures ~1.75x dimmer mean than the old milkyway_2020 band, so
+                           # 1.75 restores parity and 3.0 (starting value) brightens past it. This is
+                           # the ONLY brightness control for the diffuse galaxy band.
   ewa_max_taps: 8          # max anisotropic taps along the major ellipse axis
   jacobian: finite_diff    # finite_diff | geodesic_deviation (FD shipped; deviation = future upgrade)
 

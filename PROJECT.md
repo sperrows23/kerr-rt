@@ -421,7 +421,7 @@ export_camera.py(in Blender) ──▶ camera_matrix.json ──▶ gpu_test.py 
 | `render` | `width`/`height` (4K), `thumb_width/height` (256), `max_steps_pipe_a` (800 — Pipe B shares this same trace loop / step cap; raised from 250 because the CKS affine λ advances ~1 coord-unit/step vs BL Mino ~r²/step), `d_lambda_pipe_a` (0.25 — CKS affine step; far-field h≈dλ, shrunk near the horizon), `r_max` (50 M), `device_memory_gb` (6), `horizon_epsilon` (0.05 — CKS-6 capture margin, cost bound only), `adaptive_step_floor` (0.02), `j_fold` (0.15 — background LOD fold-saturation; under CKS this only guards the equirect texture poles, the BH spin-axis seam is gone), `fps` (24.0 — shutter arc = Δφ·fps·shutter_fraction), `projection_mode` (perspective\|equirect), `depth_infinity` (1e5 no-disk Z sentinel). *(The BL `sin2_min` 1/sin²θ polar guard was removed — CKS has no spin-axis coordinate singularity.)* |
 | `disk` | `r_inner`, `r_outer`, `theta_half_width`, `T_0`, `emission_coeff`, `absorption_coeff`, `vertical_sigma_frac` (the bbox `|u|` early-out bound is now **derived** as `sin(theta_half_width)` in code — the old `bounding_sin_theta_half` literal was removed, §7 S2) |
 | `starmap` | `path` (relative to repo root), `width` (16384 — used to compute LOD) |
-| `starfield` | **DNGR background (Formula 13 / §8).** `mode` (`texture`\|`dngr`; texture default keeps the legacy F10 path + golden frames). *Ingest:* `format` (auto\|hyg\|bsc5), `source_catalog` (HYG/ATHYG csv or `bsc5.dat`), `catalog_path` (`assets/stars.npy`), `mag_limit` (6.5), `mag_zero_point` (0.0). *Layer A (point stars):* `star_grid_cols/rows` (candidate cell grid), `star_cell_radius`, `star_psf_px` (PSF σ), `psf_trunc_sigma`, `mag_clip` (μ cap), `caustic_delta_min` (δ⁻ floor), `g_beaming` (g⁴ hook, default off). *Layer B (diffuse):* `diffuse_map` (Milky-Way EXR), `diffuse_width`, `ewa_max_taps`, `jacobian` (`finite_diff`). The Layer-A/B fields load only in `mode=dngr` |
+| `starfield` | **DNGR background (Formula 13 / §8).** `mode` (`texture`\|`dngr`; texture default keeps the legacy F10 path + golden frames). *Ingest:* `format` (auto\|hyg\|bsc5), `source_catalog` (HYG/ATHYG csv or `bsc5.dat`), `catalog_path` (`assets/stars.npy`), `mag_limit` (11.0), `mag_zero_point` (3.5 — **ingest-time**; baked into `stars.npy`, the renderer never reads it, so re-ingest after editing). *Layer A (point stars):* `star_grid_cols/rows` (candidate cell grid), `star_cell_radius`, `star_psf_px` (PSF σ), `psf_trunc_sigma`, `mag_clip` (μ cap), `caustic_delta_min` (δ⁻ floor), `g_beaming` (g⁴ hook, default off). *Layer B (diffuse):* `diffuse_map` (Milky-Way EXR), `diffuse_width`, `diffuse_gain` (render-time band brightness ×, default 1.0; no re-ingest), `ewa_max_taps`, `jacobian` (`finite_diff`). The Layer-A/B fields load only in `mode=dngr` |
 | `camera` | `default_radius` (6.03 M), `default_fov_deg` (90°), `shutter_fraction` (1/48 s — `export_exr._shutter_arc` reads this with `render.fps` as `arc = Δφ·fps·shutter_fraction`) |
 | `thumb` | preview-only framing overrides (camera radius/fov/theta, background, glow, exposure, gamma) |
 | `output` | directory names and filename prefixes for the EXR sequences |
@@ -511,10 +511,26 @@ band median, i.e. median over the *positive* pixels, since a cleaned plate is
 mostly hard zeros). It exits non-zero unless sharp >10× spikes ≤ 0.05% of lit
 pixels; `starmap_final` passes at 0.031%, `starmap_2020`/`milkyway_2020` fail at
 ~2.1% (the disproof, reproduced). Run it on any candidate Layer-B plate.
-**Open follow-up:** with the starless plate the diffuse band reads dim — an owner
-`--no-disk` test render confirmed the background is on the dark side. Cross-layer
-brightness is set by `starfield.mag_zero_point` (currently 0.0); a look-tuning
-pass on it is expected once a real BH frame is graded. Not a correctness bug.
+**Background brightness (2026-06-07, follow-up).** The starless plate reads dim,
+and an owner `--no-disk` test bumping `mag_zero_point` 0→10 changed *nothing* —
+root-caused to two facts: (1) `mag_zero_point` is an **ingest-time** parameter
+(baked into `assets/stars.npy` by `ingest_stars.py:261`); the renderer never reads
+it, so editing `render.yaml` is a no-op until you re-ingest. (2) Even re-ingested,
+it only scales **Layer A point stars** — the **Layer B diffuse band had no
+brightness control at all** (`_dngr_shade` returned the raw EXR sample). **Fix:**
+added `starfield.diffuse_gain` (default 1.0 = identity), applied at render time as
+`diffuse *= _MW_GAIN` in `_dngr_shade` — tunable per render with **no re-ingest**.
+Live config: `diffuse_gain: 3.0` (the StarNet2 plate is ~1.75× dimmer mean than the
+old milkyway band, so 1.75 restores parity, 3.0 brightens past it) and
+`mag_zero_point: 3.5` (≈25× stars: clearly visible but kept **below** the disk-edge
+peak ~6.17 so the disk stays the dominant feature — 5.0/100× made a lensed star
+outshine the disk, 10.0/10000× blew it out), re-ingested. Both are look-tuning
+starting points, not correctness values. **Test follow-on:** brightening Layer A
+exposed a latent assumption in `test_disk_peak_matches_reference` — it used the
+**global frame max** (`hdr.max()`) as a disk-peak proxy, which only holds while the
+disk is the brightest pixel. Fixed it to read the disk emission straight from
+`tr.disk_buf[..., :3]` (the final pixel is `disk_rgb + transm·bg`, so this is the
+beamed disk edge independent of the sky); reference 6.1667 unchanged, 44/44 pass.
 
 The full 5-phase optimization from `guid.md` (the now-superseded source spec) is
 **complete** and committed. Condensed history (the Phase-1 `[y,u,…]` / Θ_u / φ-wrap
@@ -887,7 +903,9 @@ starfield:
   source_catalog: star_image/hyglike_from_athyg_v32.csv
   catalog_path: assets/stars.npy            # {θ',φ',flux_rgb}
   mag_limit: 11.0            # Layer A catalog depth (~Tycho-2); was 8.0 — see §6 2026-06-07
+  mag_zero_point: 3.5        # Layer-A star flux scale (INGEST-time → re-ingest after change); see §6
   diffuse_map: star_image/starmap_final.exr   # Layer B only — STARLESS (low-freq); was milkyway_2020_16k.exr
+  diffuse_gain: 3.0          # Layer-B band brightness × (RENDER-time, no re-ingest); 1.0 = raw EXR
   star_grid_cols: 720; star_grid_rows: 360  # Layer-A candidate cell grid
   star_psf_px: 1.3           # gaussian PSF σ (px)
   mag_clip: 50.0             # cap on lensing brightness gain (caustic safety)
@@ -912,7 +930,7 @@ frames bit-for-bit; keep `pytest` green + a new `test_starfield_dngr.py`.
 | 1 | Catalog ingest → `{θ′,φ′,flux_rgb}.npy`; B−V→RGB reuse | ✅ **shipped** — `scripts/ingest_stars.py`; HYG/ATHYG csv **+** BSC5; blackbody-from-B−V |
 | 2 | FD beam Jacobian + `mag`; ellipse `(δ⁺,δ⁻,µ)` | ✅ **shipped** — `_dngr_shade` (μ→1 flat verified) |
 | 3 | Layer A star gather (cell grid) + PSF splat | ✅ **shipped** — CSR cell grid + Gaussian PSF |
-| 4 | Layer B anisotropic EWA diffuse fetch | ✅ **shipped** — `starfield.diffuse_map` (STARLESS `starmap_final.exr` since 2026-06-07; was `milkyway_2020_16k.exr`), EWA major-axis taps |
+| 4 | Layer B anisotropic EWA diffuse fetch | ✅ **shipped** — `starfield.diffuse_map` (STARLESS `starmap_final.exr` since 2026-06-07; was `milkyway_2020_16k.exr`), EWA major-axis taps; render-time `diffuse_gain` brightness × (2026-06-07) |
 | 5 | Config gate, A/B harness, validation suite | ✅ **shipped** — `mode` gate + `tests/test_starfield_dngr.py`; Layer-B starless gate = `scripts/check_starless_map.py` |
 | 6 (opt) | Geodesic-deviation Jacobian upgrade | **open** — future fidelity upgrade (new ODE) |
 
