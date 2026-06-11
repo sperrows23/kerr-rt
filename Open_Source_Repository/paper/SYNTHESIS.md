@@ -29,7 +29,7 @@ Both models agree on these (sources noted); use as **regression anchors**, not h
 | ISCO r_ms | ≈ **1.18 M** | BPT72 & NT agree (Flash variants 1.16–1.18 M from series vs. exact Z₁,Z₂ cubic) |
 | Photon orbit r_ph | → 1 M as a→M (≈1.18 M near-extremal) | BPT72 |
 | LNRF orbital speed v^(φ) at ISCO | **½ c** (a→M limit) | BPT72 — both models stress: *not* ultrarelativistic |
-| Radiative efficiency η = 1 − Ẽ(r_ms) | **≈ 0.30** at a=0.999; **0.42** extremal limit; 0.057 at a=0 | ⚠ see §7 discrepancy |
+| Radiative efficiency η = 1 − Ẽ(r_ms) | **≈ 0.30** at a=0.999 (use this); 0.42 = a→M ceiling; 0.057 at a=0 | Resolved (§7). Not in SKILL.md → put in `configs/render.yaml` if/when used. |
 
 ---
 
@@ -47,7 +47,15 @@ Both models agree on these (sources noted); use as **regression anchors**, not h
 - Constraint monitor ξ = g_μν k^μ k^ν as an in-flight accuracy guard.
 - **BL pole fix:** if the normalization drifts near θ = 0/π, roll back and take one forward-Euler step at Δλ/9. ⚠ **Lower priority in CKS** — the BL polar coordinate singularity does *not* exist in Cartesian Kerr-Schild (both models note this), so this trick is informative but largely moot for our path.
 
-**Validation targets (GRay fitting formulae):** ⟨R(a,i)⟩ and asymmetry A(a,i) give ground-truth shadow radius/asymmetry. Both models flag the exact coefficients were partly undecoded in source — **re-fetch GRay §4 from the original before using them as a numeric gate.**
+**Validation targets (GRay fitting formulae, eqs. 11–14) — VERIFIED 2026-06-11** against the full paper text (`paper/paper.md` lines 84–92; the earlier `1303.5057v1.md` had these `formula-not-decoded`/image-dropped). ⟨R(a,i)⟩ and asymmetry A(a,i) give ground-truth shadow radius/asymmetry; **all trig arguments are in degrees**. The actual published forms are:
+
+$$R \simeq R_0 + R_1\cos(2.14\,i - 22.9°)$$
+$$R_0 = (5.2 - 0.209a + 0.445a^2 - 0.567a^3)\,M,\quad R_1 = \left[0.24 - \frac{3.3}{(a-0.9017)^2+0.059}\right]\times10^{-3}\,M$$
+$$A \simeq A_0\,\sin^{n} i,\quad A_0 = (0.332a^3 + 0.176a^{21.7} + 0.0756a^{195})\,M,\quad n = 1.55(1-a)^{-0.022} + 1.3(1-a)^{0.98}$$
+
+Note the actual structure: R is a **single cosine** in inclination (not a power series in i); R₁ is a **Lorentzian** in a (not a polynomial); A is a **power law** `sinⁿ i` with large fractional exponents. The Flash pass had earlier *recalled* a completely different (polynomial-in-i, ×10⁻⁴/⁻⁸/⁻⁵/⁻⁹) parametrization — **that recalled set was WRONG and has been discarded.**
+
+Worked check against the verified formula: a=0.999, i=60° ⟹ R₀≈4.870, R₁≈−0.048, cos(105.5°)≈−0.267 ⟹ ⟨R⟩ ≈ **4.88 M** (the recalled ⟨R⟩≈4.88 coincidentally matched); A₀≈0.565, n≈1.806 ⟹ A ≈ **0.44 M** (the recalled A≈0.045 was wrong by ~10×). These are now a usable numeric regression gate. Note (both models): significant D-shape asymmetry appears only for a ≳ 0.99 **and** i ≳ 60°.
 
 ---
 
@@ -106,11 +114,11 @@ For flicker-free, IMAX-grade output (relevant to our offline renderer, not real-
 
 **Strong agreement (Flash ≡ Sonnet):** all critical-radius formulae and a=0.999 values; the geodesic constants E/L/Q and RHS; the NT/Page–Thorne flux profile and zero-torque ISCO BC; the I_obs = g³B_ν redshift law; the BL→CKS coordinate caveat; the LUT implementation strategy.
 
-**Flagged discrepancies / cautions:**
-- ⚠ **Radiative efficiency at a = 0.999.** Sonnet's NT pass and the BPT72 passes quote the **extremal (a=M) 42.3%**; Flash's NT pass gives **≈30% at a=0.999** specifically. Both are right at their stated spin — 0.42 is the a→M limit, ~0.30 is the actual a=0.999 value. Use **η ≈ 0.30 for a=0.999**; treat 0.42 as the asymptotic ceiling. Confirm against `SKILL.md` before coding.
-- ⚠ **GRay shadow-fit coefficients** (⟨R⟩, A) were partly `formula-not-decoded` in both extractions — re-fetch from the published GRay before using as numeric tests. Flash's quoted coefficient values are therefore **unverified**.
-- ⚠ **Temperature exponent.** r^(−3/4) (bolometric T_eff, = Decision B) vs r^(−17/9) (a regional vertical-structure law). Use r^(−3/4); see §4.
-- ⚠ Luminet quotes r_in = 1.24 M at a = **0.998** (not 0.999) — consistent with our ≈1.18 M at 0.999, just a different spin; don't cross-wire the two.
+**Flagged discrepancies — RESOLVED 2026-06-11** (human-reviewed; resolutions baked into §2–§4 above):
+- ✅ **Radiative efficiency at a = 0.999.** Sonnet/BPT72 quoted the **extremal (a=M) 42.3%**; Flash's NT pass gave **≈30% at a=0.999**. Both correct at their stated spin. **Decision: η ≈ 0.30 for a=0.999**; 0.42 is the a→M asymptotic ceiling, not the working value. SKILL.md currently specifies no η — if/when efficiency enters the renderer it belongs in `configs/render.yaml`, not hardcoded (config-driven policy); extend SKILL.md only with explicit human sign-off.
+- ✅ **GRay shadow-fit coefficients** (⟨R⟩, A) — **RESOLVED & VERIFIED.** The full paper text was loaded (`paper/paper.md`, eqs. 11–14, lines 84–92) and the actual published forms transcribed into §3. The coefficients Flash had *recalled* earlier turned out to be **entirely wrong** — a different algebraic structure (polynomial-in-i with ×10⁻⁴/⁻⁸/⁻⁵/⁻⁹ scalings) that matches no formula in this paper; they have been **discarded**. The real fits: R is a single cosine in inclination with a Lorentzian R₁(a); A is a `sinⁿ i` power law. Verified worked values: a=0.999,i=60° → ⟨R⟩≈4.88 M (recalled value coincidentally right), A≈0.44 M (recalled 0.045 was wrong ~10×). **Decision: these verified fits are now a usable regression gate.** (Vindicates CLAUDE.md: recalled formulae are not authoritative — only 1 of the recalled numbers survived contact with the source.)
+- ✅ **Temperature exponent.** **Decision: r^(−3/4)** — the bolometric T_eff law, which *is* SKILL.md **Decision B** `T = T₀(6/r)^0.75` (verified against SKILL.md line 942). The r^(−17/9) figure is a Shakura–Sunyaev *vertical-structure* regional law, **not** the bolometric T_eff — do not conflate (see §4).
+- ✅ **Luminet spin.** Luminet's r_in = 1.24 M is at a = **0.998**, fully consistent with our **1.18 M at a = 0.999** (SKILL.md Formula 2) — just a different spin. **Decision: keep the two spins distinct; don't cross-wire.**
 
 ---
 
@@ -120,6 +128,6 @@ For flicker-free, IMAX-grade output (relevant to our offline renderer, not real-
 2. **Disk shading:** CPU-precompute f_NT(r) LUT for a=0.999 → T_eff(r) → B_ν; emission = 0 inside r_ms. (NT + Page–Thorne.)
 3. **Relativistic transfer:** evaluate u^μ, g, apply I_obs = g³B_ν(T_eff). (Unanimous.)
 4. **Anti-aliasing pass:** ray-bundle deviation for star/disk filtering + analytic motion blur. (DNGR.)
-5. **Validation gates:** D-shaped shadow at high i; v^(φ)→½ at ISCO; F(r_ms)=0; blue/red limb asymmetry; (after re-fetch) GRay ⟨R⟩/A fits. (BPT72 + GRay + Luminet.)
+5. **Validation gates:** D-shaped shadow at high i; v^(φ)→½ at ISCO; F(r_ms)=0; blue/red limb asymmetry; GRay ⟨R⟩/A fits (eqs. 11–14, verified — §3). (BPT72 + GRay + Luminet.)
 
 > All numeric formulas above are reproduced for orientation. Before they enter any kernel, confirm the exact form in `skills/kerr-physics/SKILL.md`; if a paper's formula appears to conflict with the skill file, **flag for human review rather than substituting it** (CLAUDE.md policy).
