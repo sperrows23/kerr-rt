@@ -73,6 +73,19 @@ $$\mathcal{F}=1-2a_*r_*^{-3/2}+a_*^2r_*^{-2},\ \mathcal{G}=1-2r_*^{-1}+a_*r_*^{-
 **Emitted surface flux (NT closed form, Flash-extracted, cross-checks Page–Thorne integral):**
 $$F(r)=\frac{3M\dot{M}_0}{8\pi r^3}\,\frac{\mathcal{Q}(r)}{\mathcal{B}\,\mathcal{C}^{1/2}\,\mathcal{D}^{1/2}}, \qquad \mathcal{Q}(r)=\mathcal{B}\mathcal{C}^{1/2}\!\int_{r_{ms}}^{r}\frac{\tilde{E}\,\tilde{L}'-\tilde{L}\,\tilde{E}'}{\mathcal{B}\mathcal{C}^2\mathcal{D}^{1/2}}\,dr$$
 
+> **✅ VERIFIED & PROMOTED TO SKILL.md (2026-06-12).** The owner supplied a clean,
+> equation-intact source (`paper/1104.5499v3.md`, Page-Thorne 1974 via
+> Abramowicz-Fragile 2013). The **conservation-law integral** above was confirmed,
+> and its **canonical closed form** (cubic roots `y₁,y₂,y₃` of `y³−3y+2a=0`, the
+> `B`/`C` functions, and a three-log `bracket(y)`) is now the authoritative
+> implementation form: **`SKILL.md` Formula CKS-11** (SKILL.md rev v1.10). The
+> closed form was numerically checked to reproduce the integral to 5 sig figs over
+> r∈[1.5,28] M at a=0.999; guard = `tests/test_disk_flux.py`. The earlier ⛔
+> "blocked Piece-2" `Q/(B C^{1/2} D^{1/2})` transcription was a *different,
+> unverified* parametrization and was **discarded** (the `D` function is not needed
+> — it folds into the closed form). **Status: formula verified, kernel not yet
+> wired** — see PROJECT.md §7 backlog **D1** for the implementation path.
+
 **Both models agree on the key boundary behavior:**
 - **Zero-torque inner BC:** W(r_ms) = 0 ⟹ F(r_ms) = 0. This is what produces the disk's sharp dark inner edge. Inside r_ms gas plunges on geodesics and does not radiate (set emission = 0).
 - F(r) rises to a sharp peak just outside r_ms, then falls as ~r⁻³.
@@ -125,7 +138,7 @@ For flicker-free, IMAX-grade output (relevant to our offline renderer, not real-
 ## 8. Recommended Implementation Order (for the CKS GPU path)
 
 1. **Geodesic kernel:** CKS metric + super-Hamiltonian (or Carter-reduced) RHS from `SKILL.md`; adaptive step ∝ (r−r₊)/r; stop at r₊+δ; ξ-constraint monitor. (BPT72 + GRay + DNGR.)
-2. **Disk shading:** CPU-precompute f_NT(r) LUT for a=0.999 → T_eff(r) → B_ν; emission = 0 inside r_ms. (NT + Page–Thorne.)
+2. **Disk shading:** CPU-precompute f_PT(r) LUT for a=0.999 → T_eff(r) → B_ν; emission = 0 inside r_ms. Use the **verified closed form, SKILL.md Formula CKS-11** (not the §4 Q-integral, which it supersedes for implementation); keep `T₀` as the amplitude knob; g⁴-not-g⁸ bookkeeping (CKS-11 Piece 3). (NT + Page–Thorne; verified 2026-06-12.)
 3. **Relativistic transfer:** evaluate u^μ, g, apply I_obs = g³B_ν(T_eff). (Unanimous.)
 4. **Anti-aliasing pass:** ray-bundle deviation for star/disk filtering + analytic motion blur. (DNGR.)
 5. **Validation gates:** D-shaped shadow at high i; v^(φ)→½ at ISCO; F(r_ms)=0; blue/red limb asymmetry; GRay ⟨R⟩/A fits (eqs. 11–14, verified — §3). (BPT72 + GRay + Luminet.)

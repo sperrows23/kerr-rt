@@ -469,7 +469,10 @@ PART I (retired/reused) formula index:
 | 13 | Hybrid DNGR (rev v1.6): screen-space 2×2 ray-bundle Jacobian J → point-star magnification μ = \|det J₀·sinθ′₀\|/\|det J·sinθ′\| → energy-conserving flux `I = I_base·μ·g⁴` with truncated-Gaussian PSF. Point stars **brighten**, don't smear. **3 guards owner-approved 2026-06-05** and the two-layer render path **shipped** (§8 Phases 2–5): `taichi_renderer._dngr_shade` + `starfield.mode: texture\|dngr` |
 
 Decisions of record (from `CLAUDE.md`): Decision A = ZAMO tetrad (F7); Decision B =
-simple temperature model T = T₀·(6/r)^0.75.
+simple temperature model T = T₀·(6/r)^0.75 **(ACTIVE)**. A physically-correct
+Page-Thorne flux profile is the approved upgrade to Decision B — the formula is
+source-verified and guarded (`SKILL.md` Formula **CKS-11**, `tests/test_disk_flux.py`,
+SKILL.md rev v1.10) but **not yet wired into the kernel**; see §7 backlog **D1**.
 
 ---
 
@@ -640,6 +643,7 @@ re-derive. **`disk.py`, `geodesic.py`/`metric.py` CPU references, and any
 | **3.1/3.2** | Ship depth occlusion (early ray termination vs. Blender ship Z) | **Blocked** on a Blender ship Z-depth EXR asset. Sequence when unblocked: produce the asset → derive & document the Mino-affine ↔ camera-Z mapping → wire `ti.Texture(r32f)` + early-out behind an off-by-default flag → validate on a synthetic plane. **Biggest correctness trap:** `ray_length` is Mino-affine, not metric/Blender-Z | Asset + code |
 | **2.3** | Hardware `ti.Texture` starmap + `sample_lod` | **Deferred (external)** — Taichi 1.7.4 has no mip-upload API; revisit only after a Taichi upgrade is independently justified and re-validated on sm_120 (CLAUDE.md pins 1.7.4) | External |
 | **T3** | Moving-camera observer model (camera peculiar velocity, not just ZAMO) | **Roadmap, gated** — needs a new `SKILL.md` tetrad-boost formula approved (human review) before any code; high risk if rushed (sign/normalization) | Physics (gated) |
+| **D1** | Decision-B physical disk: Page-Thorne flux profile (replaces simple `(6/r)^0.75`) | **Roadmap, formula VERIFIED + owner-approved (2026-06-12)** — closed form is `SKILL.md` Formula **CKS-11** (numerically reproduces the conservation-law flux integral; guard `tests/test_disk_flux.py`; SKILL.md rev v1.10). **Kernel not yet wired.** Implementation = the "wire the LUT" path: CPU-precompute `f_PT(r)` shape LUT → `T_eff=(F/σ)^{1/4}` → swap into the disk kernel **behind a config flag** (keep `T₀` as the amplitude knob; respect the g⁴-not-g⁸ rule, Formula 9 / CKS-11 Piece 3). Active disk stays Decision-B-simple until this lands. | Physics (verified, unwired) |
 
 ### Code-review findings (verified against current code)
 

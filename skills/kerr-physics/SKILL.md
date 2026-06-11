@@ -939,10 +939,65 @@ Do not proceed to rendering until all four pass.
 - [ ] Circular orbit observer (more complex, marginally more accurate in-disk)
 
 **Decision B — Disk temperature model**
-- [x] Simple: `T = T_0 · (6/r)^{0.75}` — fast, already in original code
-- [ ] Novikov-Thorne (1973) flux profile — physically correct, more work
+- [x] Simple: `T = T_0 · (6/r)^{0.75}` — fast, already in original code (ACTIVE)
+- [ ] Page-Thorne (1974) flux profile — physically correct, more work (spec below, **source-VERIFIED 2026-06-12, owner-approved to implement behind a config flag; not yet wired**)
 
 Record the chosen options here once decided and reference them in `CLAUDE.md`.
+
+### Formula CKS-11 — Page-Thorne disk flux profile (VERIFIED; Decision-B upgrade)
+
+> **Status (2026-06-12):** Source-VERIFIED and owner-approved to implement behind a
+> config flag. Supersedes the earlier ⛔ PROVISIONAL transcription (which used a
+> different, unverified `Q/(B C^{1/2} D^{1/2})` parametrization — discarded).
+> **Source:** Page & Thorne (1974) ApJ 191:499, restated in Abramowicz & Fragile
+> (2013) Living Rev. Rel.; supplied as `paper/1104.5499v3.md`. **Verification:** the
+> §3 closed form below was numerically confirmed to reproduce the §1 conservation-law
+> flux integral `F = −Ṁ/(4π√−g)·Ω′/(Ẽ−ΩL̃)²·∫_{r_ms}^r(Ẽ−ΩL̃)L̃′dr` to 5 sig figs
+> across r∈[1.5,28] M for a=0.999, using SKILL.md Formula 3/4 for Ẽ,L̃,Ω; the two
+> forms differ only by the overall constant (`3/2` and √−g = r) that the closed form
+> drops by writing `F ∝ …`. The cubic roots satisfy `y³−3y+2a=0` to machine
+> precision; the bracket → 0 at `y=y₀` (zero-torque BC). This is the standard
+> Page-Thorne function, structure cross-checked. See `tests/test_disk_flux.py`.
+
+Use `y = √(r/M)`, `a_* = a/M`, `y₀ = √(r_ms/M)` with `r_ms = r_isco` (Formula 2).
+
+**Cubic roots** of `y³ − 3y + 2a_* = 0`:
+```
+y₁ = 2·cos[ (arccos(a_*) − π)/3 ]
+y₂ = 2·cos[ (arccos(a_*) + π)/3 ]
+y₃ = −2·cos[ arccos(a_*)/3 ]
+```
+
+**Correction functions** (only B, C needed for the closed form; D not required):
+```
+B = 1 + a_* y^{-3}
+C = 1 − 3 y^{-2} + 2 a_* y^{-3}        # note C = (y³ − 3y + 2a_*)/y³
+```
+
+**Closed-form flux** (proportionality — absolute amplitude is a free calibration,
+carried by `T_0` / `Ṁ`, exactly as in the simple model):
+```
+F(r) ∝ y^{-7} · C^{-1} · bracket(y)        # equivalently r^{-3}·B^{-1}·C^{-1/2}·Q
+
+bracket(y) = (y − y₀) − (3/2)·a_*·ln(y/y₀)
+           − [ 3(y₁−a_*)² / (y₁(y₁−y₂)(y₁−y₃)) ]·ln((y−y₁)/(y₀−y₁))
+           − [ 3(y₂−a_*)² / (y₂(y₂−y₁)(y₂−y₃)) ]·ln((y−y₂)/(y₀−y₂))
+           − [ 3(y₃−a_*)² / (y₃(y₃−y₁)(y₃−y₂)) ]·ln((y−y₃)/(y₀−y₃))
+```
+**Zero-torque inner BC:** `F(r_ms)=0` (bracket → 0 as `y → y₀`); emission ≡ 0 inside
+`r_ms` (gas plunges, does not radiate). **Implementation plan:** precompute the
+dimensionless shape `f_PT(r) = F(r)/F_max` as a 1-D CPU LUT indexed by `r` for fixed
+`a`; the GPU shader reads the LUT (no per-pixel integral or logs).
+
+**Piece 3 — Spectrum & g-bookkeeping** (SAFE — standard, already constrained by
+Formula 9): `T_eff(r) = (F(r)/σ)^{1/4}`, emit a physical Planck `B_ν(T_eff)`.
+**Critical interaction with Formula 9:** the active code multiplies by `pow(g,4)`
+*because* `blackbody_rgb` is chromaticity-only (no T⁴ amplitude). If a physical
+Planck `B_ν` with Stefan-Boltzmann T⁴ amplitude replaces it, the `g⁴` must be
+applied via the `T_obs = g·T_emit` substitution **OR** as an explicit factor —
+**never both** (that is the g⁸ double-count Formula 9 warns about). For the
+volumetric march the bolometric scaling is **g⁴** (Formula 9: 3D volume), not the
+g³ that applies only to a 2D monochromatic surface.
 
 ---
 
@@ -974,6 +1029,8 @@ configs/render.yaml              ← a, r_isco, WIDTH, HEIGHT, step counts, star
 | v1.6 | **F13 guards APPROVED (owner, 2026-06-05)** and the DNGR render path landed (PROJECT.md §8 Phases 2–5): (a) μ normalized by the FD undeflected-reference footprint so μ→1 in flat space; (b) boundary clamp μ=1 on non-ESCAPED neighbours / `J>j_fold`, plus `δ⁻<caustic_delta_min ⇒ μ=min(μ,mag_clip)`; (c) volumetric g⁴ as a `starfield.g_beaming` hook (default g≡1). Two decoupled sky layers in `taichi_renderer.py`: Layer A point-star energy gather (`flux·μ·g⁴·PSF`, cell-grid candidate query) and Layer B anisotropic-EWA diffuse Milky-Way fetch; gated by `starfield.mode: texture\|dngr` (texture default reproduces v1.4 golden frames bit-for-bit). |
 | v1.8 | **PART II — Cartesian Kerr-Schild (CKS) ADDED + APPROVED (owner, 2026-06-06):** the renderer geodesic path migrates BL → CKS to remove the spin-axis (1/sin²θ) and horizon (Δ→0) *coordinate* singularities at the source (the root cause of the user-reported gray polar line and the whole seam-band-aid lineage). New Formulas CKS-1…CKS-10: implicit radius `r(x,y,z)`; metric `g=η+f l⊗l`; **exact** inverse `g=η−f l⊗l` (l is η-null); analytic ∂r/∂f/∂l; Hamiltonian geodesic EOM (`dx=g·p`, `dp=−½∂g·pp`); ZAMO-from-`g^{αβ}` + projected-ray photon init (preserves Decision A); equatorial disk gas velocity `u^x=−Ωy u^t, u^y=Ωx u^t` (no BL→KS Jacobian); CKS g-factor (Δ-bug impossible); seam-free escaped-ray celestial direction. BL Formulas 1/6/7/11/12 marked SUPERSEDED-for-renderer; 2/3/4/8/9/10/13 reused. Verified against GRay2 (arXiv:1706.07062), SpECTRE, Visser (arXiv:0706.0622). |
 | v1.7 | **F13 guard (b′) ADDED + APPROVED (owner, 2026-06-06):** Layer-A splat *placement* rule when `det J` is invalid (spin-axis seam / non-ESCAPED neighbour). The shipped code positioned the splat with the degenerate `J⁻¹`, collapsing all polar-cell stars onto the meridian (the "Artifact B" seam pileup, ≈15× the off-seam jump). (b′) places the splat by the star's true proper angular separation `d² = (Δθ′²+sin²θ′·Δφ′²)/dΩ` under the undeflected footprint `dΩ=|det J₀·sinθ′₀|` (the guard-(a) quantity), so seam stars keep real angular spacing at μ=1. Resolves the dngr-default seam (`test_no_spin_axis_seam`, `test_background_has_no_vertical_seam_stripe`). The matching Formula-10 `texture`-LOD regularization is a separate follow-up (spec §7.2), **not** part of this revision. |
+| v1.9 | **Decision B — physical disk upgrade DRAFTED (PROVISIONAL, owner review pending, 2026-06-11):** added a flagged spec for moving off the simple `(6/r)^0.75` law to the NT/Page-Thorne flux. Piece 1 (NT correction functions B/C/D/F/G) and Piece 3 (physical Planck `B_ν(T_eff)` + the g⁴-not-g⁸ bookkeeping vs Formula 9) are standard/safe; **Piece 2 — the time-averaged flux `F(r)` and `Q(r)` integral — is ⛔ BLOCKED on source verification** (local Page-Thorne `1974ApJ...191.md` is image-dropped, 59 formula-not-decoded; NT `II-48.md` is OCR-garbled), so it is transcribed from SYNTHESIS §4 only and **must not be implemented until confirmed against a clean Page-Thorne 1974 source + owner sign-off** (recalled-formula caution, cf. the GRay coefficient correction same day). No code path changed; ACTIVE disk remains Decision-B-simple. |
+| v1.10 | **Decision B Piece 2 — Page-Thorne flux VERIFIED & UNBLOCKED (2026-06-12).** Owner supplied a clean equation-intact source (`paper/1104.5499v3.md`, Page-Thorne 1974 via Abramowicz-Fragile 2013). The ⛔ PROVISIONAL `Q/(B C^{1/2} D^{1/2})` transcription was **discarded** (different, unverified parametrization) and replaced by the canonical closed-form **Formula CKS-11**: cubic roots `y₁,y₂,y₃` of `y³−3y+2a=0`, correction functions B/C, and the three-log `bracket(y)`. **Verified numerically:** the closed form reproduces the §1 conservation-law flux integral (using Formula 3/4 Ẽ,L̃,Ω) to 5 sig figs over r∈[1.5,28] M at a=0.999, differing only by the overall `3/2·√−g` constant the closed form drops; roots satisfy the cubic to machine precision; zero-torque BC `F(r_ms)=0` holds. Regression guard added: `tests/test_disk_flux.py`. D function not needed (folded into the closed form). Owner-approved to implement behind a config flag; **ACTIVE disk still Decision-B-simple — kernel not yet wired.** |
 
 *Last verified: 2026-06-06 (F13 guard (b′) Layer-A splat-placement rule approved +
 landed; (b′) is a placement regularization derived from the already-verified guard-(a)
