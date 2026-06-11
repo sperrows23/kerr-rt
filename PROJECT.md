@@ -127,7 +127,8 @@ EXR.
   transmittance-weighted Mino-affine depth (sentinel `depth_infinity = 1e5` where
   there is no disk emission).
 - **Verification (the real guard):** `python scripts/gpu_test.py` → right/left
-  Doppler asymmetry ≈ 7–8× (≈ 7.77× baseline) for the a = 0.999 edge-on camera;
+  Doppler asymmetry ≈ 4.3× (4.32× CKS baseline; the retired BL Mino path read
+  7.77×) for the a = 0.999 edge-on camera;
   `oiiotool --info` to confirm channels.
 
 ### Stage 3 — Blender compositor: deep merge + optical FX *(recommended, A2)*
@@ -210,6 +211,9 @@ Black/
 │   ├── thumb.py                 ← CPU preview renderer (development / QA)
 │   ├── gpu_test.py              ← FHD GPU beauty render smoke test
 │   ├── ingest_stars.py          ← offline ingest: HYG/ATHYG csv (or BSC5) → point-star {θ',φ',flux_rgb}.npy (Formula 13 / §8 Layer A)
+│   ├── README_ingest_stars.md   ← standalone guide for the ingest step (API, config, tests)
+│   ├── seam_diagnostics.py      ← spin-axis seam isolation tools (off the render path; §7 C1)
+│   ├── check_starless_map.py    ← DNGR Layer-B starless acceptance gate (§6 2026-06-07)
 │   └── export_exr.py            ← Phase 5: multi-channel RGBAZ EXR writer (OpenImageIO)
 ├── skills/
 │   └── kerr-physics/
@@ -239,7 +243,11 @@ Black/
 ├── render_spaceship/            ← Blender ship EXR sequence — gitignored
 ├── star_image/                  ← 16K HDRI inputs (starmap + milkyway diffuse EXR, HYG csv) — gitignored
 │
+├── docs/
+│   └── specs/
+│       └── 2026-06-06-dngr-artifact-remediation.md  ← dated design record (§7 S4–S7)
 ├── PROJECT.md                   ← this file (the single project reference)
+├── README.md                    ← public-facing overview (points here for depth)
 ├── CLAUDE.md                    ← project instructions and physics policy
 ├── AGENTS.md                    ← mirror of CLAUDE.md for the Codex/Agents harness
 ├── REFERENCE_dngr_paper.md      ← James et al. 2015 (DNGR / Interstellar) — academic source
@@ -368,8 +376,9 @@ null condition `|H|` < 1e-6 along the integrated 8-vector) + a golden-CSV regres
 
 **`tests/test_gpu_regression.py`** — automated GPU beauty regression (the pytest form
 of the manual `gpu_test.py` check). Drives production `render_beauty_frame` (frame
-0, FHD, disk on); asserts NaN==0, right/left Doppler ∈ [7.0, 8.5] (right brighter),
-disk peak ≈ `_DISK_MAX_REF = 12.7707` ±5%. `pytest.mark.gpu`; **skips cleanly**
+0, FHD, disk on); asserts NaN==0, right/left Doppler ∈ [3.8, 4.9] (right brighter;
+CKS baseline 4.32×), disk peak ≈ `_DISK_MAX_REF = 6.1667` ±5%. `pytest.mark.gpu`;
+**skips cleanly**
 without CUDA (Taichi init deferred into a module-scoped fixture).
 
 **`tests/cuda_smoke_test.py`** — confirms the Taichi CUDA backend JITs on this

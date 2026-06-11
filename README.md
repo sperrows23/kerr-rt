@@ -64,7 +64,8 @@ The renderer traces two photon sub-pipelines **per pixel** inside split GPU kern
 The result is a multi-channel scene-linear HDR EXR per frame, ready for compositing.
 
 **Signature verification:** for the `a = 0.999` edge-on camera the right/left disk
-Doppler brightness asymmetry comes out to ≈ **7.8×** — the renderer is gated on this
+Doppler brightness asymmetry comes out to ≈ **4.3×** (under the CKS affine emission
+measure; the retired BL Mino path read ≈7.8×) — the renderer is gated on this
 physical number, not on a golden image alone.
 
 ### Three-phase production pipeline
@@ -107,7 +108,7 @@ pytest tests/
 # Quick CPU thumbnail (256×256, frame 0) — slow but dependency-light, no GPU needed
 python scripts/thumb.py --res 256 --frame 0
 
-# Full-HD GPU beauty smoke render (reports the Doppler asymmetry ≈ 7.8×)
+# Full-HD GPU beauty smoke render (reports the Doppler asymmetry ≈ 4.3×)
 python scripts/gpu_test.py
 
 # Production: write the multi-channel EXR sequence
@@ -190,7 +191,7 @@ python tests/cuda_smoke_test.py     # confirms the sm_120 / Blackwell CUDA JIT
 ```
 
 The GPU regression (`tests/test_gpu_regression.py`) drives the production renderer at
-FHD and asserts: no NaNs, right/left Doppler asymmetry ∈ [7.0, 8.5] (right brighter),
+FHD and asserts: no NaNs, right/left Doppler asymmetry ∈ [3.8, 4.9] (right brighter),
 and disk peak within ±5 % of reference. It is marked `gpu` and skips cleanly on
 machines without CUDA.
 
