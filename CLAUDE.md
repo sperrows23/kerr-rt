@@ -77,7 +77,7 @@ python scripts/check_starless_map.py
 |-------|---------|
 | `skills/kerr-physics/SKILL.md` | All GR and Kerr metric formulas — **mandatory reference** |
    Decision A: ZAMO tetrad (Formula 7)
-   Decision B: Simple temperature model T = T_0·(6/r)^0.75
+   Decision B: Simple temperature model T = T_0·(6/r)^0.75 (default; Page-Thorne CKS-11 available via disk.temperature_model: page_thorne)
 | `skills/taichi-conventions/` | Taichi kernel patterns, field layout, JIT conventions (to be written) |
 | `skills/blender-pipeline/` | Blender headless scripting, camera export, compositor nodes (to be written) |
 

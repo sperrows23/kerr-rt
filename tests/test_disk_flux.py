@@ -24,6 +24,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 import yaml
 
 CONFIG = Path(__file__).resolve().parent.parent / "configs" / "render.yaml"
@@ -113,3 +114,42 @@ def test_closed_form_reproduces_flux_integral():
     vals = ratio[idx]
     # constant across all radii -> same radial profile (the dropped 3/2)
     assert np.allclose(vals, 1.5, rtol=2e-3), vals
+
+
+# --- D1: the production module agrees with the pinned in-test transcription --- #
+def test_module_matches_pinned_transcription():
+    """``renderer.disk_flux`` reproduces the pinned closed form (above) to rtol 1e-10.
+
+    The in-test ``_roots`` / ``_closed_bracket`` / ``_r_isco`` are the independent
+    transcription guard; this asserts the shipped module did not drift from them.
+    """
+    from renderer import disk_flux
+
+    a = _spin()
+    r_isco = _r_isco(a)
+    r = np.linspace(r_isco + 1e-6, 28.0, 2000)
+
+    y = np.sqrt(r)
+    y0 = np.sqrt(r_isco)
+    C = 1 - 3 * y**-2 + 2 * a * y**-3
+    f_pinned = y**-7 * C**-1 * _closed_bracket(y, y0, a)
+
+    assert np.allclose(disk_flux.flux_shape(r, a), f_pinned, rtol=1e-10)
+    assert disk_flux.isco_radius(a) == pytest.approx(r_isco, rel=1e-12)
+
+
+def test_lut_properties():
+    """``build_flux_lut`` returns a clean, peak-normalized, finite shape."""
+    from renderer import disk_flux
+
+    a = _spin()
+    lut, r0, dr = disk_flux.build_flux_lut(a, 25.0, 256)
+
+    assert lut.shape == (256,)
+    assert lut[0] == 0.0  # zero-torque inner BC F(r_isco) = 0
+    assert float(lut.max()) == pytest.approx(1.0)  # peak-normalized
+    assert np.all(np.isfinite(lut))
+    assert np.all(lut >= 0.0)
+    assert 0 < int(lut.argmax()) < 255  # peak is interior, not at either edge
+    assert r0 == pytest.approx(_r_isco(a), rel=1e-12)
+    assert dr > 0.0

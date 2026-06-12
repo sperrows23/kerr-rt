@@ -377,8 +377,10 @@ null condition `|H|` < 1e-6 along the integrated 8-vector) + a golden-CSV regres
 **`tests/test_gpu_regression.py`** — automated GPU beauty regression (the pytest form
 of the manual `gpu_test.py` check). Drives production `render_beauty_frame` (frame
 0, FHD, disk on); asserts NaN==0, right/left Doppler ∈ [3.8, 4.9] (right brighter;
-CKS baseline 4.32×), disk peak ≈ `_DISK_MAX_REF = 6.1667` ±5%. `pytest.mark.gpu`;
-**skips cleanly**
+CKS baseline 4.32×), disk peak ≈ `_DISK_MAX_REF = 6.1667` ±5%. Plus two flag-path
+guards on deepcopied configs (goldens untouched): `page_thorne` renders NaN-free /
+beamed / emitting (D1), and `doppler_strength: 0` collapses the disk-only left/right
+ratio to < 1.5 (knob guard). `pytest.mark.gpu`; **skips cleanly**
 without CUDA (Taichi init deferred into a module-scoped fixture).
 
 **`tests/cuda_smoke_test.py`** — confirms the Taichi CUDA backend JITs on this
@@ -428,7 +430,7 @@ export_camera.py(in Blender) ──▶ camera_matrix.json ──▶ gpu_test.py 
 |---------|-----------|
 | `black_hole` | `spin` (a=0.999), `r_isco` (1.182 M), `r_plus` (1.0447 M — true outer horizon r₊=1+√(1−a²); now documentation-only, both the renderer and `thumb.py` derive r₊ from `spin` via `_horizon_radius`, CKS-6) |
 | `render` | `width`/`height` (4K), `thumb_width/height` (256), `max_steps_pipe_a` (800 — Pipe B shares this same trace loop / step cap; raised from 250 because the CKS affine λ advances ~1 coord-unit/step vs BL Mino ~r²/step), `d_lambda_pipe_a` (0.25 — CKS affine step; far-field h≈dλ, shrunk near the horizon), `r_max` (50 M), `device_memory_gb` (6), `horizon_epsilon` (0.05 — CKS-6 capture margin, cost bound only), `adaptive_step_floor` (0.02), `j_fold` (0.15 — background LOD fold-saturation; under CKS this only guards the equirect texture poles, the BH spin-axis seam is gone), `fps` (24.0 — shutter arc = Δφ·fps·shutter_fraction), `projection_mode` (perspective\|equirect), `depth_infinity` (1e5 no-disk Z sentinel). *(The BL `sin2_min` 1/sin²θ polar guard was removed — CKS has no spin-axis coordinate singularity.)* |
-| `disk` | `r_inner`, `r_outer`, `theta_half_width`, `T_0`, `emission_coeff`, `absorption_coeff`, `vertical_sigma_frac` (the bbox `|u|` early-out bound is now **derived** as `sin(theta_half_width)` in code — the old `bounding_sin_theta_half` literal was removed, §7 S2) |
+| `disk` | `r_inner`, `r_outer`, `theta_half_width`, `T_0`, `emission_coeff`, `absorption_coeff`, `vertical_sigma_frac` (the bbox `|u|` early-out bound is now **derived** as `sin(theta_half_width)` in code — the old `bounding_sin_theta_half` literal was removed, §7 S2), `max_step_vfrac` (0.5 — disk-thickness step cap: inside the slab the geodesic step is shrunk so the vertical displacement `|dz/dλ|·h ≤ vfrac·σ_z`, σ_z=`r·theta_half_width·vertical_sigma_frac`, stopping a steep equatorial crossing from striding over the thin emitting layer and aliasing it into a moiré; no-op for in-plane/edge-on grazers and for the current thick disk, so golden frames are unchanged — `tests/test_disk_step_convergence.py`), `temperature_model` (`simple`\|`page_thorne` — D1 radial-profile selector, default `simple`), `flux_lut_samples` (256 — page_thorne f_PT LUT resolution), `doppler_strength` (1.0 — **visualization-only** exponent `g_eff = g^s` on the CKS-9 shift, feeding both the g⁴ beaming and the blackbody color shift; 1.0 = full physics / golden frames, 0.0 = shift off, the Interstellar/DNGR artistic treatment) |
 | `starmap` | `path` (relative to repo root), `width` (16384 — used to compute LOD) |
 | `starfield` | **DNGR background (Formula 13 / §8).** `mode` (`texture`\|`dngr`; texture default keeps the legacy F10 path + golden frames). *Ingest:* `format` (auto\|hyg\|bsc5), `source_catalog` (HYG/ATHYG csv or `bsc5.dat`), `catalog_path` (`assets/stars.npy`), `mag_limit` (11.0), `mag_zero_point` (3.5 — **ingest-time**; baked into `stars.npy`, the renderer never reads it, so re-ingest after editing). *Layer A (point stars):* `star_grid_cols/rows` (candidate cell grid), `star_cell_radius`, `star_psf_px` (PSF σ), `psf_trunc_sigma`, `mag_clip` (μ cap), `caustic_delta_min` (δ⁻ floor), `g_beaming` (g⁴ hook, default off). *Layer B (diffuse):* `diffuse_map` (Milky-Way EXR), `diffuse_width`, `diffuse_gain` (render-time band brightness ×, default 1.0; no re-ingest), `ewa_max_taps`, `jacobian` (`finite_diff`). The Layer-A/B fields load only in `mode=dngr` |
 | `camera` | `default_radius` (6.03 M), `default_fov_deg` (90°), `shutter_fraction` (1/48 s — `export_exr._shutter_arc` reads this with `render.fps` as `arc = Δφ·fps·shutter_fraction`) |
@@ -478,10 +480,12 @@ PART I (retired/reused) formula index:
 | 13 | Hybrid DNGR (rev v1.6): screen-space 2×2 ray-bundle Jacobian J → point-star magnification μ = \|det J₀·sinθ′₀\|/\|det J·sinθ′\| → energy-conserving flux `I = I_base·μ·g⁴` with truncated-Gaussian PSF. Point stars **brighten**, don't smear. **3 guards owner-approved 2026-06-05** and the two-layer render path **shipped** (§8 Phases 2–5): `taichi_renderer._dngr_shade` + `starfield.mode: texture\|dngr` |
 
 Decisions of record (from `CLAUDE.md`): Decision A = ZAMO tetrad (F7); Decision B =
-simple temperature model T = T₀·(6/r)^0.75 **(ACTIVE)**. A physically-correct
-Page-Thorne flux profile is the approved upgrade to Decision B — the formula is
-source-verified and guarded (`SKILL.md` Formula **CKS-11**, `tests/test_disk_flux.py`,
-SKILL.md rev v1.10) but **not yet wired into the kernel**; see §7 backlog **D1**.
+simple temperature model T = T₀·(6/r)^0.75 **(ACTIVE default)**. The physically-correct
+Page-Thorne flux profile (`SKILL.md` Formula **CKS-11**, guarded by `tests/test_disk_flux.py`,
+SKILL.md rev v1.11) is now **wired behind the config flag `disk.temperature_model: page_thorne`**
+(2026-06-12; CPU-precomputed `f_PT(r)` LUT in `src/renderer/disk_flux.py`, GPU guard in
+`tests/test_gpu_regression.py`) — the simple model stays the default, so golden frames /
+the pinned GPU regression are unchanged; see §7 backlog **D1**.
 
 ---
 
@@ -543,6 +547,26 @@ exposed a latent assumption in `test_disk_peak_matches_reference` — it used th
 disk is the brightest pixel. Fixed it to read the disk emission straight from
 `tr.disk_buf[..., :3]` (the final pixel is `disk_rgb + transm·bg`, so this is the
 beamed disk edge independent of the sky); reference 6.1667 unchanged, 44/44 pass.
+
+**Disk-thickness step cap (2026-06-12).** Fixed a concentric **moiré band** around
+the disk on face-on / steep-crossing views. Root cause: the Pipe-B march sizes its
+geodesic step by horizon distance only (`h = dλ·max(floor, (r−r₊)/r)`, CKS-5) and is
+blind to the disk's vertical extent, so when a ray crosses the equatorial plane
+steeply and the emitting layer is thin, one step strides over the Gaussian density
+(Formula 9) and the layer is sampled 0/1/2× almost at random across the frame —
+aliasing (the user's "shrink the step and it renders normally" is the classic
+under-resolved-quadrature signature). **Fix:** while inside the slab, cap the step's
+**vertical** displacement `|dz/dλ|·h ≤ max_step_vfrac·σ_z`, σ_z=`r·θ_half·σ_frac`
+(`disk.max_step_vfrac`, default 0.5 ≈ 2 samples/σ; `dz/dλ` read for free by hoisting
+RK4's `k1` out via `_rk4_step_k1`, bit-identical to `_rk4_step`). It only bites for
+steep crossings — near-in-plane / edge-on grazers (dz/dλ→0) keep the full step, so it
+adds no cost there and **cannot** push them into `max_steps` (a path-length cap was
+tried and rejected: it throttled edge-on grazers into 76% ray truncation). *Validated:*
+out-of-band pixels and the production thick-disk golden frame 0 are bit-identical (cap
+ON≡OFF to 4 dp, both disk models — so golden frames / pinned regression are unchanged);
+on a thin disk seen face-on the cap cuts divergence-from-ground-truth 0.123→0.002 (56×)
+and the moiré vanishes. Guard: `tests/test_disk_step_convergence.py` (thin slab, top-
+down camera, non-truncated fine reference).
 
 The full 5-phase optimization from `guid.md` (the now-superseded source spec) is
 **complete** and committed. Condensed history (the Phase-1 `[y,u,…]` / Θ_u / φ-wrap
@@ -630,6 +654,18 @@ work below predates and is **superseded by** the CKS migration above):
   values, or render output changed; frozen files untouched.** *Verified:* `ruff check`
   / `ruff format --check` clean; pytest 40 passed (GPU deselected).
 
+- **`disk.doppler_strength` artistic shift dial (2026-06-12):** visualization-only
+  exponent on the CKS-9 relativistic shift, `g_eff = g^s`, applied once in
+  `_disk_emit_cks` and feeding **both** the Formula-9 g⁴ beaming amplitude and the
+  blackbody color shift (g⁴-not-g⁸ bookkeeping unchanged). `s=1` (default) skips the
+  `ti.pow` branch entirely — verified bit-equivalent to the pre-knob kernel (Doppler
+  4.317×, disk peak 6.1665 vs goldens 4.32× / 6.1667). `s=0` ⇒ g_eff≡1: no beaming,
+  no color shift — the Interstellar/DNGR treatment (the film suppressed the disk's
+  Doppler asymmetry); lensing geometry is untouched. Runtime kernel arg, no re-JIT.
+  NOT physics: scales the TOTAL CKS-9 g (orbital + gravitational, inseparable there).
+  *Verified:* new GPU guard `test_doppler_strength_zero_symmetrizes_disk` (s=0
+  disk-only L/R ratio < 1.5, NaN-free, still emits) green.
+
 *Note — `render_pipe_a`* (the 256² dev LOD kernel for `_gate2_lod_test`) was
 migrated to `[y,u,…]` but **intentionally keeps its offset ray** as the offset-ray
 LOD reference; it is not on the 4K production path.
@@ -652,7 +688,7 @@ re-derive. **`disk.py`, `geodesic.py`/`metric.py` CPU references, and any
 | **3.1/3.2** | Ship depth occlusion (early ray termination vs. Blender ship Z) | **Blocked** on a Blender ship Z-depth EXR asset. Sequence when unblocked: produce the asset → derive & document the Mino-affine ↔ camera-Z mapping → wire `ti.Texture(r32f)` + early-out behind an off-by-default flag → validate on a synthetic plane. **Biggest correctness trap:** `ray_length` is Mino-affine, not metric/Blender-Z | Asset + code |
 | **2.3** | Hardware `ti.Texture` starmap + `sample_lod` | **Deferred (external)** — Taichi 1.7.4 has no mip-upload API; revisit only after a Taichi upgrade is independently justified and re-validated on sm_120 (CLAUDE.md pins 1.7.4) | External |
 | **T3** | Moving-camera observer model (camera peculiar velocity, not just ZAMO) | **Roadmap, gated** — needs a new `SKILL.md` tetrad-boost formula approved (human review) before any code; high risk if rushed (sign/normalization) | Physics (gated) |
-| **D1** | Decision-B physical disk: Page-Thorne flux profile (replaces simple `(6/r)^0.75`) | **Roadmap, formula VERIFIED + owner-approved (2026-06-12)** — closed form is `SKILL.md` Formula **CKS-11** (numerically reproduces the conservation-law flux integral; guard `tests/test_disk_flux.py`; SKILL.md rev v1.10). **Kernel not yet wired.** Implementation = the "wire the LUT" path: CPU-precompute `f_PT(r)` shape LUT → `T_eff=(F/σ)^{1/4}` → swap into the disk kernel **behind a config flag** (keep `T₀` as the amplitude knob; respect the g⁴-not-g⁸ rule, Formula 9 / CKS-11 Piece 3). Active disk stays Decision-B-simple until this lands. | Physics (verified, unwired) |
+| **D1** | Decision-B physical disk: Page-Thorne flux profile (replaces simple `(6/r)^0.75`) | ✅ **Resolved (2026-06-12)** — wired behind `disk.temperature_model: page_thorne` (default `simple`); LUT in `src/renderer/disk_flux.py`; GPU guard in `test_gpu_regression.py`. Closed form is `SKILL.md` Formula **CKS-11** (numerically reproduces the conservation-law flux integral; guard `tests/test_disk_flux.py`; SKILL.md rev v1.11). The "wire the LUT" path: CPU-precompute `f_PT(r)` shape LUT → `T_eff=T₀·f_PT^{1/4}`, amplitude ×f_PT → sampled in the disk kernel **behind the config flag** (`T₀` stays the amplitude knob; g⁴-not-g⁸ respected, Formula 9 / CKS-11 Piece 3). Default disk stays Decision-B-simple, so golden frames / pinned GPU regression are unchanged. | Physics |
 
 ### Code-review findings (verified against current code)
 

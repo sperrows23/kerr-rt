@@ -796,6 +796,15 @@ Integrate the 8-vector `[t, x, y, z, p_t, p_x, p_y, p_z]` with RK4. `p_t` is con
 analytically — a free per-step error monitor. Recommended affine step: constant `dλ`
 far out, shrunk near the horizon, e.g. `h = dλ · max(step_floor, (r − r₊)/r)`.
 
+This step rule is numerical, not physics — size it however keeps the integrand
+resolved. In particular it knows only the horizon distance, so inside the Pipe-B
+disk slab (where the emission integrand has a thin vertical Gaussian of scale height
+`σ_z = r·θ_half·σ_frac`, Formula 9) it must additionally be capped so a steep
+equatorial crossing cannot step over the layer: bound the vertical displacement
+`|dz/dλ|·h ≤ vfrac·σ_z` (config `disk.max_step_vfrac`). It only bites for steep
+crossings — in-plane grazers keep the full step — so it never starves the
+`max_steps` budget. Under-resolving it aliases the disk into a concentric moiré.
+
 ---
 
 ## Formula CKS-6 — Horizon capture and escape
@@ -873,6 +882,15 @@ Then emission follows **Formula 9 verbatim** (chromaticity · g⁴, volumetric).
 Formula-8 "divide p_r by Δ" bug is impossible here: there is no Δ and `p_μ` is already
 covariant.
 
+> **Visualization dial (NOT physics — do not "fix"):** the GPU kernel applies
+> `g_eff = g^s` with `s = disk.doppler_strength` (default **1.0** = this formula
+> verbatim; the `s≠1` branch is skipped, bit-identical). `s<1` artistically mutes
+> the shift — `s=0` ⇒ `g_eff≡1`, the Interstellar/DNGR treatment that suppressed the
+> disk's Doppler asymmetry for the film. `g_eff` feeds **both** the Formula-9 g⁴ and
+> the chromaticity (single application — the g⁴-not-g⁸ rule is unaffected). It scales
+> the TOTAL g; splitting orbital Doppler from gravitational redshift would need a new
+> formula here first (static-observer redshift) — do not improvise one in code.
+
 ---
 
 ## Formula CKS-10 — Escaped-ray celestial direction (no spin-axis seam)
@@ -940,14 +958,16 @@ Do not proceed to rendering until all four pass.
 
 **Decision B — Disk temperature model**
 - [x] Simple: `T = T_0 · (6/r)^{0.75}` — fast, already in original code (ACTIVE)
-- [ ] Page-Thorne (1974) flux profile — physically correct, more work (spec below, **source-VERIFIED 2026-06-12, owner-approved to implement behind a config flag; not yet wired**)
+- [x] Page-Thorne (1974) flux profile — physically correct (spec below, **source-VERIFIED 2026-06-12; WIRED 2026-06-12 behind `disk.temperature_model: page_thorne`, default `simple`**)
 
 Record the chosen options here once decided and reference them in `CLAUDE.md`.
 
 ### Formula CKS-11 — Page-Thorne disk flux profile (VERIFIED; Decision-B upgrade)
 
-> **Status (2026-06-12):** Source-VERIFIED and owner-approved to implement behind a
-> config flag. Supersedes the earlier ⛔ PROVISIONAL transcription (which used a
+> **Status (2026-06-12):** Source-VERIFIED and **Wired 2026-06-12 behind
+> `disk.temperature_model` flag (default `simple`)** — CPU `f_PT(r)` LUT in
+> `src/renderer/disk_flux.py`, sampled by the GPU disk kernel. Supersedes the
+> earlier ⛔ PROVISIONAL transcription (which used a
 > different, unverified `Q/(B C^{1/2} D^{1/2})` parametrization — discarded).
 > **Source:** Page & Thorne (1974) ApJ 191:499, restated in Abramowicz & Fragile
 > (2013) Living Rev. Rel.; supplied as `paper/1104.5499v3.md`. **Verification:** the
@@ -1031,6 +1051,8 @@ configs/render.yaml              ← a, r_isco, WIDTH, HEIGHT, step counts, star
 | v1.7 | **F13 guard (b′) ADDED + APPROVED (owner, 2026-06-06):** Layer-A splat *placement* rule when `det J` is invalid (spin-axis seam / non-ESCAPED neighbour). The shipped code positioned the splat with the degenerate `J⁻¹`, collapsing all polar-cell stars onto the meridian (the "Artifact B" seam pileup, ≈15× the off-seam jump). (b′) places the splat by the star's true proper angular separation `d² = (Δθ′²+sin²θ′·Δφ′²)/dΩ` under the undeflected footprint `dΩ=|det J₀·sinθ′₀|` (the guard-(a) quantity), so seam stars keep real angular spacing at μ=1. Resolves the dngr-default seam (`test_no_spin_axis_seam`, `test_background_has_no_vertical_seam_stripe`). The matching Formula-10 `texture`-LOD regularization is a separate follow-up (spec §7.2), **not** part of this revision. |
 | v1.9 | **Decision B — physical disk upgrade DRAFTED (PROVISIONAL, owner review pending, 2026-06-11):** added a flagged spec for moving off the simple `(6/r)^0.75` law to the NT/Page-Thorne flux. Piece 1 (NT correction functions B/C/D/F/G) and Piece 3 (physical Planck `B_ν(T_eff)` + the g⁴-not-g⁸ bookkeeping vs Formula 9) are standard/safe; **Piece 2 — the time-averaged flux `F(r)` and `Q(r)` integral — is ⛔ BLOCKED on source verification** (local Page-Thorne `1974ApJ...191.md` is image-dropped, 59 formula-not-decoded; NT `II-48.md` is OCR-garbled), so it is transcribed from SYNTHESIS §4 only and **must not be implemented until confirmed against a clean Page-Thorne 1974 source + owner sign-off** (recalled-formula caution, cf. the GRay coefficient correction same day). No code path changed; ACTIVE disk remains Decision-B-simple. |
 | v1.10 | **Decision B Piece 2 — Page-Thorne flux VERIFIED & UNBLOCKED (2026-06-12).** Owner supplied a clean equation-intact source (`paper/1104.5499v3.md`, Page-Thorne 1974 via Abramowicz-Fragile 2013). The ⛔ PROVISIONAL `Q/(B C^{1/2} D^{1/2})` transcription was **discarded** (different, unverified parametrization) and replaced by the canonical closed-form **Formula CKS-11**: cubic roots `y₁,y₂,y₃` of `y³−3y+2a=0`, correction functions B/C, and the three-log `bracket(y)`. **Verified numerically:** the closed form reproduces the §1 conservation-law flux integral (using Formula 3/4 Ẽ,L̃,Ω) to 5 sig figs over r∈[1.5,28] M at a=0.999, differing only by the overall `3/2·√−g` constant the closed form drops; roots satisfy the cubic to machine precision; zero-torque BC `F(r_ms)=0` holds. Regression guard added: `tests/test_disk_flux.py`. D function not needed (folded into the closed form). Owner-approved to implement behind a config flag; **ACTIVE disk still Decision-B-simple — kernel not yet wired.** |
+| v1.11 | **Decision B Piece 2 — Page-Thorne flux WIRED (2026-06-12, D1).** The verified CKS-11 closed form is now live behind the runtime flag `disk.temperature_model` (default `simple`, so golden frames / the pinned GPU regression are unchanged). Path: `src/renderer/disk_flux.py` precomputes the normalized dimensionless shape `f_PT(r)=F/F_max` as a 1-D CPU LUT over `[r_isco, r_outer]` (`flux_lut_samples`, default 256; `lut[0]=0` zero-torque BC); `taichi_renderer._setup_disk_flux` always builds+uploads it (tiny → flag toggles per-render with no re-JIT); the disk kernel linear-interpolates it and sets `T_eff=T₀·f_PT^{1/4}` with emission amplitude ×`f_PT`. **g-bookkeeping preserved:** the explicit `g⁴` is kept and NOT doubled (`_blackbody_rgb` is chromaticity-only — the g⁸ error Formula 9 / CKS-11 Piece 3 warns about is avoided in both branches). Guards: `tests/test_disk_flux.py` (module vs pinned transcription + LUT properties) and a gpu-marked `tests/test_gpu_regression.py` page_thorne render check. `T₀` stays the amplitude knob. |
+| v1.12 | **`disk.doppler_strength` visualization dial documented (2026-06-12) — NOT a physics revision.** The kernel applies `g_eff = g^s` to the CKS-9 g-factor before Formula 9 (`s=1` default = formulas verbatim, branch skipped, bit-identical — verified Doppler 4.317×/peak 6.1665 vs goldens 4.32×/6.1667; `s=0` ⇒ shift fully off, the Interstellar/DNGR artistic treatment). Single application feeding both g⁴ and the chromaticity — the g⁴-not-g⁸ rule is unaffected. Scales the TOTAL g; an orbital-vs-gravitational split would require a new verified static-observer redshift formula first. GPU guard: `test_doppler_strength_zero_symmetrizes_disk` (s=0 ⇒ disk-only L/R ratio < 1.5). See the dial note under Formula CKS-9. |
 
 *Last verified: 2026-06-06 (F13 guard (b′) Layer-A splat-placement rule approved +
 landed; (b′) is a placement regularization derived from the already-verified guard-(a)

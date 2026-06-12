@@ -39,6 +39,7 @@ fixture, not done at import time.
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 
@@ -202,3 +203,85 @@ def test_no_spin_axis_seam(beauty_frame):
     jump = beauty_frame["seam_center_jump"]
     baseline = max(beauty_frame["seam_bg_median"], 1e-9)
     assert jump / baseline <= _SEAM_JUMP_OVER_MEDIAN_MAX
+
+
+def test_page_thorne_disk_model_renders(beauty_frame):
+    """D1 guard: the page_thorne flux LUT path renders a physical disk frame.
+
+    Reuses the module fixture only to gate on CUDA availability (and share the one-
+    time JIT / starmap upload), then re-renders frame 0 with
+    ``disk.temperature_model = page_thorne`` on a deepcopied cfg so the simple-model
+    golden references above are untouched. Asserts the Page-Thorne branch is NaN-free,
+    still g⁴-Doppler-beamed (right > left by > 2×, same measurement as the simple
+    path), and actually emits (max disk luminance > 0).
+    """
+    from renderer import taichi_renderer as tr
+
+    cfg = copy.deepcopy(tr.load_config())
+    cfg["disk"]["temperature_model"] = "page_thorne"
+
+    with open(_CAMERA_PATH, encoding="utf-8-sig") as fh:
+        cam = json.load(fh)[_FRAME_INDEX]
+
+    # setup_renderer re-runs ti.init (destroying all fields) and always (re)builds +
+    # uploads the LUT; the flag then toggles per-render. The module caches the frame
+    # buffers behind _FW/_FH, whose stale handles do not survive the re-init — reset
+    # the cache so _alloc_frame rebuilds them against the fresh runtime.
+    tr.setup_renderer(cfg)
+    tr.frame_pixels = None
+    tr._FW = 0
+    tr._FH = 0
+    hdr = tr.render_beauty_frame(cfg, cam, _WIDTH, _HEIGHT, with_disk=True, lod_enabled=True)
+
+    assert int(np.isnan(hdr).sum()) == 0
+
+    lum = hdr.sum(axis=2)
+    w = hdr.shape[1]
+    left = float(lum[:, : w // 2].mean())
+    right = float(lum[:, w // 2 :].mean())
+    assert right > left  # approaching edge is the bright one (g⁴ beaming)
+    assert right / max(left, 1e-9) > 2.0
+
+    disk_max = float(np.nan_to_num(tr.disk_buf.to_numpy()[:, :, :3]).max())
+    assert disk_max > 0.0
+
+
+def test_doppler_strength_zero_symmetrizes_disk(beauty_frame):
+    """``disk.doppler_strength`` guard: s=0 ⇒ g_eff≡1 ⇒ the beamed asymmetry dies.
+
+    Visualization knob, not physics (g_eff = g^s feeding both g⁴ and the blackbody
+    chroma; default 1.0 leaves the kernel path bit-identical). With s=0 the disk's
+    left/right split must collapse to near-symmetric — measured on ``disk_buf``
+    (disk emission only), since the DNGR sky background is itself asymmetric.
+    Residual asymmetry from frame-dragged photon paths (lensing geometry, which the
+    knob deliberately does NOT touch) is allowed, hence a loose < 1.5 bound vs the
+    full-physics ≈4.3×. Forces ``temperature_model: simple`` so the bound doesn't
+    depend on the user's current YAML state.
+    """
+    from renderer import taichi_renderer as tr
+
+    cfg = copy.deepcopy(tr.load_config())
+    cfg["disk"]["temperature_model"] = "simple"
+    cfg["disk"]["doppler_strength"] = 0.0
+
+    with open(_CAMERA_PATH, encoding="utf-8-sig") as fh:
+        cam = json.load(fh)[_FRAME_INDEX]
+
+    # Same re-setup stale-handle workaround as the page_thorne test above.
+    tr.setup_renderer(cfg)
+    tr.frame_pixels = None
+    tr._FW = 0
+    tr._FH = 0
+    hdr = tr.render_beauty_frame(cfg, cam, _WIDTH, _HEIGHT, with_disk=True, lod_enabled=True)
+
+    assert int(np.isnan(hdr).sum()) == 0
+
+    disk_rgb = np.nan_to_num(tr.disk_buf.to_numpy()[:, :, :3])
+    assert float(disk_rgb.max()) > 0.0  # still emits with the shift disabled
+
+    lum = disk_rgb.sum(axis=2)
+    w = lum.shape[1]
+    left = float(lum[:, : w // 2].mean())
+    right = float(lum[:, w // 2 :].mean())
+    ratio = max(left, right) / max(min(left, right), 1e-9)
+    assert ratio < 1.5, (left, right)

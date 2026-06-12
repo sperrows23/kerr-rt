@@ -11,13 +11,13 @@ render:
   height: 2160
   thumb_width: 256
   thumb_height: 256
-  max_steps_pipe_a: 800        # Pipe B (volumetric disk march) shares this same trace loop / step cap.
+  max_steps_pipe_a: 500        # Pipe B (volumetric disk march) shares this same trace loop / step cap.
                                # CKS affine λ advances ~1 coord-unit per unit λ (unlike BL Mino time, which
                                # advanced ~r² per unit λ), so a photon must take ~(r_max−r_cam)/h far-field
                                # steps to escape plus extra near the photon ring — hence the larger cap.
   r_max: 50.0
   device_memory_gb: 6.0
-  d_lambda_pipe_a: 0.25        # CKS affine-parameter step dλ for the Hamiltonian geodesic (Formula CKS-5).
+  d_lambda_pipe_a: 0.2        # CKS affine-parameter step dλ for the Hamiltonian geodesic (Formula CKS-5).
                                # Far-field h≈dλ (≈0.25 coord-units/step); shrinks toward the horizon via the
                                # adaptive factor below. Sized so a ~35-unit traverse (r_cam≈15→r_max=50) is
                                # ~140 steps and a photon-ring grazer's few orbits stay under max_steps.
@@ -39,15 +39,36 @@ disk:
   r_inner: 1.182
   r_outer: 25.0
   theta_half_width: 0.15   # |θ - π/2| < this for bounding box (single source of truth for the slab)
-  T_0: 1.0e4               # inner reference temperature (Decision B: T = T_0·(6/r)^0.75)
-  emission_coeff: 0.25     # volumetric emission scale (visualization). RECALIBRATED for CKS
+  T_0: 5500.0               # inner reference temperature (Decision B: T = T_0·(6/r)^0.75)
+  emission_coeff: 4.0     # volumetric emission scale (visualization). RECALIBRATED for CKS
                            # (2026-06-07): the march integrates emis·density·g⁴·ds with ds = the
                            # CKS affine step (~0.1–0.24 coord-units), whereas the old 8.0 was tuned
                            # for the BL Mino step (~0.003–0.009, ~30× smaller). Scaled ~1/30 so the
                            # disk is optically thin and the g⁴-beamed inner edge is not washed out.
-  absorption_coeff: 0.05   # volumetric absorption scale (visualization). RECALIBRATED for CKS ds
+  absorption_coeff: 0.8   # volumetric absorption scale (visualization). RECALIBRATED for CKS ds
                            # (2026-06-07; was 1.5) — same ~1/30 BL-Mino→CKS-affine rescale.
-  vertical_sigma_frac: 0.5 # gaussian scale height as fraction of theta_half_width
+  vertical_sigma_frac: 0.2 # gaussian scale height as fraction of theta_half_width
+  max_step_vfrac: 0.5      # disk-thickness adaptive-step cap (Pipe B). While a ray is inside the
+                           # slab its geodesic step is shrunk so the VERTICAL displacement |dz/dλ|·h
+                           # spans at most this fraction of the local Gaussian scale height
+                           # σ_z = r·theta_half_width·vertical_sigma_frac. Stops the horizon-distance
+                           # step rule (CKS-5) from striding over the thin emitting layer when a ray
+                           # crosses the equatorial plane steeply (face-on views), aliasing it into a
+                           # moiré band. Only bites for steep crossings; near-in-plane / edge-on
+                           # grazers (dz/dλ→0) keep the full step, so it adds no cost there and cannot
+                           # push them into max_steps_pipe_a. Smaller = finer/slower; 0.5 ≈ 2 samples
+                           # per σ. Guarded by tests/test_disk_step_convergence.py.
+  temperature_model: page_thorne  # simple | page_thorne (D1). simple = T = T_0·(6/r)^0.75 (Decision B,
+                           # default, golden frames). page_thorne = CKS-11 flux LUT: T_eff = T_0·f_PT^¼,
+                           # emission amplitude ×f_PT, zero-torque F(r_isco)=0; T_0 stays the amplitude knob.
+  flux_lut_samples: 256    # LUT resolution over [r_isco, r_outer] for the page_thorne f_PT(r) profile.
+  doppler_strength: 0.1    # VISUALIZATION knob (not physics): g_eff = g^s on the CKS-9 shift, feeding
+                           # both the g⁴ beaming amplitude AND the blackbody color shift. 1.0 = full
+                           # physics (default; bit-identical kernel path, golden frames intact).
+                           # 0.0 = shift off — the Interstellar/DNGR treatment (the film suppressed
+                           # the Doppler asymmetry so the disk reads symmetric to the audience);
+                           # ~0.2–0.4 keeps a hint of the bright approaching side. Scales the TOTAL
+                           # shift (orbital Doppler + gravitational, inseparable in CKS-9).
   # NOTE: the Phase-3.3 |u|=|cosθ| disk-slab early-out bound is now DERIVED in code
   # as sin(theta_half_width) (renderer.render_beauty_frame) — the old hardcoded
   # `bounding_sin_theta_half: 0.14944` literal duplicated it and desynced whenever

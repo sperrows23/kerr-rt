@@ -45,6 +45,7 @@ import numpy as np
 import taichi as ti
 import yaml
 
+from renderer import disk_flux
 from renderer.starmap import Starmap
 
 # --------------------------------------------------------------------------- #
@@ -84,6 +85,10 @@ _TWO_PI = 2.0 * math.pi
 _RUNNING = 0
 _ESCAPED = 1
 _CAPTURED = 2
+
+# Floor on the coordinate speed |dx/dλ| in the disk step cap, so a degenerate
+# near-null-spatial step divides by a finite number instead of blowing up.
+_DISK_STEP_V_EPS = 1e-6
 
 
 # --------------------------------------------------------------------------- #
@@ -140,6 +145,18 @@ disk_buf: ti.Field = None  # type: ignore[assignment]  (H,W,4): disk_rgb + trans
 depth_pixels: ti.Field = None  # type: ignore[assignment]  (H,W): transmittance-weighted Z (3.4)
 _FW = 0
 _FH = 0
+
+# --- Page-Thorne disk-flux LUT (D1; SKILL.md CKS-11) ------------------------- #
+# 1-D dimensionless shape f_PT(r) = F(r)/F_max over [r_isco, r_outer], precomputed
+# on the CPU by renderer.disk_flux and uploaded here. The kernel reads it with
+# linear interpolation when disk.temperature_model == page_thorne; the simple
+# T₀·(6/r)^0.75 path ignores it. ALWAYS built/uploaded in setup (256 floats is
+# negligible) so the flag toggles per-render without a re-JIT. The _PT_LUT_*
+# scalars are baked into the kernel at JIT (same pattern as _MAX_LOD).
+disk_flux_lut: ti.Field = None  # type: ignore[assignment]  (n,) normalized f_PT
+_PT_LUT_N = 1
+_PT_LUT_R0 = 0.0
+_PT_LUT_INV_DR = 0.0
 
 
 def _pack_pyramid(sm: Starmap):
@@ -249,6 +266,7 @@ def setup_renderer(cfg: dict) -> Starmap:
     star_h.from_numpy(np.asarray(hs, dtype=np.int32))
 
     _setup_dngr(cfg)
+    _setup_disk_flux(cfg)
     return sm
 
 
@@ -329,6 +347,30 @@ def _setup_dngr(cfg: dict) -> None:
         _MW_N_LEVELS = 1
         _MW_MAX_LOD = 0.0
         _MW_WIDTH = 16384.0
+
+
+def _setup_disk_flux(cfg: dict) -> None:
+    """Build + upload the Page-Thorne f_PT(r) LUT (D1; SKILL.md CKS-11).
+
+    ALWAYS runs, regardless of ``disk.temperature_model`` — the LUT is tiny (256
+    f32) and uploading it unconditionally lets the flag toggle per-render without a
+    re-JIT (the kernel just doesn't sample it in the simple branch). The
+    ``_PT_LUT_*`` index scalars are baked into module globals here so the kernel
+    JITs against them (same pattern as ``_J_FOLD`` / ``_MAX_LOD``).
+    """
+    global disk_flux_lut, _PT_LUT_N, _PT_LUT_R0, _PT_LUT_INV_DR
+
+    d = cfg["disk"]
+    a = float(cfg["black_hole"]["spin"])
+    r_outer = float(d["r_outer"])
+    n = int(d.get("flux_lut_samples", 256))
+
+    lut, r0, dr = disk_flux.build_flux_lut(a, r_outer, n)
+    _PT_LUT_N = n
+    _PT_LUT_R0 = r0
+    _PT_LUT_INV_DR = 1.0 / dr if dr > 0.0 else 0.0
+    disk_flux_lut = ti.field(dtype=ti.f32, shape=n)
+    disk_flux_lut.from_numpy(lut)
 
 
 def _horizon_radius(a: float) -> float:
@@ -491,6 +533,20 @@ def _eom(s, a):
 def _rk4_step(s, a, h):
     """One RK4 step of the CKS-5 EOM (mirrors renderer.geodesic.integrate)."""
     k1 = _eom(s, a)
+    k2 = _eom(s + 0.5 * h * k1, a)
+    k3 = _eom(s + 0.5 * h * k2, a)
+    k4 = _eom(s + h * k3, a)
+    return s + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+
+
+@ti.func
+def _rk4_step_k1(s, a, h, k1):
+    """RK4 step reusing an already-evaluated ``k1 = _eom(s, a)``.
+
+    Bit-identical to :func:`_rk4_step` — only the (h-independent) first stage is
+    hoisted out so the disk march can read ``dz/dλ = k1[3]`` for the slab-aware
+    step cap without a second EOM evaluation (net zero extra cost per step).
+    """
     k2 = _eom(s + 0.5 * h * k1, a)
     k3 = _eom(s + 0.5 * h * k2, a)
     k4 = _eom(s + h * k3, a)
@@ -674,8 +730,24 @@ def _blackbody_rgb(temp):
 
 
 @ti.func
+def _pt_flux_sample(r):
+    """Linear-interp the Page-Thorne f_PT(r) LUT (D1; SKILL.md CKS-11).
+
+    ``t = (r − r0)/dr`` clamped to ``[0, n−1]``; lerp the two adjacent texels.
+    Returns 0 below r_isco (lut[0]==0 by construction, the zero-torque BC).
+    """
+    t = (r - _PT_LUT_R0) * _PT_LUT_INV_DR
+    t = ti.min(ti.max(t, 0.0), ti.cast(_PT_LUT_N - 1, ti.f32))
+    i0 = ti.cast(ti.floor(t), ti.i32)
+    i1 = ti.min(i0 + 1, _PT_LUT_N - 1)
+    frac = t - ti.cast(i0, ti.f32)
+    return disk_flux_lut[i0] * (1.0 - frac) + disk_flux_lut[i1] * frac
+
+
+@ti.func
 def _disk_emit_cks(
-    x, y, z, p_cov, a, r_inner, r_outer, theta_half, sigma_frac, T_0, emis_c, absb_c, ds
+    x, y, z, p_cov, a, r_inner, r_outer, theta_half, sigma_frac, T_0, emis_c, absb_c, ds,
+    disk_model, doppler_strength,
 ):
     """One volumetric disk sample at a CKS geodesic point → (emission RGB, dτ).
 
@@ -688,6 +760,28 @@ def _disk_emit_cks(
     ``g = −E / (p_t u^t + p_x u^x + p_y u^y + p_z u^z)``. The Formula-8 "divide
     p_r by Δ" bug is structurally impossible — there is no Δ and p is already
     covariant. Formula 9: chromaticity·g⁴ volumetric emission.
+
+    ``disk_model`` (D1): 0 = simple ``T = T_0·(6/r)^0.75`` (Decision-B default,
+    golden frames); 1 = Page-Thorne (SKILL.md CKS-11): sample the precomputed
+    f_PT(r) shape LUT, set ``T_emit = T_0·f_PT^¼`` (T_eff=(F/σ)^¼ with T_0 carrying
+    the σ/Ṁ amplitude — CKS-11 Piece 3), and fold f_PT into the bolometric
+    amplitude (``emission ∝ … · f_PT``) — the f factor IS the T⁴ radial profile.
+
+    **g-bookkeeping (Formula 9 / CKS-11 Piece 3, BOTH paths):** ``_blackbody_rgb``
+    is chromaticity-only (no T⁴ amplitude), so the explicit ``g⁴`` is the ONLY g
+    factor and is NOT double-counted — do not add any other g (that is the g⁸
+    error Formula 9 warns about). This holds identically for simple and
+    page_thorne; page_thorne only changes the *radial* profile (f_PT vs (6/r)³).
+
+    ``doppler_strength`` (visualization-only, NOT physics): exponent scale on the
+    relativistic shift, ``g_eff = g^s``. 1.0 = full physics (the ``s != 1``
+    branch is skipped, so the default is bit-identical to the pre-knob kernel —
+    golden frames intact); 0.0 = g_eff ≡ 1 (no beaming, no color shift — the
+    Interstellar/DNGR artistic treatment, which suppressed the Doppler asymmetry
+    for the film); values between blend smoothly in log-g. It scales the TOTAL
+    CKS-9 g (orbital Doppler + gravitational shift combined — separating the two
+    would need a new SKILL.md formula). Applied once to g_eff, which then feeds
+    BOTH g⁴ and the chromaticity, so the g⁴-not-g⁸ bookkeeping is unchanged.
     """
     out = vec4(0.0, 0.0, 0.0, 0.0)
     r = _kerr_radius(x, y, z, a)
@@ -701,20 +795,41 @@ def _disk_emit_cks(
         if ti.abs(denom) > 1e-12:
             g = -E / denom  # Formula CKS-9
             if g > 0.0:
-                # Decision B temperature model: T = T_0·(6/r)^0.75.
-                T_emit = T_0 * ti.pow(6.0 / r, 0.75)
-                T_obs = g * T_emit
-                chroma = _blackbody_rgb(T_obs)
+                # Artistic shift dial: g_eff = g^s (s=1 ⇒ untouched physics; the
+                # branch keeps the default path bit-identical to ti.pow-free code).
+                g_eff = g
+                if doppler_strength != 1.0:
+                    g_eff = ti.pow(g, doppler_strength)
                 sigma_theta = theta_half * sigma_frac
                 density = ti.exp(-0.5 * (dz_ang / sigma_theta) ** 2)
-                g4 = g * g * g * g  # Formula 9 (3D volume: g⁴)
-                emission = emis_c * density * g4 * ds
-                out = vec4(
-                    emission * chroma[0],
-                    emission * chroma[1],
-                    emission * chroma[2],
-                    absb_c * density * ds,
-                )
+                g4 = g_eff * g_eff * g_eff * g_eff  # Formula 9 (3D volume: g⁴)
+
+                # Radial profile: simple (Decision B) or Page-Thorne (CKS-11).
+                T_emit = 0.0
+                emission = 0.0
+                emit = 1  # 0 ⇒ Page-Thorne f_PT≤0 (inside r_ms): no emission
+                if disk_model == 1:
+                    f = _pt_flux_sample(r)
+                    if f <= 0.0:
+                        emit = 0
+                    else:
+                        # CKS-11 Piece 3: T_eff = (F/σ)^¼ = T_0·f_PT^¼; f IS the
+                        # T⁴ bolometric radial profile, so it multiplies emission.
+                        T_emit = T_0 * ti.pow(f, 0.25)
+                        emission = emis_c * density * f * g4 * ds
+                else:
+                    # Decision B temperature model: T = T_0·(6/r)^0.75.
+                    T_emit = T_0 * ti.pow(6.0 / r, 0.75)
+                    emission = emis_c * density * g4 * ds
+
+                if emit == 1:
+                    chroma = _blackbody_rgb(g_eff * T_emit)
+                    out = vec4(
+                        emission * chroma[0],
+                        emission * chroma[1],
+                        emission * chroma[2],
+                        absb_c * density * ds,
+                    )
     return out
 
 
@@ -848,6 +963,9 @@ def render_beauty_physics(
     T_0: float,
     emis_c: float,
     absb_c: float,
+    disk_model: int,
+    doppler_strength: float,
+    max_step_vfrac: float,
 ):
     """Kernel 1 (Phase 2.4 split): trace ONE primary ray per pixel (no offset ray).
 
@@ -922,15 +1040,36 @@ def render_beauty_physics(
                 # variable step desyncs the Riemann sum).
                 local_h = d_lambda * ti.max(adaptive_floor, (r - r_plus) / r)
 
-                # Pipe B: accumulate disk emission at the current point.
-                # optimization Phase 3.3 bounding-box early-out: |cosθ| < sin θ_half (≡ the
-                # slab test) and r within the radial band.
-                if (
+                # k1 is hoisted out of the RK4 step so the disk-thickness cap below
+                # can read dz/dλ = k1[3] for free (the step reuses this same k1).
+                k1 = _eom(s, a)
+
+                in_band = (
                     disk_enabled == 1
                     and ti.abs(z / r) < bound_sin_half
                     and r >= r_inner
                     and r <= r_outer
-                ):
+                )
+                if in_band:
+                    # Disk-thickness step cap. The base rule sizes h only by distance
+                    # to the horizon and is blind to the disk's vertical extent, so a
+                    # ray crossing the equatorial plane steeply can stride over the
+                    # thin emitting layer — under-sampling the Gaussian density
+                    # (Formula 9) into a moiré band on the disk face. Limit the per-
+                    # step VERTICAL displacement |dz/dλ|·h to a fraction of the local
+                    # scale height σ_z = r·θ_half·σ_frac so the slab is resolved. Only
+                    # bites for steep crossings (large |dz/dλ|); near-in-plane / edge-
+                    # on grazers (dz/dλ→0) keep the full radial step, so the cap adds
+                    # no steps there and cannot push those rays into the max_steps cap.
+                    sigma_z = r * theta_half * sigma_frac
+                    vz = ti.abs(k1[3])
+                    h_cap = max_step_vfrac * sigma_z / ti.max(vz, _DISK_STEP_V_EPS)
+                    local_h = ti.min(local_h, h_cap)
+
+                # Pipe B: accumulate disk emission at the current point.
+                # optimization Phase 3.3 bounding-box early-out: |cosθ| < sin θ_half (≡ the
+                # slab test) and r within the radial band.
+                if in_band:
                     p_cov = vec4(s[4], s[5], s[6], s[7])
                     ev = _disk_emit_cks(
                         x,
@@ -946,6 +1085,8 @@ def render_beauty_physics(
                         emis_c,
                         absb_c,
                         local_h,
+                        disk_model,
+                        doppler_strength,
                     )
                     disk_col += transm * vec3(ev[0], ev[1], ev[2])
                     contribution = transm * (ev[0] + ev[1] + ev[2])
@@ -953,7 +1094,7 @@ def render_beauty_physics(
                     total_emission += contribution
                     transm *= ti.exp(-ev[3])
 
-                s = _rk4_step(s, a, local_h)
+                s = _rk4_step_k1(s, a, local_h, k1)
                 ray_length += local_h
             step += 1
 
@@ -1419,6 +1560,15 @@ def render_beauty_frame(
     # source of truth): |θ−π/2| < θ_half ⇔ |cosθ| < sin(θ_half), exactly the slab
     # test re-checked inside ``_disk_emit_cks``.
     bound_sin_half = math.sin(float(d["theta_half_width"]))
+    # D1 disk radial-profile selector: 0 = simple T₀·(6/r)^0.75 (Decision-B default,
+    # golden frames); 1 = Page-Thorne f_PT(r) LUT (SKILL.md CKS-11). The _PT_LUT_*
+    # index scalars are baked at JIT from _setup_disk_flux (always run by
+    # setup_renderer first, same as _MAX_LOD), so the flag toggles with no re-JIT.
+    disk_model = 1 if str(d.get("temperature_model", "simple")) == "page_thorne" else 0
+    # Visualization knob (NOT physics): g_eff = g^s exponent on the CKS-9 shift.
+    # 1.0 = full physics (default, golden frames); 0.0 = Doppler/redshift off
+    # (Interstellar-style symmetric disk). Runtime kernel arg — no re-JIT.
+    doppler_strength = float(d.get("doppler_strength", 1.0))
 
     _alloc_frame(width, height)
     # Phase 2.4 kernel split: physics pass writes exit_buf/disk_buf, shading pass
@@ -1457,6 +1607,9 @@ def render_beauty_frame(
         float(d["T_0"]),
         float(d["emission_coeff"]),
         float(d["absorption_coeff"]),
+        disk_model,
+        doppler_strength,
+        float(d.get("max_step_vfrac", 0.5)),
     )
     # starfield.mode: dngr ⇒ Formula-13 two-layer background; else legacy F10 texture.
     dngr_mode = 1 if str(cfg.get("starfield", {}).get("mode", "texture")) == "dngr" else 0
