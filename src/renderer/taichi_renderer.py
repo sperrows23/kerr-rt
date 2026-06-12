@@ -45,7 +45,7 @@ import numpy as np
 import taichi as ti
 import yaml
 
-from renderer import disk_flux
+from renderer import disk_flux, kerr_params
 from renderer.starmap import Starmap
 
 # --------------------------------------------------------------------------- #
@@ -58,7 +58,10 @@ _CONFIG_PATH = _ROOT / "configs" / "render.yaml"
 def load_config(path: Path = _CONFIG_PATH) -> dict:
     # Explicit utf-8: this box defaults to cp949 and the config has θ/π/· bytes.
     with open(path, encoding="utf-8") as fh:
-        return yaml.safe_load(fh)
+        cfg = yaml.safe_load(fh)
+    # Inject all spin/extent-derived parameters (r_plus, r_isco, r_inner, T_0,
+    # disk.dynamics.*) — Formula CKS-13. The YAML stores base parameters only.
+    return kerr_params.resolve_config(cfg)
 
 
 # Horizon-capture margin (mirrored from render.horizon_epsilon — NOT physics).

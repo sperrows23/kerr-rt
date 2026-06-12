@@ -51,6 +51,7 @@ from renderer.geodesic import (  # noqa: E402
     integrate_null_geodesic,
     make_null_initial_conditions,
 )
+from renderer.kerr_params import resolve_config  # noqa: E402
 from renderer.metric import kerr_radius  # noqa: E402
 
 # CKS Cartesian coordinate index order (matches renderer.metric / geodesic).
@@ -61,7 +62,10 @@ _CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs" / "render.yaml"
 
 def load_config(path: Path = _CONFIG_PATH) -> dict:
     with open(path, encoding="utf-8") as fh:
-        return yaml.safe_load(fh)
+        cfg = yaml.safe_load(fh)
+    # Inject spin/extent-derived parameters (r_isco, r_inner, T_0, dynamics —
+    # Formula CKS-13); the YAML stores base parameters only. Taichi-free.
+    return resolve_config(cfg)
 
 
 # --------------------------------------------------------------------------- #

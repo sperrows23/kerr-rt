@@ -1,10 +1,9 @@
 black_hole:
-  spin: 0.999      # a — the single source of truth; r_isco and r_plus below are FUNCTIONS of it
-  r_isco: 1.182    # DERIVED (Formula 2 of a=0.999). Duplicated literal — re-derive if spin changes
-  r_plus: 1.0447   # DERIVED: r+ = 1 + sqrt(1-a^2), a=0.999 (true horizon). Now UNUSED at runtime:
-                   # both the GPU renderer and the CPU preview (thumb.py) compute r+ from `spin`
-                   # via _horizon_radius (CKS-6). Kept as documentation only; it silently desyncs
-                   # if `spin` is edited (FLAGGED) — the live value is always derived from `spin`.
+  spin: 0.999      # a — the single source of truth. r_isco / r_plus are NOT stored here:
+                   # they are FUNCTIONS of spin, computed at load by
+                   # src/renderer/kerr_params.resolve_config (Formula 2 / CKS-6, see CKS-13)
+                   # and injected as black_hole.r_isco / black_hole.r_plus. The old literals
+                   # (1.182 / 1.0447 for a=0.999) silently desynced whenever spin was edited.
 
 render:
   width: 3840
@@ -36,10 +35,16 @@ render:
   depth_infinity: 1.0e5        # optimization Phase 3.4: Z value written to pixels with no disk emission
 
 disk:
-  r_inner: 1.182
+  r_inner: auto            # auto → r_isco(spin) (zero-torque inner edge, Formula CKS-13).
+                           # A number here is an artistic override; values below r_isco are
+                           # clamped UP to it (no emission inside the ISCO — gas plunges).
   r_outer: 25.0
   theta_half_width: 0.15   # |θ - π/2| < this for bounding box (single source of truth for the slab)
-  T_0: 5500.0               # inner reference temperature (Decision B: T = T_0·(6/r)^0.75)
+  target_peak_temperature: 5500.0  # BASE look parameter: desired peak T_eff (K) of the disk.
+                           # kerr_params derives the model amplitude T_0 from it (CKS-13):
+                           #   page_thorne: T_0 = target (f_PT LUT is normalized to max 1)
+                           #   simple:      T_0 = target·(r_inner/6)^0.75 (peak sits at r_inner)
+                           # An explicit disk.T_0 key would override this (legacy escape hatch).
   emission_coeff: 4.0     # volumetric emission scale (visualization). RECALIBRATED for CKS
                            # (2026-06-07): the march integrates emis·density·g⁴·ds with ds = the
                            # CKS affine step (~0.1–0.24 coord-units), whereas the old 8.0 was tuned
@@ -69,6 +74,17 @@ disk:
                            # the Doppler asymmetry so the disk reads symmetric to the audience);
                            # ~0.2–0.4 keeps a hint of the bright approaching side. Scales the TOTAL
                            # shift (orbital Doppler + gravitational, inseparable in CKS-9).
+  dynamics:                # BASE time-mapping look parameters (Formula CKS-13). The resolver
+                           # derives from these + spin + disk extent: omega_inner/outer,
+                           # period_inner_M / period_outer_M, wrap_time_M, and the two values the
+                           # D2 noise system consumes — time_scale (geometric M of disk time per
+                           # second of footage; t_disk = frame/fps · time_scale) and
+                           # shear_period_M (the CKS-12 §2 dual-phase reseed period T).
+                           # Everything rescales automatically when spin / r_inner / r_outer move.
+    inner_lap_seconds: 10.0 # [look-dev] footage seconds for ONE full revolution of the disk
+                           # inner edge → time_scale = T_orb(r_inner)/this. Smaller = faster disk.
+    shear_wrap_budget: 3.0 # [look-dev] differential 2π-wraps across [r_inner, r_outer] tolerated
+                           # before the CKS-12 reseed → shear_period_M = budget·2π/(Ω_in−Ω_out).
   # NOTE: the Phase-3.3 |u|=|cosθ| disk-slab early-out bound is now DERIVED in code
   # as sin(theta_half_width) (renderer.render_beauty_frame) — the old hardcoded
   # `bounding_sin_theta_half: 0.14944` literal duplicated it and desynced whenever

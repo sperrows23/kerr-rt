@@ -134,8 +134,12 @@ disk:
   noise:
     enabled: false        # master switch; false = bit-identical legacy branch
     seed: 1234
-    time_scale: 5.0       # geometric-time units (M) per animation second  [look-dev]
-    shear_period: 60.0    # T, M units per advection phase cycle (CKS-12)  [look-dev]
+    # time_scale / shear_period are NOT stored here — superseded 2026-06-13 (D3,
+    # Formula CKS-13): the resolver derives disk.dynamics.time_scale =
+    # T_orb(r_inner)/inner_lap_seconds and disk.dynamics.shear_period_M =
+    # shear_wrap_budget·2π/(Ω_in−Ω_out) from the BASE look targets
+    # disk.dynamics.{inner_lap_seconds: 10.0, shear_wrap_budget: 3.0} (already in
+    # render.yaml). They rescale automatically with spin and disk extent.
     variance_preserve: true   # divide blend by sqrt(w0²+w1²) (CKS-12 §2)
     m_max: 2.5            # clamp on the log-density sum
     layers:
@@ -153,10 +157,12 @@ disk:
     height: {amp: 0.5, freq_u: 1.0, freq_phi: 3, speed: 0.7}
 ```
 
-All values above are **placeholders to be tuned in D2.2 look-dev** (`[look-dev]`);
-`time_scale`/`shear_period` defaults assume the ISCO orbital period
-`2π(r_isco^{3/2}+a) ≈ 14.4 M`, i.e. `time_scale: 5` ≈ one inner-edge orbit every
-~3 s of footage. Frequencies `freq_phi` are integers (φ-periodicity, §3.1).
+All values above are **placeholders to be tuned in D2.2 look-dev** (`[look-dev]`).
+The time mapping is now physical (D3 / CKS-13): with the shipped defaults
+(`inner_lap_seconds: 10`, a = 0.999 → `T_orb(r_isco) ≈ 14.35 M`) the resolver
+gives `time_scale ≈ 1.435 M/s` and `shear_period_M ≈ 3·14.6 ≈ 43.8 M` (≈ 30 s of
+footage between reseeds); tuning rotation speed = editing `inner_lap_seconds`
+only. Frequencies `freq_phi` are integers (φ-periodicity, §3.1).
 
 ## 6. Renderer integration points (D2.2–D2.5)
 
@@ -165,7 +171,7 @@ All values above are **placeholders to be tuned in D2.2 look-dev** (`[look-dev]`
 | `src/renderer/noise.py` (new) | CPU reference primitives (§3) |
 | `taichi_renderer.py` `@ti.func` noise twins | mirror of `noise.py` |
 | `_disk_emit_cks` (`taichi_renderer.py:748`) | compute `(u, φ, ζ)` from the already-available `r`, `x,y,z`, `dz_ang/σ_θ`; apply CKS-12 advection + §4 stack behind `noise_enabled` |
-| `render_beauty_frame` (`taichi_renderer.py:1503`) | new `t_disk` parameter (computed by callers as `frame_index / render.fps × disk.noise.time_scale`) |
+| `render_beauty_frame` (`taichi_renderer.py:1503`) | new `t_disk` parameter (computed by callers as `frame_index / render.fps × disk.dynamics.time_scale` — the CKS-13-derived value) |
 | `render_beauty_frame_mb` (`taichi_renderer.py:1641`) | jitter `t_disk` across the shutter **alongside** the camera `dphi` jitter — the rotate-the-camera motion-blur trick alone is only valid for an axisymmetric disk |
 | `_setup_disk_noise` (new, beside `_setup_disk_flux`) | upload per-layer params into a small `ti.field` **param buffer** (not baked module constants) so look-dev tuning does **not** re-JIT; `t_disk`, `enabled`, `seed` are kernel args. Follow the D1 `ti.init`-re-setup gotcha: setup must run after `ti.init` on every renderer (re)initialization. |
 | `scripts/thumb.py` | accept `--t-disk` (or `--frame`) for advection look-dev |

@@ -11,6 +11,7 @@ Load this skill whenever the task involves:
 - Anti-aliasing / mipmap LOD for the starmap
 - Point-star magnification, ray-bundle Jacobian, or star PSF (Formula 13)
 - Disk procedural turbulence / noise shear-advection (Formula CKS-12)
+- Derived config parameters — r_plus/r_isco/r_inner/T_0/orbital periods from base spin etc. (Formula CKS-13)
 - Any formula involving `r_isco`, `E_I`, `L_I`, `u^t`, `u^r`, `u^phi`, `g-factor`, `Carter Q`
 
 ---
@@ -1061,7 +1062,7 @@ as t grows (relative shear rate dΩ/dr). Standard fix — two pattern phases wit
 staggered resets, crossfaded (Neyret-style advected texture):
 
 ```
-s    = t_disk / T                       # T = config disk.noise.shear_period
+s    = t_disk / T                       # T = disk.dynamics.shear_period_M (DERIVED, CKS-13)
 a_k  = fract(s + k/2),  k ∈ {0, 1}      # each phase's age fraction ∈ [0, 1)
 c_k  = floor(s + k/2)                   # phase-k cycle index
 w_k  = 1 − |2·a_k − 1|                  # triangle weights; w_0 + w_1 ≡ 1
@@ -1073,7 +1074,8 @@ n(u, φ, ζ; t) = w_0·N(u, φ′_0, ζ; hash(seed, k=0, c_0))
 ```
 
 - `t_disk` is the disk animation time in geometric units; callers compute it as
-  `frame_index / render.fps × disk.noise.time_scale`.
+  `frame_index / render.fps × disk.dynamics.time_scale` (`time_scale` is DERIVED
+  by the CKS-13 resolver from `disk.dynamics.inner_lap_seconds`).
 - **Per-cycle reseed** (the `c_k` term in the hash, or equivalently a hashed
   per-cycle domain offset) is mandatory — without it the whole animation repeats
   with period T.
@@ -1120,6 +1122,48 @@ r_out_eff(φ,t) = r_outer·(1 + e_out·(n_e' − ½))
 
 ---
 
+## Formula CKS-13 — Derived disk/orbit parameters (the config resolver; owner-approved 2026-06-13)
+
+**Implemented in `src/renderer/kerr_params.py` (`resolve_config`), called by every
+config loader.** `configs/render.yaml` stores **base** parameters only (spin,
+disk extent, target peak temperature, `disk.dynamics` look targets); everything
+that is a function of them is derived at load time so no dependent literal can
+desync when a base parameter is edited (the old `r_isco: 1.182` failure mode).
+
+Nothing below is new physics — each line is a pinned formula or its trivial
+algebraic inverse:
+
+```
+r_plus  = 1 + sqrt(1 − a²)                       # Formula CKS-6, verbatim
+r_isco  = BPT closed form                        # Formula 2, verbatim (disk_flux.isco_radius)
+Ω(r)    = 1 / (r^{3/2} + a)                      # Formula 3, verbatim
+T_orb(r) = 2π/Ω = 2π·(r^{3/2} + a)               # Formula 3 inverse (geometric M)
+t_wrap  = 2π / (Ω(r_inner) − Ω(r_outer))         # one full differential 2π shear wrap
+
+# Derived config values:
+disk.r_inner          = r_isco            # 'auto'; numeric override clamped to ≥ r_isco
+                                          # (CKS-11 zero-torque BC / CKS-12 constraint 3)
+disk.T_0 (page_thorne) = T_peak           # f_PT LUT is max-normalized ⇒ max T_eff = T_0
+disk.T_0 (simple)      = T_peak·(r_inner/6)^{3/4}   # Decision-B law peaks at r_inner
+dynamics.time_scale    = T_orb(r_inner) / inner_lap_seconds    # M per footage second
+dynamics.shear_period_M = shear_wrap_budget · t_wrap           # CKS-12 §2 reset period T
+```
+
+**Closed forms, not lookup tables:** for Kerr orbital quantities the
+Bardeen–Press–Teukolsky (1972) expressions are exact — an external table would
+only add interpolation error on top of the same equations. Published values are
+pinned as **test anchors** instead (`tests/test_kerr_params.py`: a=0 → r_isco=6,
+r₊=2; a=1 → both 1; a=0.999 → 1.182/1.0447, the SKILL.md Formula-2 verified
+value). The one profile with no closed form, the Page–Thorne flux, is already a
+precomputed LUT (Formula CKS-11, `disk_flux.build_flux_lut`).
+
+**Override semantics:** an explicit numeric `disk.r_inner` (≥ r_isco) or a legacy
+`disk.T_0` key wins over derivation — artistic escape hatches, resolved at load,
+idempotent on re-resolve. `black_hole.r_isco` / `black_hole.r_plus` are ALWAYS
+overwritten and must not be stored in the YAML.
+
+---
+
 ## File locations (project conventions)
 
 ```
@@ -1127,11 +1171,12 @@ skills/kerr-physics/SKILL.md     ← this file
 src/renderer/geodesic.py         ← Formulas 1, 6, 7
 src/renderer/disk.py             ← Formulas 2, 3, 4, 5, 8, 9
 src/renderer/noise.py            ← (planned, D2) Formula CKS-12 noise primitives — CPU source of truth
+src/renderer/kerr_params.py      ← Formula CKS-13 config resolver (derived r_plus/r_isco/r_inner/T_0/dynamics)
 src/renderer/starmap.py          ← Formula 10
 src/renderer/taichi_renderer.py  ← Formulas 10, 13 (screen-space Jacobian, μ, star splat)
 scripts/ingest_stars.py          ← Formula 13 catalog pre-processing (HYG/ATHYG csv or BSC5 → {θ′, φ′, flux_rgb}.npy; I_base·chroma folded into flux)
 tests/test_geodesic.py           ← Conservation tests (Formula 6 conserved quantities)
-configs/render.yaml              ← a, r_isco, WIDTH, HEIGHT, step counts, stars:*
+configs/render.yaml              ← BASE params only: a, WIDTH, HEIGHT, step counts, stars:* (r_isco/r_plus/r_inner/T_0 derived at load — CKS-13)
 ```
 
 ---
@@ -1154,6 +1199,7 @@ configs/render.yaml              ← a, r_isco, WIDTH, HEIGHT, step counts, star
 | v1.11 | **Decision B Piece 2 — Page-Thorne flux WIRED (2026-06-12, D1).** The verified CKS-11 closed form is now live behind the runtime flag `disk.temperature_model` (default `simple`, so golden frames / the pinned GPU regression are unchanged). Path: `src/renderer/disk_flux.py` precomputes the normalized dimensionless shape `f_PT(r)=F/F_max` as a 1-D CPU LUT over `[r_isco, r_outer]` (`flux_lut_samples`, default 256; `lut[0]=0` zero-torque BC); `taichi_renderer._setup_disk_flux` always builds+uploads it (tiny → flag toggles per-render with no re-JIT); the disk kernel linear-interpolates it and sets `T_eff=T₀·f_PT^{1/4}` with emission amplitude ×`f_PT`. **g-bookkeeping preserved:** the explicit `g⁴` is kept and NOT doubled (`_blackbody_rgb` is chromaticity-only — the g⁸ error Formula 9 / CKS-11 Piece 3 warns about is avoided in both branches). Guards: `tests/test_disk_flux.py` (module vs pinned transcription + LUT properties) and a gpu-marked `tests/test_gpu_regression.py` page_thorne render check. `T₀` stays the amplitude knob. |
 | v1.12 | **`disk.doppler_strength` visualization dial documented (2026-06-12) — NOT a physics revision.** The kernel applies `g_eff = g^s` to the CKS-9 g-factor before Formula 9 (`s=1` default = formulas verbatim, branch skipped, bit-identical — verified Doppler 4.317×/peak 6.1665 vs goldens 4.32×/6.1667; `s=0` ⇒ shift fully off, the Interstellar/DNGR artistic treatment). Single application feeding both g⁴ and the chromaticity — the g⁴-not-g⁸ rule is unaffected. Scales the TOTAL g; an orbital-vs-gravitational split would require a new verified static-observer redshift formula first. GPU guard: `test_doppler_strength_zero_symmetrizes_disk` (s=0 ⇒ disk-only L/R ratio < 1.5). See the dial note under Formula CKS-9. |
 | v1.13 | **Formula CKS-12 ADDED — disk procedural turbulence (owner-approved 2026-06-13; NOT YET WIRED, backlog D2).** Visualization math for the layered-noise disk: disk-natural noise coordinates `(u=ln r/r_inner, φ=atan2(y,x), ζ=Δθ/σ_θ)` with the proof that this φ is advected at exactly Ω by the CKS-8 gas field (and is a static `arctan(a/r)` twist away from the KS azimuth — do not "fix"); Keplerian shear advection `φ′ = φ − Ω(r)·t_disk` (Ω = Formula 3 verbatim) with dual-phase triangle-weight reset blending, mandatory per-cycle reseed, optional variance-preserving normalization; and the modulation bookkeeping (noise multiplies density/T_emit/edge/height **amplitudes only** — never p_μ, u^μ, g, g⁴, chroma form, or f_PT; T-modulation pre-g so g⁴-not-g⁸ holds; `r_in_eff ≥ r_isco`; step-cap uses worst-case σ_z; integer φ-periodicity; `enabled:false` bit-identical; deterministic hash, no `ti.random`). Noise primitives (fBm/ridged/Voronoi) are texturing, not physics — specified in `docs/specs/2026-06-13-disk-noise-turbulence.md` with `src/renderer/noise.py` (planned) as the CPU source of truth. |
+| v1.14 | **Formula CKS-13 ADDED + WIRED — derived-parameter config resolver (owner-approved 2026-06-13).** `src/renderer/kerr_params.resolve_config` (called by every config loader: `taichi_renderer.load_config`, `scripts/thumb.py`) derives all spin/extent-dependent parameters at load: `r_plus` (CKS-6), `r_isco` (Formula 2), `disk.r_inner` (`auto` → r_isco; numeric override clamped ≥ r_isco), `disk.T_0` from the new base `disk.target_peak_temperature` (page_thorne: T_0=T_peak, LUT max-normalized; simple: T_0=T_peak·(r_inner/6)^¾), and the `disk.dynamics` time mapping (`T_orb=2π(r^{3/2}+a)` Formula-3 inverse; `t_wrap=2π/ΔΩ`; `time_scale=T_orb(r_in)/inner_lap_seconds`; `shear_period_M=budget·t_wrap` — the CKS-12 §2 reset period). No new physics: every line is a pinned formula or its trivial inverse. The YAML `r_isco`/`r_plus`/`r_inner`/`T_0` literals were REMOVED (the desync failure mode is gone); literature anchors (a=0→6/2, a=1→1/1, a=0.999→1.182/1.0447) pinned in `tests/test_kerr_params.py` instead of an external LUT — BPT closed forms are exact, only CKS-11 f_PT needs tabulation. Render-path impact: r_inner 1.182→1.181765 (exact ISCO); GPU regression metrics bit-identical except Doppler ratio Δ5e-6. |
 
 *Last verified: 2026-06-06 (F13 guard (b′) Layer-A splat-placement rule approved +
 landed; (b′) is a placement regularization derived from the already-verified guard-(a)
