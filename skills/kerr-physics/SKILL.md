@@ -10,6 +10,7 @@ Load this skill whenever the task involves:
 - Doppler beaming, redshift, or g-factor computation
 - Anti-aliasing / mipmap LOD for the starmap
 - Point-star magnification, ray-bundle Jacobian, or star PSF (Formula 13)
+- Disk procedural turbulence / noise shear-advection (Formula CKS-12)
 - Any formula involving `r_isco`, `E_I`, `L_I`, `u^t`, `u^r`, `u^phi`, `g-factor`, `Carter Q`
 
 ---
@@ -1021,12 +1022,111 @@ g³ that applies only to a 2D monochromatic surface.
 
 ---
 
+## Formula CKS-12 — Disk procedural turbulence: noise coordinates, Keplerian shear advection, modulation bookkeeping (VISUALIZATION)
+
+> **Status (2026-06-13): owner-approved design, NOT YET WIRED** (backlog **D2**;
+> design spec `docs/specs/2026-06-13-disk-noise-turbulence.md`). **Not new GR.**
+> The only physics input is Ω from **Formula 3, reused verbatim**. Everything else
+> is procedural texturing that multiplies *amplitude* quantities (density, emitted
+> temperature, edge/height windows). The noise primitives themselves (fBm, ridged
+> multifractal, Worley/Voronoi) are texturing functions, not physics — they are
+> specified in the design spec, with `src/renderer/noise.py` (CPU NumPy) as their
+> implementation source of truth and `@ti.func` twins held to it by tests.
+
+### 1. Noise coordinates (per disk sample, from CKS `(x, y, z)`)
+
+```
+r  = kerr_radius(x, y, z)            # CKS-1 (already computed in the disk kernel)
+φ  = atan2(y, x)
+u  = ln(r / r_inner)                 # log-radial: feature size scales with r (self-similar disk)
+ζ  = (θ − π/2) / (θ_half · σ_frac)   # vertical position in local Gaussian scale heights
+                                     #   (= the kernel's existing dz_ang / σ_theta)
+```
+
+- **Advection consistency:** under the CKS-8 gas field (`u^x = −Ωy·u^t`,
+  `u^y = +Ωx·u^t`), `d/dt atan2(y, x) = Ω` exactly — so advecting noise in this φ
+  is exactly co-moving with the same velocity field that drives the CKS-9 Doppler.
+- **φ is NOT the KS azimuth φ̃** (CKS-8: `x = r cosφ̃ + a sinφ̃ …` ⇒
+  `φ = φ̃ − arctan(a/r)`). The difference is a static, r-dependent twist of the
+  noise domain — visually harmless. Do not "fix" it by converting to φ̃.
+
+### 2. Keplerian shear advection with dual-phase reset
+
+```
+Ω(r) = 1 / (r^{3/2} + a)                        # Formula 3 — verbatim, prograde
+```
+
+Naive advection `φ′ = φ − Ω(r)·t` shears any pattern into infinitely thin spirals
+as t grows (relative shear rate dΩ/dr). Standard fix — two pattern phases with
+staggered resets, crossfaded (Neyret-style advected texture):
+
+```
+s    = t_disk / T                       # T = config disk.noise.shear_period
+a_k  = fract(s + k/2),  k ∈ {0, 1}      # each phase's age fraction ∈ [0, 1)
+c_k  = floor(s + k/2)                   # phase-k cycle index
+w_k  = 1 − |2·a_k − 1|                  # triangle weights; w_0 + w_1 ≡ 1
+
+φ′_k = φ − Ω(r) · (a_k · T)             # each phase sheared for at most T
+
+n(u, φ, ζ; t) = w_0·N(u, φ′_0, ζ; hash(seed, k=0, c_0))
+              + w_1·N(u, φ′_1, ζ; hash(seed, k=1, c_1))
+```
+
+- `t_disk` is the disk animation time in geometric units; callers compute it as
+  `frame_index / render.fps × disk.noise.time_scale`.
+- **Per-cycle reseed** (the `c_k` term in the hash, or equivalently a hashed
+  per-cycle domain offset) is mandatory — without it the whole animation repeats
+  with period T.
+- **Optional variance preservation:** the crossfade lowers contrast mid-blend
+  (`w² sum < 1`); dividing the blend by `sqrt(w_0² + w_1²)` removes the periodic
+  contrast "breathing" (config `variance_preserve`).
+- T is a look dial: long T → long Interstellar-style filaments; short T → choppier.
+
+### 3. Modulation bookkeeping — where noise MAY and MAY NOT enter
+
+With `m = Σ_i amp_i·(n_i − bias_i)` over the layer stack (spec §4):
+
+```
+density_mult = exp( clamp(m, −m_max, +m_max) )          # > 0 by construction
+ρ            = gauss(ζ) · density_mult                   # feeds BOTH emission and absorption
+emission     ∝ emis_c · ρ · [f_PT or 1] · g_eff⁴ · ds    # CKS-11 / Formula 9 unchanged
+dτ           = absb_c · ρ · ds                           # clumps self-shadow
+
+T_emit  ← T_emit · (1 + τ_amp·(n_T − ½))     # BEFORE the g shift: chroma(g_eff · T_emit)
+r_in_eff(φ,t)  = max( r_inner·(1 + e_in·(n_e − ½)),  r_isco )   # zero-torque BC kept
+r_out_eff(φ,t) = r_outer·(1 + e_out·(n_e' − ½))
+ρ ← ρ · smoothstep windows on [r_in_eff, r_out_eff]      # replaces the hard cutoffs
+σ_θ ← σ_θ · (1 + h_amp·(n_h − ½))                        # lumpy scale height
+```
+
+**Hard constraints (violating any of these is a physics bug, not a style choice):**
+
+1. Noise must NEVER touch `p_μ`, `u^μ` (CKS-8), `g` (CKS-9), the `g⁴` exponent
+   (Formula 9), the blackbody chromaticity form, or the `f_PT` radial shape
+   (CKS-11). Amplitude quantities only.
+2. Temperature modulation applies to the **emitted** `T_emit` before the `g_eff`
+   shift — the g⁴-not-g⁸ bookkeeping of Formula 9 / CKS-11 Piece 3 is unaffected.
+3. `r_in_eff ≥ r_isco` always (CKS-11 zero-torque BC; no emission from the plunge).
+4. The CKS-5 Pipe-B vertical step cap must use the **worst-case modulated** scale
+   height `σ_z·(1 − h_amp/2)`, or the face-on moiré that `disk.max_step_vfrac`
+   fixed returns.
+5. Every noise lattice is **integer-periodic in φ** (period 2π ⇒ `freq_phi ∈ ℤ`) —
+   no seam at φ = 0.
+6. `disk.noise.enabled: false` must take a branch **bit-identical** to the
+   pre-noise kernel (the `doppler_strength == 1.0` pattern) — golden frames stay
+   valid.
+7. Deterministic integer hashing only (seed from config); **no `ti.random`** —
+   same seed + same `t_disk` ⇒ identical frame.
+
+---
+
 ## File locations (project conventions)
 
 ```
 skills/kerr-physics/SKILL.md     ← this file
 src/renderer/geodesic.py         ← Formulas 1, 6, 7
 src/renderer/disk.py             ← Formulas 2, 3, 4, 5, 8, 9
+src/renderer/noise.py            ← (planned, D2) Formula CKS-12 noise primitives — CPU source of truth
 src/renderer/starmap.py          ← Formula 10
 src/renderer/taichi_renderer.py  ← Formulas 10, 13 (screen-space Jacobian, μ, star splat)
 scripts/ingest_stars.py          ← Formula 13 catalog pre-processing (HYG/ATHYG csv or BSC5 → {θ′, φ′, flux_rgb}.npy; I_base·chroma folded into flux)
@@ -1053,6 +1153,7 @@ configs/render.yaml              ← a, r_isco, WIDTH, HEIGHT, step counts, star
 | v1.10 | **Decision B Piece 2 — Page-Thorne flux VERIFIED & UNBLOCKED (2026-06-12).** Owner supplied a clean equation-intact source (`paper/1104.5499v3.md`, Page-Thorne 1974 via Abramowicz-Fragile 2013). The ⛔ PROVISIONAL `Q/(B C^{1/2} D^{1/2})` transcription was **discarded** (different, unverified parametrization) and replaced by the canonical closed-form **Formula CKS-11**: cubic roots `y₁,y₂,y₃` of `y³−3y+2a=0`, correction functions B/C, and the three-log `bracket(y)`. **Verified numerically:** the closed form reproduces the §1 conservation-law flux integral (using Formula 3/4 Ẽ,L̃,Ω) to 5 sig figs over r∈[1.5,28] M at a=0.999, differing only by the overall `3/2·√−g` constant the closed form drops; roots satisfy the cubic to machine precision; zero-torque BC `F(r_ms)=0` holds. Regression guard added: `tests/test_disk_flux.py`. D function not needed (folded into the closed form). Owner-approved to implement behind a config flag; **ACTIVE disk still Decision-B-simple — kernel not yet wired.** |
 | v1.11 | **Decision B Piece 2 — Page-Thorne flux WIRED (2026-06-12, D1).** The verified CKS-11 closed form is now live behind the runtime flag `disk.temperature_model` (default `simple`, so golden frames / the pinned GPU regression are unchanged). Path: `src/renderer/disk_flux.py` precomputes the normalized dimensionless shape `f_PT(r)=F/F_max` as a 1-D CPU LUT over `[r_isco, r_outer]` (`flux_lut_samples`, default 256; `lut[0]=0` zero-torque BC); `taichi_renderer._setup_disk_flux` always builds+uploads it (tiny → flag toggles per-render with no re-JIT); the disk kernel linear-interpolates it and sets `T_eff=T₀·f_PT^{1/4}` with emission amplitude ×`f_PT`. **g-bookkeeping preserved:** the explicit `g⁴` is kept and NOT doubled (`_blackbody_rgb` is chromaticity-only — the g⁸ error Formula 9 / CKS-11 Piece 3 warns about is avoided in both branches). Guards: `tests/test_disk_flux.py` (module vs pinned transcription + LUT properties) and a gpu-marked `tests/test_gpu_regression.py` page_thorne render check. `T₀` stays the amplitude knob. |
 | v1.12 | **`disk.doppler_strength` visualization dial documented (2026-06-12) — NOT a physics revision.** The kernel applies `g_eff = g^s` to the CKS-9 g-factor before Formula 9 (`s=1` default = formulas verbatim, branch skipped, bit-identical — verified Doppler 4.317×/peak 6.1665 vs goldens 4.32×/6.1667; `s=0` ⇒ shift fully off, the Interstellar/DNGR artistic treatment). Single application feeding both g⁴ and the chromaticity — the g⁴-not-g⁸ rule is unaffected. Scales the TOTAL g; an orbital-vs-gravitational split would require a new verified static-observer redshift formula first. GPU guard: `test_doppler_strength_zero_symmetrizes_disk` (s=0 ⇒ disk-only L/R ratio < 1.5). See the dial note under Formula CKS-9. |
+| v1.13 | **Formula CKS-12 ADDED — disk procedural turbulence (owner-approved 2026-06-13; NOT YET WIRED, backlog D2).** Visualization math for the layered-noise disk: disk-natural noise coordinates `(u=ln r/r_inner, φ=atan2(y,x), ζ=Δθ/σ_θ)` with the proof that this φ is advected at exactly Ω by the CKS-8 gas field (and is a static `arctan(a/r)` twist away from the KS azimuth — do not "fix"); Keplerian shear advection `φ′ = φ − Ω(r)·t_disk` (Ω = Formula 3 verbatim) with dual-phase triangle-weight reset blending, mandatory per-cycle reseed, optional variance-preserving normalization; and the modulation bookkeeping (noise multiplies density/T_emit/edge/height **amplitudes only** — never p_μ, u^μ, g, g⁴, chroma form, or f_PT; T-modulation pre-g so g⁴-not-g⁸ holds; `r_in_eff ≥ r_isco`; step-cap uses worst-case σ_z; integer φ-periodicity; `enabled:false` bit-identical; deterministic hash, no `ti.random`). Noise primitives (fBm/ridged/Voronoi) are texturing, not physics — specified in `docs/specs/2026-06-13-disk-noise-turbulence.md` with `src/renderer/noise.py` (planned) as the CPU source of truth. |
 
 *Last verified: 2026-06-06 (F13 guard (b′) Layer-A splat-placement rule approved +
 landed; (b′) is a placement regularization derived from the already-verified guard-(a)

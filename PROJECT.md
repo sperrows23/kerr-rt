@@ -30,8 +30,9 @@ one forward-looking proposal. This file supersedes the former `PROJECT_MAP.md`,
 5. [Physics formula index (`SKILL.md`)](#5-physics-formula-index-skillmd)
 6. [Implementation status — shipped](#6-implementation-status--shipped)
 7. [Remaining work & known issues](#7-remaining-work--known-issues)
-8. [Future proposal — DNGR background rearchitecture (gated)](#8-future-proposal--dngr-background-rearchitecture-gated)
+8. [DNGR background rearchitecture (SHIPPED)](#8-dngr-background-rearchitecture-shipped--starfieldmode-dngr)
 9. [Reference material & related files](#9-reference-material--related-files)
+10. [Accretion-disk procedural turbulence (PLANNED — D2)](#10-accretion-disk-procedural-turbulence-planned--d2)
 
 ---
 
@@ -461,6 +462,8 @@ celestial direction). CKS PART II index:
 | CKS-8 | Equatorial disk gas 4-velocity: rigid +z rotation at Ω (no BL→KS Jacobian) |
 | CKS-9 | g-factor = −E/(p_t u^t + p_x u^x + p_y u^y + p_z u^z) (Cartesian dot product) |
 | CKS-10 | Escaped-ray celestial dir = normalized contravariant (p^x,p^y,p^z) → (θ′,φ′) |
+| CKS-11 | Page-Thorne flux shape f_PT(r) (cubic roots + three-log bracket, zero-torque BC) — **wired** behind `disk.temperature_model: page_thorne` (D1) |
+| CKS-12 | Disk procedural turbulence (**planned**, D2): noise coords (u=ln r/r_inner, φ, ζ), Keplerian shear advection φ′=φ−Ω(r)·t with dual-phase reset blend (Ω = Formula 3 verbatim), modulation bookkeeping (amplitudes only — density/T_emit/edges/σ_θ; never p_μ/u^μ/g/g⁴/f_PT) |
 
 PART I (retired/reused) formula index:
 
@@ -689,6 +692,7 @@ re-derive. **`disk.py`, `geodesic.py`/`metric.py` CPU references, and any
 | **2.3** | Hardware `ti.Texture` starmap + `sample_lod` | **Deferred (external)** — Taichi 1.7.4 has no mip-upload API; revisit only after a Taichi upgrade is independently justified and re-validated on sm_120 (CLAUDE.md pins 1.7.4) | External |
 | **T3** | Moving-camera observer model (camera peculiar velocity, not just ZAMO) | **Roadmap, gated** — needs a new `SKILL.md` tetrad-boost formula approved (human review) before any code; high risk if rushed (sign/normalization) | Physics (gated) |
 | **D1** | Decision-B physical disk: Page-Thorne flux profile (replaces simple `(6/r)^0.75`) | ✅ **Resolved (2026-06-12)** — wired behind `disk.temperature_model: page_thorne` (default `simple`); LUT in `src/renderer/disk_flux.py`; GPU guard in `test_gpu_regression.py`. Closed form is `SKILL.md` Formula **CKS-11** (numerically reproduces the conservation-law flux integral; guard `tests/test_disk_flux.py`; SKILL.md rev v1.11). The "wire the LUT" path: CPU-precompute `f_PT(r)` shape LUT → `T_eff=T₀·f_PT^{1/4}`, amplitude ×f_PT → sampled in the disk kernel **behind the config flag** (`T₀` stays the amplitude knob; g⁴-not-g⁸ respected, Formula 9 / CKS-11 Piece 3). Default disk stays Decision-B-simple, so golden frames / pinned GPU regression are unchanged. | Physics |
+| **D2** | Disk procedural turbulence: layered noise (Interstellar-base fBm + MRI clump/tear ridged-MF/Voronoi accents) with full Keplerian shear advection, modulating density, temperature, edges, and scale height | **Planned — design approved 2026-06-13.** Spec: `docs/specs/2026-06-13-disk-noise-turbulence.md`; math: SKILL.md Formula **CKS-12** (rev v1.13; Ω = Formula 3 verbatim, all noise amplitude-only); build order in **§10** (D2.1 noise lib → D2.2 static look-dev → D2.3 advection → D2.4 T/edges/height → D2.5 MB-jitter/golden/docs). **No code yet**; `disk.noise.enabled: false` will be a bit-identical branch, golden frames intact | Visualization |
 
 ### Code-review findings (verified against current code)
 
@@ -1009,3 +1013,60 @@ test confirmed); tune `starfield.mag_zero_point` (currently 0.0) against a grade
   *Gravitational Lensing by Spinning Black Holes… and in the movie Interstellar*
   (Class. Quantum Grav. 32 065001). The academic source for §8 (DNGR ray-bundle
   technique, magnification, caustics).
+- **`research/accretion-disk/`** — scouted + (sub-domain B) validated source corpus
+  for the disk-turbulence work (§10): `sources-procedural-noise.md` +
+  `validation-procedural-noise.md`. Validator caveat: only VERIFIED-rated excerpts
+  are trustworthy (several sources carry scout paraphrases presented as quotes).
+
+---
+
+## 10. Accretion-disk procedural turbulence (PLANNED — D2)
+
+**Status: design approved 2026-06-13; docs landed (SKILL.md CKS-12 rev v1.13, spec
+below); NO renderer code yet.** Backlog row **D2** (§7).
+
+**Spec of record:** `docs/specs/2026-06-13-disk-noise-turbulence.md` — layer stack,
+noise primitives, config draft, perf budget, test plan.
+**Math of record:** SKILL.md **Formula CKS-12** — noise coordinates, shear
+advection, modulation bookkeeping (hard constraints 1–7).
+
+### What it is
+
+The disk's radial-only profile (rings) gains fluid-like structure from **layered
+procedural noise evaluated in-kernel** at disk-natural coordinates
+`(u = ln r/r_inner, φ = atan2(y,x), ζ = Δθ/σ_θ)` and **advected by Keplerian shear**
+`φ′ = φ − Ω(r)·t_disk` (Ω = Formula 3 verbatim; dual-phase reset blend caps the
+shear stretching). Three layers: L0 anisotropic fBm (Interstellar filaments along
+orbits), L1 ridged-multifractal × Voronoi-billow under a slow coverage mask (MRI
+clumping/tearing), L2 low-frequency fBm (large-scale patchiness). Noise multiplies
+**amplitudes only** — volumetric density (emission *and* absorption → clumps
+self-shadow), emitted temperature (pre-g-shift, ≤ ~±15%), smoothstep edge windows
+(`r_in_eff ≥ r_isco` always), and scale height σ_θ. The geodesic path, g-factor,
+g⁴ bookkeeping, and f_PT shape are untouched.
+
+### Key plumbing facts (why this isn't a pure-kernel change)
+
+- The renderer gets its **first time variable**: `render_beauty_frame(..., t_disk)`
+  with `t_disk = frame_index / render.fps × disk.noise.time_scale`.
+- **Motion blur:** `render_beauty_frame_mb` must jitter `t_disk` across the shutter
+  alongside the camera `dphi` jitter — the rotate-the-camera trick alone is only
+  valid while the disk is axisymmetric.
+- **No re-JIT look-dev:** layer parameters go in a small uploaded `ti.field` param
+  buffer (`_setup_disk_noise`, following the D1 `_setup_disk_flux` / ti.init
+  re-setup pattern); `t_disk`/`enabled`/seed are kernel args.
+- **Step-cap interaction:** the CKS-5 vertical step cap must use the worst-case
+  modulated scale height `σ_z·(1 − h_amp/2)` or the face-on moiré returns.
+
+### Build order (each phase lands with tests + docs sync)
+
+| Phase | Scope | Gate |
+|---|---|---|
+| D2.0 | Docs (CKS-12, spec, this section) | ✅ done 2026-06-13 |
+| D2.1 | `src/renderer/noise.py` CPU reference + `@ti.func` twins + `tests/test_noise.py` (CPU↔GPU agreement, φ-periodicity, determinism) | no renderer change |
+| D2.2 | Static structure: `(u,φ,ζ)` mapping + 3 layers on density only at `t_disk=0`; `disk.noise` config block; off-branch bit-identity vs goldens; **thumb.py look-dev loop** | perf ≤ 2× thumb, ≤ ~1.5× 4K |
+| D2.3 | Shear advection: `t_disk` plumbing, dual-phase reset + per-cycle reseed, temporal-continuity test | short thumb sequence review |
+| D2.4 | Temperature + edges + scale height (incl. step-cap σ_z fix, extended convergence test) | `test_disk_step_convergence.py` green |
+| D2.5 | MB `t_disk` jitter, perf pass, noise-on golden (fixed seed/t), docs/memory sync | owner sign-off; `enabled` stays `false` until owner flips it |
+
+Known confound: the pre-existing `doppler_strength=0.1` regression failure
+(2026-06-12) predates D2 — do not attribute it to this work.
