@@ -476,7 +476,7 @@ celestial direction). CKS PART II index:
 | CKS-9 | g-factor = −E/(p_t u^t + p_x u^x + p_y u^y + p_z u^z) (Cartesian dot product) |
 | CKS-10 | Escaped-ray celestial dir = normalized contravariant (p^x,p^y,p^z) → (θ′,φ′) |
 | CKS-11 | Page-Thorne flux shape f_PT(r) (cubic roots + three-log bracket, zero-torque BC) — **wired** behind `disk.temperature_model: page_thorne` (D1) |
-| CKS-12 | Disk procedural turbulence (**density wired** through D2.3, 2026-06-13; T/edges/σ_θ planned D2.4): noise coords (u=ln r/r_inner, φ, ζ), Keplerian shear advection φ′=φ−Ω(r)·t_disk with dual-phase reset blend (Ω = Formula 3 verbatim), modulation bookkeeping (amplitudes only — density/T_emit/edges/σ_θ; never p_μ/u^μ/g/g⁴/f_PT) |
+| CKS-12 | Disk procedural turbulence (**density wired** through D2.3, 2026-06-13; T/edges/σ_θ planned D2.4): noise coords (u=ln r/r_inner, φ, ζ), Keplerian shear advection φ′=φ−Ω(r)·t_disk with dual-phase reset blend (Ω = Formula 3 verbatim), modulation bookkeeping (amplitudes only — density/T_emit/edges/σ_θ; never p_μ/u^μ/g/g⁴/f_PT). Non-physical `disk.noise.dynamism` viz gain (φ′=φ−dynamism·Ω·a·T, default 1.0=bit-identical) emphasises per-frame swirl — same dial spirit as `doppler_strength` (SKILL.md v1.19) |
 | CKS-13 | Derived-parameter config resolver (**wired**, D3, 2026-06-13): `kerr_params.resolve_config` injects r_plus (CKS-6), r_isco (Formula 2), `disk.r_inner` (auto→r_isco, override clamped), `disk.T_0` from `target_peak_temperature` (per temperature model), and `disk.dynamics` time mapping (T_orb=2π(r^{3/2}+a), t_wrap=2π/ΔΩ → `time_scale`, `shear_period_M`). No new physics — pinned formulas + trivial inverses; literature anchors in `tests/test_kerr_params.py` |
 
 PART I (retired/reused) formula index:
@@ -1052,8 +1052,12 @@ The renderer's first time variable `t_disk = frame/fps·time_scale` is threaded 
 **and** `shear_period ≤ 0` (no `disk.dynamics`) both keep the legacy/D2.2-static
 bit-identical branch (golden frames intact). Tests: `test_noise.py` (25 CPU, incl. §2
 advection: static fallback / evolution / determinism / reset-continuity / variance-
-preserve), `test_noise_gpu.py` (10 CUDA), `test_disk_noise.py` (6 CUDA: bit-identity,
-enabled-changes-disk, determinism, seed, static + advected GPU↔CPU stack agreement).
+preserve / dynamism unit-gain bit-identity / dynamism winding-emphasis), `test_noise_gpu.py`
+(10 CUDA), `test_disk_noise.py` (7 CUDA: bit-identity, enabled-changes-disk, determinism,
+seed, static + advected GPU↔CPU stack agreement, dynamism-gain agreement+effect).
+A non-physical `disk.noise.dynamism` viz gain (default 1.0 = bit-identical) scales the
+shear amount (`φ′=φ−dynamism·Ω·a·T`) to emphasise the per-frame swirl without changing
+the reset cadence — added 2026-06-13 after the swirl read too weak in a look-dev render.
 D2.4 (T/edges/height) pending.** Backlog row **D2** (§7).
 
 **Spec of record:** `docs/specs/2026-06-13-disk-noise-turbulence.md` — layer stack,

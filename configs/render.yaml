@@ -101,6 +101,11 @@ disk:
     variance_preserve: true # D2.3: divide the dual-phase blend by √(w0²+w1²) so contrast
                            # doesn't "breathe" at mid-crossfade (w0=w1=0.5). No effect on
                            # the static path (single phase).
+    dynamism: 1.0          # NON-PHYSICAL viz gain on the shear amount: φ′ = φ − dynamism·Ω·a·T.
+                           # 1.0 = the CKS-12 §2 formula exactly (bit-identical). >1 emphasises
+                           # the per-frame differential winding (swirl) without speeding up the
+                           # reset cadence — bump this (e.g. 3–6) when the swirl reads too weak.
+                           # Artistic dial, like disk.doppler_strength; not a metric change.
     layers:
       # L0 base streaks — fBm, features long along the orbit (freq_phi ≪ freq_u).
       base:  {enabled: true, amp: 0.6, octaves: 5, lacunarity: 2.0, gain: 0.5,

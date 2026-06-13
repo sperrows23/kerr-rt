@@ -141,6 +141,9 @@ disk:
     # disk.dynamics.{inner_lap_seconds: 10.0, shear_wrap_budget: 3.0} (already in
     # render.yaml). They rescale automatically with spin and disk extent.
     variance_preserve: true   # divide blend by sqrt(w0²+w1²) (CKS-12 §2)
+    dynamism: 1.0        # NON-PHYSICAL viz gain on the shear amount φ′=φ−dynamism·Ω·a·T
+                         # (1.0 = formula, bit-identical; >1 emphasises per-frame swirl,
+                         # leaves reset cadence/continuity untouched — like doppler_strength)
     m_max: 2.5            # clamp on the log-density sum
     layers:
       base:  {enabled: true, amp: 0.6, octaves: 5, lacunarity: 2.0, gain: 0.5,
@@ -236,6 +239,13 @@ peak 6.17→14.45 and Doppler ratio 4.32→5.15 — NOT just `doppler_strength`.
   goldens + GPU stack-agreement untouched. Tests: `test_noise.py §2` (static
   fallback, evolution, determinism, reset-continuity over [0,2T], variance-preserve)
   + `test_disk_noise.py::test_advected_stack_matches_cpu_reference` (GPU↔CPU).
+  **Follow-up 2026-06-13:** added the non-physical `disk.noise.dynamism` viz gain
+  (`φ′=φ−dynamism·Ω·a·T`, default 1.0 = bit-identical) after the swirl read too weak
+  in a look-dev render — in the first reset cycle the visible winding is `Ω·t_disk`
+  (T cancels), so per-frame swirl was previously only tunable via the *physical*
+  `inner_lap_seconds`. The gain emphasises it without touching reset cadence/continuity.
+  Tests: `test_noise.py` (unit-gain bit-identity + winding-emphasis) +
+  `test_disk_noise.py::test_dynamism_gain_matches_cpu_and_changes_shear`.
 - **D2.4 — Temperature + edges + scale height.** Including the step-cap σ_z
   interaction and the extended convergence test.
 - **D2.5 — Finish.** Motion-blur `t_disk` jitter, perf pass, noise-on golden

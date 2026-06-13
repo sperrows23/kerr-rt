@@ -241,3 +241,52 @@ def test_advected_stack_matches_cpu_reference():
     # Looser than the static guard: s/a_k/w_k/φ′ are f32 on both sides but the φ shift
     # (Ω·a·T ~ 1 rad) feeds a high-freq_phi lattice, so f32 rounding spreads a touch.
     assert np.allclose(gpu, cpu, rtol=1e-3, atol=2e-3), float(np.abs(gpu - cpu).max())
+
+
+def test_dynamism_gain_matches_cpu_and_changes_shear():
+    """The non-physical ``disk.noise.dynamism`` viz gain (φ′ = φ − dynamism·Ω·a·T)
+    must (a) still agree GPU↔CPU at a gain ≠ 1, and (b) actually move the field versus
+    gain = 1 (so the dial does something). Same advection setup as the test above.
+    """
+    import taichi as ti
+
+    from renderer import noise
+
+    _ensure_cuda()
+    T = 10.0
+    t_disk = 1.3 * T
+    nz_gain = copy.deepcopy(_NOISE_ON)
+    nz_gain["dynamism"] = 4.0
+    tr._setup_disk_noise({"disk": {"noise": nz_gain,
+                                   "dynamics": {"shear_period_M": T}}})
+    seed = int(nz_gain["seed"])
+
+    rng = np.random.default_rng(2)
+    n = 4096
+    u = rng.uniform(0.0, 3.0, n).astype(np.float32)
+    phi = rng.uniform(-np.pi, np.pi, n).astype(np.float32)
+    zeta = rng.uniform(-2.5, 2.5, n).astype(np.float32)
+    omega = rng.uniform(0.05, 0.4, n).astype(np.float32)
+
+    uf = ti.field(ti.f32, n)
+    pf = ti.field(ti.f32, n)
+    zf = ti.field(ti.f32, n)
+    omf = ti.field(ti.f32, n)
+    of = ti.field(ti.f32, n)
+    uf.from_numpy(u); pf.from_numpy(phi); zf.from_numpy(zeta); omf.from_numpy(omega)
+
+    @ti.kernel
+    def k_adv(s: ti.i32, td: ti.f32):
+        for i in range(n):
+            of[i] = tr._disk_noise_density_mult(uf[i], pf[i], zf[i], td, omf[i], s)
+
+    k_adv(seed, t_disk)
+    gpu = of.to_numpy()
+    cpu_gain = noise.noise_density_mult(u, phi, zeta, nz_gain, seed=seed,
+                                        t_disk=t_disk, omega=omega, shear_period=T)
+    assert np.allclose(gpu, cpu_gain, rtol=1e-3, atol=2e-3), float(np.abs(gpu - cpu_gain).max())
+
+    # gain = 1 is a different field: the dial demonstrably emphasises the winding.
+    cpu_unit = noise.noise_density_mult(u, phi, zeta, _NOISE_ON, seed=seed,
+                                        t_disk=t_disk, omega=omega, shear_period=T)
+    assert not np.allclose(cpu_gain, cpu_unit, rtol=1e-2, atol=1e-2)

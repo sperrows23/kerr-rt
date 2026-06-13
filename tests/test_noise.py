@@ -323,3 +323,31 @@ def test_variance_preserve_restores_contrast():
     off = noise.noise_density_mult(u, phi, zeta, nz_off, seed=5,
                                    t_disk=t_mid, omega=omega, shear_period=T)
     assert np.log(on).std() > np.log(off).std()
+
+
+def test_dynamism_unit_gain_is_bit_identical():
+    """``dynamism: 1.0`` (and an omitted key) reproduce the CKS-12 §2 formula exactly —
+    the viz gain is opt-in and the default path is unchanged bit-for-bit."""
+    u, phi, zeta, omega = _adv_grid()
+    T = 4.0
+    kw = dict(seed=7, t_disk=1.3 * T, omega=omega, shear_period=T)
+    base = noise.noise_density_mult(u, phi, zeta, _NZ, **kw)
+    unit = noise.noise_density_mult(u, phi, zeta, {**_NZ, "dynamism": 1.0}, **kw)
+    assert np.array_equal(base, unit)
+
+
+def test_dynamism_gain_emphasises_winding():
+    """A gain > 1 scales the shear (φ′ = φ − dynamism·Ω·a·T), so the field is pushed
+    further from the unsheared (static) field than gain = 1 is — i.e. the dial makes
+    the swirl read stronger for a given frame."""
+    u, phi, zeta, omega = _adv_grid()
+    T = 4.0
+    t = 0.3 * T
+    static = noise.noise_density_mult(u, phi, zeta, _NZ, seed=5)
+    g1 = noise.noise_density_mult(u, phi, zeta, {**_NZ, "dynamism": 1.0}, seed=5,
+                                  t_disk=t, omega=omega, shear_period=T)
+    g4 = noise.noise_density_mult(u, phi, zeta, {**_NZ, "dynamism": 4.0}, seed=5,
+                                  t_disk=t, omega=omega, shear_period=T)
+    dev1 = np.abs(np.log(g1) - np.log(static)).mean()
+    dev4 = np.abs(np.log(g4) - np.log(static)).mean()
+    assert dev4 > dev1

@@ -185,9 +185,14 @@ _NI_L0_EN, _NI_L0_AMP, _NI_L0_OCT, _NI_L0_LAC, _NI_L0_GAIN, _NI_L0_FU, _NI_L0_FP
  _NI_L2_FP) = range(22, 29)
 # D2.3 shear advection: T = disk.dynamics.shear_period_M (CKS-13-derived reset
 # period); var_preserve = disk.noise.variance_preserve (1/0). ≤ 0 T ⇒ static path.
+# dynamism = disk.noise.dynamism — a NON-PHYSICAL viz gain on the CKS-12 §2 shear
+# amount (φ′ = φ − dynamism·Ω·a·T). 1.0 = the physical formula (bit-identical);
+# >1 exaggerates the differential winding per frame. Same dial spirit as
+# disk.doppler_strength: artistic emphasis, not a metric change.
 _NI_SHEAR_T = 29
 _NI_VAR_PRESERVE = 30
-_NOISE_N = 31
+_NI_DYNAMISM = 31
+_NOISE_N = 32
 
 # Layer-stack constants — sourced from noise.py (the CPU twin) so the GPU kernel
 # and the CPU reference noise.noise_density_mult can never drift apart.
@@ -447,6 +452,9 @@ def _setup_disk_noise(cfg: dict) -> None:
     # so configs without dynamics stay bit-identical to the static stack.
     buf[_NI_SHEAR_T] = float(dyn.get("shear_period_M", 0.0))
     buf[_NI_VAR_PRESERVE] = 1.0 if nz.get("variance_preserve", True) else 0.0
+    # Non-physical viz gain on the shear amount (1.0 = the CKS-12 §2 formula exactly,
+    # bit-identical; >1 emphasises the per-frame differential winding).
+    buf[_NI_DYNAMISM] = float(nz.get("dynamism", 1.0))
 
     # L0 — base streaks (fBm)
     buf[_NI_L0_EN] = 1.0 if base.get("enabled", False) else 0.0
@@ -956,8 +964,10 @@ def _disk_noise_density_mult(u, phi, zeta, t_disk, omega, seed):
     each phase draws a per-cycle reseed (``c_k = floor(s + k/2)``) so the loop does not
     repeat with period T. ``_NI_VAR_PRESERVE`` divides the blend by ``√(w_0² + w_1²)``
     to kill the mid-crossfade contrast breathing. ``omega`` = Ω(r) (Formula 3) is
-    supplied by the caller. With ``T ≤ 0`` (no ``disk.dynamics`` block) the field is
-    static — sampled directly at ``φ`` — i.e. exactly the D2.2 path.
+    supplied by the caller. ``_NI_DYNAMISM`` is a non-physical viz gain on the shear
+    amount (``φ′ = φ − dynamism·Ω·a·T``; 1.0 reproduces the formula bit-for-bit, >1
+    exaggerates the differential winding). With ``T ≤ 0`` (no ``disk.dynamics`` block)
+    the field is static — sampled directly at ``φ`` — i.e. exactly the D2.2 path.
     """
     T = disk_noise_params[_NI_SHEAR_T]
     m = 0.0
@@ -966,13 +976,14 @@ def _disk_noise_density_mult(u, phi, zeta, t_disk, omega, seed):
         m = _disk_noise_m(u, phi, zeta, seed)
     else:
         s = t_disk / T
+        g = disk_noise_params[_NI_DYNAMISM]  # viz gain on the shear amount (1.0 = formula)
         wsq = 0.0
         # Phase k = 0.
         c0 = ti.floor(s)
         a0 = s - c0
         w0 = 1.0 - ti.abs(2.0 * a0 - 1.0)
         seed0 = seed + ti.cast(c0, ti.i32) * _NCYC_CYCLE
-        m += w0 * _disk_noise_m(u, phi - omega * (a0 * T), zeta, seed0)
+        m += w0 * _disk_noise_m(u, phi - g * omega * (a0 * T), zeta, seed0)
         wsq += w0 * w0
         # Phase k = 1 (half-period staggered reset).
         ar1 = s + 0.5
@@ -980,7 +991,7 @@ def _disk_noise_density_mult(u, phi, zeta, t_disk, omega, seed):
         a1 = ar1 - c1
         w1 = 1.0 - ti.abs(2.0 * a1 - 1.0)
         seed1 = seed + _NCYC_PHASE + ti.cast(c1, ti.i32) * _NCYC_CYCLE
-        m += w1 * _disk_noise_m(u, phi - omega * (a1 * T), zeta, seed1)
+        m += w1 * _disk_noise_m(u, phi - g * omega * (a1 * T), zeta, seed1)
         wsq += w1 * w1
         if disk_noise_params[_NI_VAR_PRESERVE] > 0.5 and wsq > 0.0:
             m = m / ti.sqrt(wsq)

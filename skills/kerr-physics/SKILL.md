@@ -1098,6 +1098,14 @@ n(u, φ, ζ; t) = w_0·N(u, φ′_0, ζ; hash(seed, k=0, c_0))
   (`w² sum < 1`); dividing the blend by `sqrt(w_0² + w_1²)` removes the periodic
   contrast "breathing" (config `variance_preserve`).
 - T is a look dial: long T → long Interstellar-style filaments; short T → choppier.
+- **Non-physical viz dial — `disk.noise.dynamism` (default 1.0):** the renderer
+  multiplies the shear amount by this gain, `φ′_k = φ − dynamism·Ω(r)·(a_k·T)`.
+  `dynamism = 1` reproduces the formula above bit-for-bit (the default path is
+  unchanged); `> 1` exaggerates the per-frame differential winding (the swirl) for a
+  given `t_disk` **without** changing the reset cadence (the `c_k`/reseed structure is
+  unaffected, so C0-continuity at resets still holds — `w_k = 0` at each reset
+  regardless of the gain). This is artistic emphasis only — the same dial spirit as
+  `disk.doppler_strength` (Formula CKS-9) — and touches no metric/g/g⁴ quantity.
 
 ### 3. Modulation bookkeeping — where noise MAY and MAY NOT enter
 
@@ -1202,6 +1210,7 @@ configs/render.yaml              ← BASE params only: a, WIDTH, HEIGHT, step co
 | Version | Change |
 |---|---|
 | v1.0 | Initial release |
+| v1.19 | **`disk.noise.dynamism` visualization dial ADDED (2026-06-13) — NOT a physics revision.** A non-physical gain on the CKS-12 §2 shear amount: `φ′_k = φ − dynamism·Ω(r)·(a_k·T)` in BOTH twins (`noise.noise_density_mult` reads `nz["dynamism"]`; GPU `_disk_noise_density_mult` reads param slot `_NI_DYNAMISM=31`, buffer grew 31→32). Motivation: in the first reset cycle the visible winding reduces to `Ω·t_disk` (T cancels), so per-frame swirl was only tunable via the *physical* `inner_lap_seconds` (which also speeds reseeding) — this dial emphasises the differential winding for a given frame without touching the reset cadence or C0-continuity (`w_k=0` at each reset regardless of gain). `dynamism=1.0` (and an omitted key) is **bit-identical** to v1.18 — guarded by `tests/test_noise.py::test_dynamism_unit_gain_is_bit_identical` + the unchanged advected agreement test; effect + GPU↔CPU agreement at gain≠1 by `test_dynamism_gain_emphasises_winding` (CPU) and `test_disk_noise.py::test_dynamism_gain_matches_cpu_and_changes_shear` (CUDA). Amplitude/φ-only, no GR/g/g⁴ touched. Same dial spirit as `disk.doppler_strength` (v1.12). |
 | v1.1 | **F6:** Corrected Carter constant to null geodesic form (−a²E², not a²(1−E²)). **F7:** Corrected lapse α to exact form using A = (r²+a²)²−a²Δsin²θ. **F9:** Documented that blackbody_rgb returns chromaticity only; clarified g⁴ is not double-counted, but will be if a physical Planck spectrum is substituted. |
 | v1.2 | **F6:** Removed the leftover massive-particle `μ²r²` term from the radial potential `R(r)`; the null (μ=0) form drops it. The previous form gave `g^{μν}p_μp_ν = −r²/Σ`, breaking the null-condition conservation test. |
 | v1.3 | **F10:** Added 2π normalization to the LOD formula — φ spans 2π radians across the 16384-texel starmap width, so dividing by 2π correctly maps the angular footprint to a texel footprint. Also switched to raw per-pixel exit deltas (δθ, δφ) rather than dividing by δu=1/WIDTH. The missing factor caused LOD to saturate at max mip for all background pixels, collapsing the LOD-on render to near-black. |

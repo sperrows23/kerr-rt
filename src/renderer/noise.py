@@ -484,6 +484,12 @@ def noise_density_mult(u, phi, zeta, nz, seed: int = 1234,
     contrast "breathing". ``omega`` = Ω(r) (Formula 3) is supplied per sample by the
     caller (it has ``r`` already); it may be a scalar or broadcastable array.
 
+    ``dynamism`` (``nz`` key, default 1.0) is a **non-physical viz gain** on the shear
+    amount: ``φ′_k = φ − dynamism·Ω·a_k·T``. At 1.0 it reproduces the CKS-12 §2 formula
+    bit-for-bit; >1 exaggerates the per-frame differential winding (the swirl) without
+    touching the reset cadence. Same dial spirit as ``disk.doppler_strength`` —
+    artistic emphasis, not a metric change.
+
     With ``shear_period ≤ 0`` (the default, and any config without a ``disk.dynamics``
     block) the field is **static** — sampled directly at ``phi`` — i.e. exactly the
     D2.2 path, so existing static callers/tests are unchanged. ``nz`` disabled layers
@@ -502,6 +508,7 @@ def noise_density_mult(u, phi, zeta, nz, seed: int = 1234,
         omega = _f32(omega)
         s = np.float32(t_disk) / T
         var_preserve = bool(nz.get("variance_preserve", True))
+        g = np.float32(nz.get("dynamism", 1.0))  # viz gain on the shear amount
         m = None
         wsq = np.float32(0.0)
         # Two staggered reset phases, crossfaded (Neyret-style advected texture).
@@ -511,7 +518,7 @@ def noise_density_mult(u, phi, zeta, nz, seed: int = 1234,
             ak = ar - np.float32(ck)         # age fraction ∈ [0, 1)
             wk = np.float32(1.0) - np.abs(np.float32(2.0) * ak - np.float32(1.0))
             seed_k = int(seed) + k * NCYC_PHASE + ck * NCYC_CYCLE
-            phi_k = phi - omega * (ak * T)   # CKS-12 §2: φ sheared for ≤ T
+            phi_k = phi - g * omega * (ak * T)   # CKS-12 §2: φ sheared for ≤ T (×gain)
             mk = wk * _noise_m_stack(u, phi_k, zeta, nz, seed_k)
             m = mk if m is None else m + mk
             wsq = wsq + wk * wk
