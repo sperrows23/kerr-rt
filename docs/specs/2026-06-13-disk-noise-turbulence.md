@@ -206,21 +206,36 @@ ray’s march). Mitigations, in order, **only if measured slow** (D2.2 gate:
 | New golden | one pinned noise-on frame (fixed seed, fixed `t_disk`) added to the GPU regression |
 | Conservation suite | untouched — noise never enters the geodesic path |
 
-Known pre-existing failure (memory, 2026-06-12): `doppler_strength=0.1` regression
-fails before this work starts — do not attribute it to D2.
+~~Known pre-existing failure (memory, 2026-06-12): `doppler_strength=0.1` regression
+fails before this work starts — do not attribute it to D2.~~ **RESOLVED 2026-06-13:**
+root-caused to D3/CKS-13 re-keying the simple-model peak temperature
+(`T_0`→`target_peak_temperature`, peak T_eff 18,600→5,500 K), which moved the disk
+peak 6.17→14.45 and Doppler ratio 4.32→5.15 — NOT just `doppler_strength`. The
+`test_gpu_regression.py` guards were re-anchored + made dynamic in `doppler_strength`
+(monotone g^s beaming sweep + re-measured s=1.0 goldens; SKILL.md v1.16).
 
 ## 9. Build order (phases gate on each other; each lands with its tests + docs sync)
 
 - **D2.0 — Docs (this commit).** SKILL.md CKS-12, this spec, PROJECT.md §7/§10.
 - **D2.1 — Noise primitive library.** `noise.py` CPU reference + `@ti.func` twins
   + `tests/test_noise.py` (agreement, periodicity, determinism). No renderer change.
-- **D2.2 — Static structure.** `(u, φ, ζ)` mapping + L0/L1/L2 on **density only**,
-  `t_disk = 0`; `disk.noise` config block lands; `_setup_disk_noise` param buffer;
-  off-branch bit-identity test; **look-dev loop via `thumb.py`** (most tuning
-  happens here); perf gate (§7).
-- **D2.3 — Shear advection.** `t_disk` plumbing, dual-phase reset blend +
-  per-cycle reseed (CKS-12 §2), temporal-continuity test, short thumb sequence
-  review.
+- **D2.2 — Static structure. ✅ done 2026-06-13.** `(u, φ, ζ)` mapping + L0/L1/L2 on
+  **density only**, `t_disk = 0`; `disk.noise` config block; `_setup_disk_noise`
+  param buffer; GPU `_disk_noise_density_mult` + CPU `noise.noise_density_mult` twin;
+  `thumb.py` look-dev; tests `test_disk_noise.py` (off-branch bit-identity,
+  enabled-changes-disk, determinism, seed, GPU↔CPU stack agreement) + 4 CPU stack
+  tests. Perf: noise-on ≈ 2.66× off at 960×540 (sub-100 ms; above the ≤2× target but
+  fine for offline — tunable via config-only octave dials, defaults are placeholders).
+- **D2.3 — Shear advection. ✅ done 2026-06-13.** `t_disk` plumbing
+  (`frame/fps·time_scale`, CKS-13) through `render_beauty_frame{,_mb}` →
+  `_disk_emit_cks`, `export_exr.py`, and `thumb.py --frame/--t-disk`; the §2
+  dual-phase reset blend + per-cycle integer reseed wraps the `m`-stack in both
+  `noise.noise_density_mult` (CPU) and `_disk_noise_density_mult` (GPU twin); Ω is
+  Formula 3 per disk sample. `disk.noise.variance_preserve` (default true) ÷√(Σw²).
+  `shear_period ≤ 0` (no `disk.dynamics`) ⇒ static D2.2 path, **bit-identical** —
+  goldens + GPU stack-agreement untouched. Tests: `test_noise.py §2` (static
+  fallback, evolution, determinism, reset-continuity over [0,2T], variance-preserve)
+  + `test_disk_noise.py::test_advected_stack_matches_cpu_reference` (GPU↔CPU).
 - **D2.4 — Temperature + edges + scale height.** Including the step-cap σ_z
   interaction and the extended convergence test.
 - **D2.5 — Finish.** Motion-blur `t_disk` jitter, perf pass, noise-on golden

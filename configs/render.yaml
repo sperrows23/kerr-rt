@@ -85,6 +85,33 @@ disk:
                            # inner edge → time_scale = T_orb(r_inner)/this. Smaller = faster disk.
     shear_wrap_budget: 3.0 # [look-dev] differential 2π-wraps across [r_inner, r_outer] tolerated
                            # before the CKS-12 reseed → shear_period_M = budget·2π/(Ω_in−Ω_out).
+  noise:                   # D2 procedural turbulence (SKILL.md CKS-12, spec docs/specs/
+                           # 2026-06-13-disk-noise-turbulence.md). D2.2 = static DENSITY
+                           # structure; D2.3 = Keplerian SHEAR ADVECTION (the field wraps
+                           # with t_disk → the Interstellar filament look). Needs the
+                           # disk.dynamics block above (shear_period_M); without it the
+                           # field stays static (bit-identical to D2.2). temperature/edges/
+                           # height are D2.4. All amps/freqs are [look-dev] placeholders.
+                           # freq_phi MUST be an integer (2π periodicity, CKS-12 constraint 5).
+    enabled: false         # master switch; false ⇒ branch bit-identical to the legacy
+                           # kernel (golden frames untouched, CKS-12 constraint 6).
+    seed: 1234             # deterministic integer hash seed (no ti.random; same seed +
+                           # same t_disk ⇒ identical frame, constraint 7).
+    m_max: 2.5             # clamp on the log-density sum: density_mult = exp(clamp(m, ±m_max)).
+    variance_preserve: true # D2.3: divide the dual-phase blend by √(w0²+w1²) so contrast
+                           # doesn't "breathe" at mid-crossfade (w0=w1=0.5). No effect on
+                           # the static path (single phase).
+    layers:
+      # L0 base streaks — fBm, features long along the orbit (freq_phi ≪ freq_u).
+      base:  {enabled: true, amp: 0.6, octaves: 5, lacunarity: 2.0, gain: 0.5,
+              freq_u: 6.0, freq_phi: 24}
+      # L1 clump/tear — ridged MF × Voronoi billow, gated by a slow coverage mask.
+      clump: {enabled: true, amp: 1.2, bias: 0.35, octaves: 3, lacunarity: 2.0,
+              gain: 0.5, freq_u: 3.0, freq_phi: 12, freq_z: 1.0, coverage: 0.45,
+              mask_freq_u: 1.0, mask_freq_phi: 3, ridge_offset: 1.0, voronoi_k: 4.0}
+      # L2 patchiness — subtle large-scale fBm breaking the ring symmetry.
+      patch: {enabled: true, amp: 0.35, octaves: 2, lacunarity: 2.0, gain: 0.5,
+              freq_u: 1.5, freq_phi: 4}
   # NOTE: the Phase-3.3 |u|=|cosθ| disk-slab early-out bound is now DERIVED in code
   # as sin(theta_half_width) (renderer.render_beauty_frame) — the old hardcoded
   # `bounding_sin_theta_half: 0.14944` literal duplicated it and desynced whenever

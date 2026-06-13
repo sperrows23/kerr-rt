@@ -53,6 +53,7 @@ from renderer.geodesic import (  # noqa: E402
 )
 from renderer.kerr_params import resolve_config  # noqa: E402
 from renderer.metric import kerr_radius  # noqa: E402
+from renderer.noise import noise_density_mult  # noqa: E402
 
 # CKS Cartesian coordinate index order (matches renderer.metric / geodesic).
 T, X, Y, Z = 0, 1, 2, 3
@@ -271,6 +272,25 @@ def march_disk(x: np.ndarray, p_cov: np.ndarray, dp: dict) -> tuple[np.ndarray, 
         # Vertical Gaussian density profile within the slab.
         density = np.exp(-0.5 * (dz / sigma_theta) ** 2)
 
+        # D2.2/D2.3 procedural turbulence (SKILL.md CKS-12 §2–3): multiply the
+        # density by the noise field (amplitude only — feeds emission AND
+        # absorption). Uses the SAME noise.noise_density_mult the GPU kernel
+        # mirrors, so a CPU thumb is a faithful look-dev preview of the beauty
+        # render. With dp["shear_period"] > 0 the field is Keplerian-sheared and
+        # reseeded against dp["t_disk"] (CKS-12 §2 dual-phase blend; Ω = Formula 3
+        # per sample); shear_period == 0 ⇒ the static D2.2 path.
+        if dp["noise_enabled"]:
+            u_n = np.log(r / dp["r_inner"])
+            phi_n = np.arctan2(float(yi), float(xi))
+            zeta_n = dz / sigma_theta
+            omega = 1.0 / (r**1.5 + a)  # Formula 3 (prograde Ω at this radius)
+            density *= float(
+                noise_density_mult(
+                    u_n, phi_n, zeta_n, dp["noise"], dp["noise_seed"],
+                    t_disk=dp["t_disk"], omega=omega, shear_period=dp["shear_period"],
+                )
+            )
+
         emission = dp["emission_coeff"] * density * chroma * (g**4) * ds
         color += transmittance * emission
         transmittance *= np.exp(-dp["absorption_coeff"] * density * ds)
@@ -278,9 +298,11 @@ def march_disk(x: np.ndarray, p_cov: np.ndarray, dp: dict) -> tuple[np.ndarray, 
     return color, transmittance
 
 
-def build_disk_params(cfg: dict, a: float, d_lambda: float) -> dict:
+def build_disk_params(cfg: dict, a: float, d_lambda: float, t_disk: float = 0.0) -> dict:
     """Assemble disk parameters from config (CKS-8 needs no frozen ISCO constants)."""
     d = cfg["disk"]
+    nz = d.get("noise", {}) or {}
+    dyn = d.get("dynamics") or {}
     return {
         "a": a,
         "r_inner": float(d["r_inner"]),
@@ -291,10 +313,19 @@ def build_disk_params(cfg: dict, a: float, d_lambda: float) -> dict:
         "emission_coeff": float(d["emission_coeff"]),
         "absorption_coeff": float(d["absorption_coeff"]),
         "d_lambda": d_lambda,
+        # D2.2 procedural turbulence (static; SKILL.md CKS-12). Off by default
+        # (disk.noise.enabled: false) ⇒ this CPU twin matches the legacy disk.
+        "noise": nz,
+        "noise_enabled": bool(nz.get("enabled", False)),
+        "noise_seed": int(nz.get("seed", 1234)),
+        # D2.3 shear advection (CKS-12 §2). shear_period == 0 (no disk.dynamics
+        # block) ⇒ static D2.2 noise. t_disk is the disk clock in geometric M.
+        "shear_period": float(dyn.get("shear_period_M", 0.0)),
+        "t_disk": float(t_disk),
     }
 
 
-def render(cfg: dict, res: int, with_disk: bool = False) -> np.ndarray:
+def render(cfg: dict, res: int, with_disk: bool = False, t_disk: float = 0.0) -> np.ndarray:
     bh = cfg["black_hole"]
     rcfg = cfg["render"]
     cam = cfg["camera"]
@@ -333,7 +364,7 @@ def render(cfg: dict, res: int, with_disk: bool = False) -> np.ndarray:
     )
     fwd, right, up = camera_basis(pos)
 
-    disk_params = build_disk_params(cfg, a, d_lambda) if with_disk else None
+    disk_params = build_disk_params(cfg, a, d_lambda, t_disk) if with_disk else None
 
     img = np.zeros((res, res, 3), dtype=float)
 
@@ -405,6 +436,13 @@ def main(argv: list[str] | None = None) -> None:
         help="Composite the volumetric accretion disk (Pipe B); "
         "saves thumb_disk.png instead of thumb_output.png.",
     )
+    parser.add_argument(
+        "--t-disk",
+        type=float,
+        default=None,
+        help="Disk clock in geometric M (CKS-12 §2 shear advection). Overrides the "
+        "value derived from --frame. Needs disk.dynamics in config to have any effect.",
+    )
     args = parser.parse_args(argv)
 
     cfg = load_config()
@@ -413,12 +451,21 @@ def main(argv: list[str] | None = None) -> None:
     if args.frame != 0:
         print(
             f"[warn] --frame {args.frame}: per-frame camera matrices are not "
-            f"wired up yet; using the config camera (frame 0)."
+            f"wired up yet; using the config camera (frame 0). The disk animation "
+            f"clock (t_disk) DOES advance with --frame."
         )
+
+    # D2.3 disk clock: t_disk = frame/fps · time_scale (geometric M, CKS-13).
+    # No disk.dynamics block ⇒ time_scale absent ⇒ 0 ⇒ static D2.2 noise.
+    if args.t_disk is not None:
+        t_disk = args.t_disk
+    else:
+        dyn = cfg["disk"].get("dynamics") or {}
+        t_disk = args.frame / float(cfg["render"]["fps"]) * float(dyn.get("time_scale", 0.0))
 
     from PIL import Image  # local import so --help works without Pillow
 
-    pixels = render(cfg, res, with_disk=args.disk)
+    pixels = render(cfg, res, with_disk=args.disk, t_disk=t_disk)
     out_name = "thumb_disk.png" if args.disk else "thumb_output.png"
     out_path = Path(__file__).resolve().parent / out_name
     Image.fromarray(pixels, mode="RGB").save(out_path)

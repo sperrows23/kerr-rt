@@ -45,7 +45,7 @@ import numpy as np
 import taichi as ti
 import yaml
 
-from renderer import disk_flux, kerr_params
+from renderer import disk_flux, kerr_params, noise
 from renderer.starmap import Starmap
 
 # --------------------------------------------------------------------------- #
@@ -161,6 +161,47 @@ _PT_LUT_N = 1
 _PT_LUT_R0 = 0.0
 _PT_LUT_INV_DR = 0.0
 
+# --- Disk procedural noise param buffer (D2.2; SKILL.md CKS-12, spec §4/§5) --- #
+# A small f32 ti.field holds ALL per-layer noise tuning params so look-dev edits
+# (amp / freq / octaves …) re-upload the buffer instead of re-JITting the kernel
+# (spec §6: "param buffer, not baked module constants"). ``disk.noise.enabled`` and
+# ``disk.noise.seed`` are kernel ARGS (toggle/seed per render). ALWAYS built+uploaded
+# in setup (tiny) so the enabled flag flips per-render with no re-JIT; when the flag
+# is 0 the kernel takes a branch bit-identical to the pre-noise path (CKS-12
+# constraint 6 — golden frames untouched). Index map (flat f32 layout) below; the
+# _NI_* scalars are plain Python ints baked at JIT (same pattern as _PT_LUT_N).
+disk_noise_params: ti.Field = None  # type: ignore[assignment]  (_NOISE_N,) f32
+
+# global
+_NI_M_MAX = 0
+# L0 base streaks (fbm2 on density)
+_NI_L0_EN, _NI_L0_AMP, _NI_L0_OCT, _NI_L0_LAC, _NI_L0_GAIN, _NI_L0_FU, _NI_L0_FP = range(1, 8)
+# L1 clump/tear (ridged3 × voronoi_billow3, coverage-masked)
+(_NI_L1_EN, _NI_L1_AMP, _NI_L1_BIAS, _NI_L1_OCT, _NI_L1_LAC, _NI_L1_GAIN, _NI_L1_FU,
+ _NI_L1_FP, _NI_L1_FZ, _NI_L1_COV, _NI_L1_MFU, _NI_L1_MFP, _NI_L1_ROFF,
+ _NI_L1_VK) = range(8, 22)
+# L2 patchiness (fbm2 on density)
+(_NI_L2_EN, _NI_L2_AMP, _NI_L2_OCT, _NI_L2_LAC, _NI_L2_GAIN, _NI_L2_FU,
+ _NI_L2_FP) = range(22, 29)
+# D2.3 shear advection: T = disk.dynamics.shear_period_M (CKS-13-derived reset
+# period); var_preserve = disk.noise.variance_preserve (1/0). ≤ 0 T ⇒ static path.
+_NI_SHEAR_T = 29
+_NI_VAR_PRESERVE = 30
+_NOISE_N = 31
+
+# Layer-stack constants — sourced from noise.py (the CPU twin) so the GPU kernel
+# and the CPU reference noise.noise_density_mult can never drift apart.
+_NSEED_L0 = noise.NSEED_L0
+_NSEED_L1_RIDGE = noise.NSEED_L1_RIDGE
+_NSEED_L1_VORO = noise.NSEED_L1_VORO
+_NSEED_L1_MASK = noise.NSEED_L1_MASK
+_NSEED_L2 = noise.NSEED_L2
+_NOISE_RIDGE_FEEDBACK = noise.RIDGE_FEEDBACK
+_NOISE_MASK_SOFT = noise.MASK_SOFT
+_NCYC_PHASE = noise.NCYC_PHASE  # dual-phase reseed offsets (CKS-12 §2, D2.3)
+_NCYC_CYCLE = noise.NCYC_CYCLE
+_INV_TWO_PI = 1.0 / (2.0 * math.pi)
+
 
 def _pack_pyramid(sm: Starmap):
     """Pack every mip level's RGB into one contiguous f16 buffer + per-level meta.
@@ -270,6 +311,7 @@ def setup_renderer(cfg: dict) -> Starmap:
 
     _setup_dngr(cfg)
     _setup_disk_flux(cfg)
+    _setup_disk_noise(cfg)
     return sm
 
 
@@ -374,6 +416,74 @@ def _setup_disk_flux(cfg: dict) -> None:
     _PT_LUT_INV_DR = 1.0 / dr if dr > 0.0 else 0.0
     disk_flux_lut = ti.field(dtype=ti.f32, shape=n)
     disk_flux_lut.from_numpy(lut)
+
+
+def _setup_disk_noise(cfg: dict) -> None:
+    """Pack + upload the disk procedural-noise param buffer (D2.2; SKILL.md CKS-12).
+
+    ALWAYS runs (like ``_setup_disk_flux``); the buffer is ~29 floats, so uploading
+    it unconditionally lets ``disk.noise.enabled`` (a kernel arg) toggle per render
+    with no re-JIT, and lets look-dev re-tune amplitudes/frequencies by re-running
+    setup (re-upload) rather than recompiling. Missing keys fall back to the spec §5
+    defaults; an absent ``disk.noise`` block leaves every layer disabled (the buffer
+    is still uploaded so the kernel JITs against a live field). The values are read
+    only when the ``noise_enabled`` kernel arg is 1.
+    """
+    global disk_noise_params
+
+    d = cfg.get("disk", {}) or {}
+    nz = d.get("noise", {}) or {}
+    dyn = d.get("dynamics", {}) or {}
+    layers = nz.get("layers", {}) or {}
+    base = layers.get("base", {}) or {}
+    clump = layers.get("clump", {}) or {}
+    patch = layers.get("patch", {}) or {}
+
+    buf = np.zeros(_NOISE_N, dtype=np.float32)
+    buf[_NI_M_MAX] = float(nz.get("m_max", 2.5))
+
+    # D2.3 shear advection (CKS-12 §2). shear_period_M is CKS-13-derived (resolver);
+    # absent (no disk.dynamics block) ⇒ 0 ⇒ the kernel takes the static (D2.2) path,
+    # so configs without dynamics stay bit-identical to the static stack.
+    buf[_NI_SHEAR_T] = float(dyn.get("shear_period_M", 0.0))
+    buf[_NI_VAR_PRESERVE] = 1.0 if nz.get("variance_preserve", True) else 0.0
+
+    # L0 — base streaks (fBm)
+    buf[_NI_L0_EN] = 1.0 if base.get("enabled", False) else 0.0
+    buf[_NI_L0_AMP] = float(base.get("amp", 0.6))
+    buf[_NI_L0_OCT] = float(base.get("octaves", 5))
+    buf[_NI_L0_LAC] = float(base.get("lacunarity", 2.0))
+    buf[_NI_L0_GAIN] = float(base.get("gain", 0.5))
+    buf[_NI_L0_FU] = float(base.get("freq_u", 6.0))
+    buf[_NI_L0_FP] = float(base.get("freq_phi", 24))
+
+    # L1 — clump/tear (ridged MF × Voronoi billow, coverage-masked)
+    buf[_NI_L1_EN] = 1.0 if clump.get("enabled", False) else 0.0
+    buf[_NI_L1_AMP] = float(clump.get("amp", 1.2))
+    buf[_NI_L1_BIAS] = float(clump.get("bias", 0.35))
+    buf[_NI_L1_OCT] = float(clump.get("octaves", 3))
+    buf[_NI_L1_LAC] = float(clump.get("lacunarity", 2.0))
+    buf[_NI_L1_GAIN] = float(clump.get("gain", 0.5))
+    buf[_NI_L1_FU] = float(clump.get("freq_u", 3.0))
+    buf[_NI_L1_FP] = float(clump.get("freq_phi", 12))
+    buf[_NI_L1_FZ] = float(clump.get("freq_z", 1.0))
+    buf[_NI_L1_COV] = float(clump.get("coverage", 0.45))
+    buf[_NI_L1_MFU] = float(clump.get("mask_freq_u", 1.0))
+    buf[_NI_L1_MFP] = float(clump.get("mask_freq_phi", 3))
+    buf[_NI_L1_ROFF] = float(clump.get("ridge_offset", 1.0))
+    buf[_NI_L1_VK] = float(clump.get("voronoi_k", 4.0))
+
+    # L2 — patchiness (fBm)
+    buf[_NI_L2_EN] = 1.0 if patch.get("enabled", False) else 0.0
+    buf[_NI_L2_AMP] = float(patch.get("amp", 0.35))
+    buf[_NI_L2_OCT] = float(patch.get("octaves", 2))
+    buf[_NI_L2_LAC] = float(patch.get("lacunarity", 2.0))
+    buf[_NI_L2_GAIN] = float(patch.get("gain", 0.5))
+    buf[_NI_L2_FU] = float(patch.get("freq_u", 1.5))
+    buf[_NI_L2_FP] = float(patch.get("freq_phi", 4))
+
+    disk_noise_params = ti.field(dtype=ti.f32, shape=_NOISE_N)
+    disk_noise_params.from_numpy(buf)
 
 
 def _horizon_radius(a: float) -> float:
@@ -748,9 +858,142 @@ def _pt_flux_sample(r):
 
 
 @ti.func
+def _disk_noise_m(u, phi, zeta, seed):
+    """Unclamped log-density sum ``m = Σ amp·(layer − bias)`` (CKS-12 §3, spec §4);
+    GPU twin of :func:`noise._noise_m_stack`. Reads the per-layer dials from
+    ``disk_noise_params`` and evaluates the L0/L1/L2 stack at the disk-natural coords
+    (``u = ln r/r_inner``, ``φ``, ``ζ``) BEFORE the ``m_max`` clamp and ``exp``. φ
+    enters each lattice as ``y = φ/(2π)·freq_phi`` with integer period ``= freq_phi``
+    (exact 2π-periodicity, constraint 5). Called once per shear-advection phase by
+    :func:`_disk_noise_density_mult`.
+    """
+    m = 0.0
+    phi01 = phi * _INV_TWO_PI  # φ/(2π) ∈ [−0.5, 0.5]; ×freq_phi → lattice y
+
+    # L0 — base streaks: fBm, features long along the orbit (freq_phi ≪ freq_u).
+    if disk_noise_params[_NI_L0_EN] > 0.5:
+        fpf = disk_noise_params[_NI_L0_FP]
+        fp = ti.cast(fpf, ti.i32)
+        n0 = noise.fbm2_ti(
+            u * disk_noise_params[_NI_L0_FU],
+            phi01 * fpf,
+            fp,
+            ti.cast(disk_noise_params[_NI_L0_OCT], ti.i32),
+            ti.cast(disk_noise_params[_NI_L0_LAC], ti.i32),
+            disk_noise_params[_NI_L0_GAIN],
+            seed + _NSEED_L0,
+        )
+        m += disk_noise_params[_NI_L0_AMP] * (n0 - 0.5)
+
+    # L1 — clump/tear: ridged MF × Voronoi billow, gated by a slow coverage mask.
+    if disk_noise_params[_NI_L1_EN] > 0.5:
+        fpf = disk_noise_params[_NI_L1_FP]
+        fp = ti.cast(fpf, ti.i32)
+        xu = u * disk_noise_params[_NI_L1_FU]
+        yphi = phi01 * fpf
+        zz = zeta * disk_noise_params[_NI_L1_FZ]
+        ridge = noise.ridged3_ti(
+            xu, yphi, zz, fp,
+            ti.cast(disk_noise_params[_NI_L1_OCT], ti.i32),
+            ti.cast(disk_noise_params[_NI_L1_LAC], ti.i32),
+            disk_noise_params[_NI_L1_GAIN],
+            disk_noise_params[_NI_L1_ROFF],
+            _NOISE_RIDGE_FEEDBACK,
+            seed + _NSEED_L1_RIDGE,
+        )
+        voro = noise.voronoi_billow3_ti(
+            xu, yphi, zz, fp, disk_noise_params[_NI_L1_VK], seed + _NSEED_L1_VORO,
+        )
+        clump = ridge * voro
+        # Coverage mask M ∈ [0,1]: slow low-freq fBm, smoothstep-thresholded at
+        # (1 − coverage) so clumps appear in patches, not uniformly (spec §4).
+        mfpf = disk_noise_params[_NI_L1_MFP]
+        mask_raw = noise.fbm2_ti(
+            u * disk_noise_params[_NI_L1_MFU],
+            phi01 * mfpf,
+            ti.cast(mfpf, ti.i32),
+            2, 2, 0.5,
+            seed + _NSEED_L1_MASK,
+        )
+        thr = 1.0 - disk_noise_params[_NI_L1_COV]
+        t = (mask_raw - (thr - _NOISE_MASK_SOFT)) / (2.0 * _NOISE_MASK_SOFT)
+        t = ti.min(ti.max(t, 0.0), 1.0)
+        mask = t * t * (3.0 - 2.0 * t)  # smoothstep
+        m += disk_noise_params[_NI_L1_AMP] * mask * (clump - disk_noise_params[_NI_L1_BIAS])
+
+    # L2 — patchiness: subtle large-scale fBm breaking the ring symmetry.
+    if disk_noise_params[_NI_L2_EN] > 0.5:
+        fpf = disk_noise_params[_NI_L2_FP]
+        fp = ti.cast(fpf, ti.i32)
+        n2 = noise.fbm2_ti(
+            u * disk_noise_params[_NI_L2_FU],
+            phi01 * fpf,
+            fp,
+            ti.cast(disk_noise_params[_NI_L2_OCT], ti.i32),
+            ti.cast(disk_noise_params[_NI_L2_LAC], ti.i32),
+            disk_noise_params[_NI_L2_GAIN],
+            seed + _NSEED_L2,
+        )
+        m += disk_noise_params[_NI_L2_AMP] * (n2 - 0.5)
+
+    return m
+
+
+@ti.func
+def _disk_noise_density_mult(u, phi, zeta, t_disk, omega, seed):
+    """Procedural-noise density multiplier (D2.3; SKILL.md CKS-12 §2–3, spec §4).
+
+    GPU twin of :func:`noise.noise_density_mult`. Evaluates the L0/L1/L2 layer stack
+    (:func:`_disk_noise_m`) and returns ``exp(clamp(m, ±m_max)) > 0`` — the multiplier
+    on the Gaussian vertical density (feeds BOTH emission and absorption, so clumps
+    self-shadow). Only called when ``noise_enabled == 1``; the disabled path never
+    touches density (constraint 6, bit-identical golden frames).
+
+    **Keplerian shear advection (CKS-12 §2).** With ``T = disk_noise_params[_NI_SHEAR_T]``
+    (= ``disk.dynamics.shear_period_M``) > 0 the whole stack is evaluated at two
+    staggered reset phases ``φ′_k = φ − Ω(r)·a_k·T`` (``a_k = frac(s + k/2)``,
+    ``s = t_disk/T``) and crossfaded with triangle weights ``w_k = 1 − |2a_k − 1|``;
+    each phase draws a per-cycle reseed (``c_k = floor(s + k/2)``) so the loop does not
+    repeat with period T. ``_NI_VAR_PRESERVE`` divides the blend by ``√(w_0² + w_1²)``
+    to kill the mid-crossfade contrast breathing. ``omega`` = Ω(r) (Formula 3) is
+    supplied by the caller. With ``T ≤ 0`` (no ``disk.dynamics`` block) the field is
+    static — sampled directly at ``φ`` — i.e. exactly the D2.2 path.
+    """
+    T = disk_noise_params[_NI_SHEAR_T]
+    m = 0.0
+    if T <= 0.0:
+        # Static (D2.2 / bit-identical default): no advection, sample at φ.
+        m = _disk_noise_m(u, phi, zeta, seed)
+    else:
+        s = t_disk / T
+        wsq = 0.0
+        # Phase k = 0.
+        c0 = ti.floor(s)
+        a0 = s - c0
+        w0 = 1.0 - ti.abs(2.0 * a0 - 1.0)
+        seed0 = seed + ti.cast(c0, ti.i32) * _NCYC_CYCLE
+        m += w0 * _disk_noise_m(u, phi - omega * (a0 * T), zeta, seed0)
+        wsq += w0 * w0
+        # Phase k = 1 (half-period staggered reset).
+        ar1 = s + 0.5
+        c1 = ti.floor(ar1)
+        a1 = ar1 - c1
+        w1 = 1.0 - ti.abs(2.0 * a1 - 1.0)
+        seed1 = seed + _NCYC_PHASE + ti.cast(c1, ti.i32) * _NCYC_CYCLE
+        m += w1 * _disk_noise_m(u, phi - omega * (a1 * T), zeta, seed1)
+        wsq += w1 * w1
+        if disk_noise_params[_NI_VAR_PRESERVE] > 0.5 and wsq > 0.0:
+            m = m / ti.sqrt(wsq)
+
+    mmax = disk_noise_params[_NI_M_MAX]
+    m = ti.min(ti.max(m, -mmax), mmax)
+    return ti.exp(m)
+
+
+@ti.func
 def _disk_emit_cks(
     x, y, z, p_cov, a, r_inner, r_outer, theta_half, sigma_frac, T_0, emis_c, absb_c, ds,
-    disk_model, doppler_strength,
+    disk_model, doppler_strength, noise_enabled, noise_seed, t_disk,
 ):
     """One volumetric disk sample at a CKS geodesic point → (emission RGB, dτ).
 
@@ -805,6 +1048,20 @@ def _disk_emit_cks(
                     g_eff = ti.pow(g, doppler_strength)
                 sigma_theta = theta_half * sigma_frac
                 density = ti.exp(-0.5 * (dz_ang / sigma_theta) ** 2)
+                # D2.2 procedural turbulence (SKILL.md CKS-12 §3): multiply the
+                # Gaussian density by the noise field (amplitude only — feeds BOTH
+                # emission and absorption). enabled==0 skips this entirely ⇒ the
+                # legacy path is bit-identical (constraint 6).
+                if noise_enabled == 1:
+                    u_n = ti.log(r / r_inner)
+                    phi_n = ti.atan2(y, x)
+                    zeta_n = dz_ang / sigma_theta
+                    # Ω(r) = 1/(r^{3/2}+a) — Formula 3 (prograde), the shear-advection
+                    # rate (CKS-12 §2). d/dt atan2(y,x) = Ω co-moves with the CKS-8 gas.
+                    omega = 1.0 / (r * ti.sqrt(r) + a)
+                    density *= _disk_noise_density_mult(
+                        u_n, phi_n, zeta_n, t_disk, omega, noise_seed
+                    )
                 g4 = g_eff * g_eff * g_eff * g_eff  # Formula 9 (3D volume: g⁴)
 
                 # Radial profile: simple (Decision B) or Page-Thorne (CKS-11).
@@ -969,6 +1226,9 @@ def render_beauty_physics(
     disk_model: int,
     doppler_strength: float,
     max_step_vfrac: float,
+    noise_enabled: int,
+    noise_seed: int,
+    t_disk: float,
 ):
     """Kernel 1 (Phase 2.4 split): trace ONE primary ray per pixel (no offset ray).
 
@@ -1090,6 +1350,9 @@ def render_beauty_physics(
                         local_h,
                         disk_model,
                         doppler_strength,
+                        noise_enabled,
+                        noise_seed,
+                        t_disk,
                     )
                     disk_col += transm * vec3(ev[0], ev[1], ev[2])
                     contribution = transm * (ev[0] + ev[1] + ev[2])
@@ -1511,6 +1774,7 @@ def render_beauty_frame(
     with_disk: bool = True,
     lod_enabled: bool = True,
     return_depth: bool = False,
+    t_disk: float = 0.0,
 ):
     """Render one beauty frame (Pipe A + Pipe B) for a camera_matrix.json entry.
 
@@ -1520,6 +1784,12 @@ def render_beauty_frame(
     the coordinate frame (spin axis = +z), so the camera position and basis are
     used directly — no Boyer-Lindquist embedding, no (r̂,θ̂,φ̂) projection. The
     supplied basis is re-orthonormalized for numerical safety.
+
+    ``t_disk`` is the disk animation time in geometric M (D2.3 shear advection,
+    CKS-12 §2); callers pass ``frame_index / render.fps × disk.dynamics.time_scale``
+    (the CKS-13-derived ``time_scale``). It only matters when ``disk.noise.enabled``
+    and a ``disk.dynamics`` block are present (else the noise is static); ``0.0`` is
+    the phase-0 frame.
 
     Returns a float32 ``(height, width, 3)`` HDR buffer (and the depth pass if
     ``return_depth``).
@@ -1572,6 +1842,14 @@ def render_beauty_frame(
     # 1.0 = full physics (default, golden frames); 0.0 = Doppler/redshift off
     # (Interstellar-style symmetric disk). Runtime kernel arg — no re-JIT.
     doppler_strength = float(d.get("doppler_strength", 1.0))
+    # D2.2 procedural turbulence (SKILL.md CKS-12): runtime kernel args so the flag
+    # toggles per render with no re-JIT; enabled==0 takes a branch bit-identical to
+    # the legacy kernel (golden frames untouched). The per-layer dials live in the
+    # uploaded ``disk_noise_params`` buffer (_setup_disk_noise), not kernel args, so
+    # look-dev re-tuning re-uploads instead of recompiling.
+    nz = d.get("noise", {}) or {}
+    noise_enabled = 1 if nz.get("enabled", False) else 0
+    noise_seed = int(nz.get("seed", 1234))
 
     _alloc_frame(width, height)
     # Phase 2.4 kernel split: physics pass writes exit_buf/disk_buf, shading pass
@@ -1613,6 +1891,9 @@ def render_beauty_frame(
         disk_model,
         doppler_strength,
         float(d.get("max_step_vfrac", 0.5)),
+        noise_enabled,
+        noise_seed,
+        float(t_disk),
     )
     # starfield.mode: dngr ⇒ Formula-13 two-layer background; else legacy F10 texture.
     dngr_mode = 1 if str(cfg.get("starfield", {}).get("mode", "texture")) == "dngr" else 0
@@ -1650,6 +1931,7 @@ def render_beauty_frame_mb(
     with_disk: bool = True,
     lod_enabled: bool = True,
     return_depth: bool = False,
+    t_disk: float = 0.0,
 ):
     """Temporal motion blur (optimization Phase 4.2) by host-side averaging of jittered sub-frames.
 
@@ -1661,7 +1943,7 @@ def render_beauty_frame_mb(
     samples = int(cfg["render"]["motion_blur_samples"])
     if samples <= 1 or shutter_arc == 0.0:
         return render_beauty_frame(
-            cfg, cam_frame, width, height, with_disk, lod_enabled, return_depth
+            cfg, cam_frame, width, height, with_disk, lod_enabled, return_depth, t_disk
         )
 
     depth_inf = float(cfg["render"]["depth_infinity"])
@@ -1677,7 +1959,15 @@ def render_beauty_frame_mb(
         jf["fwd"] = _rotate_z(cam_frame["fwd"], dphi)
         jf["up"] = _rotate_z(cam_frame["up"], dphi)
         jf["right"] = _rotate_z(cam_frame["right"], dphi)
-        out = render_beauty_frame(cfg, jf, width, height, with_disk, lod_enabled, return_depth)
+        # NOTE (D2.5): the disk noise phase ``t_disk`` is held fixed across the shutter
+        # here (same value for every sub-frame). Strictly the shear pattern should be
+        # jittered alongside ``dphi`` (the rotate-the-camera blur trick assumes an
+        # axisymmetric disk, which the noise breaks); per-sub-frame ``t_disk`` jitter
+        # is the D2.5 motion-blur task. The error is bounded (the shutter is a small
+        # fraction of a frame) and motion blur is off in the default/test pipeline.
+        out = render_beauty_frame(
+            cfg, jf, width, height, with_disk, lod_enabled, return_depth, t_disk
+        )
         hdr = out[0] if return_depth else out
         acc = hdr.astype(np.float64) if acc is None else acc + hdr
         if return_depth:

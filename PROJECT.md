@@ -128,9 +128,11 @@ EXR.
   transmittance-weighted Mino-affine depth (sentinel `depth_infinity = 1e5` where
   there is no disk emission).
 - **Verification (the real guard):** `python scripts/gpu_test.py` → right/left
-  Doppler asymmetry ≈ 4.3× (4.32× CKS baseline; the retired BL Mino path read
-  7.77×) for the a = 0.999 edge-on camera;
-  `oiiotool --info` to confirm channels.
+  Doppler asymmetry for the a = 0.999 edge-on camera. At full physics
+  (`doppler_strength: 1.0`, simple model) this is ≈5.15× post-CKS-13 (was 4.32× pre-D3,
+  7.77× on the retired BL Mino path); the `doppler_strength = s` knob scales it down
+  (g_eff = g^s), so the YAML's current s = 0.1 reads ≈1.9×. `oiiotool --info` to
+  confirm channels.
 
 ### Stage 3 — Blender compositor: deep merge + optical FX *(recommended, A2)*
 
@@ -377,11 +379,22 @@ null condition `|H|` < 1e-6 along the integrated 8-vector) + a golden-CSV regres
 
 **`tests/test_gpu_regression.py`** — automated GPU beauty regression (the pytest form
 of the manual `gpu_test.py` check). Drives production `render_beauty_frame` (frame
-0, FHD, disk on); asserts NaN==0, right/left Doppler ∈ [3.8, 4.9] (right brighter;
-CKS baseline 4.32×), disk peak ≈ `_DISK_MAX_REF = 6.1667` ±5%. Plus two flag-path
-guards on deepcopied configs (goldens untouched): `page_thorne` renders NaN-free /
-beamed / emitting (D1), and `doppler_strength: 0` collapses the disk-only left/right
-ratio to < 1.5 (knob guard). `pytest.mark.gpu`; **skips cleanly**
+0, FHD, disk on); asserts NaN==0 and no spin-axis seam on the YAML-configured frame.
+The Doppler / disk-peak guards are **dynamic in `doppler_strength`** (g_eff = g^s):
+rather than pin one brittle band, they render frame 0 at forced s ∈ {0, 0.5, 1.0}
+(simple model, disk-only `disk_buf` metrics) and assert the beaming *response* —
+near-symmetric at s=0 (< 1.5), monotone non-decreasing in s, and matching the
+re-anchored s=1.0 goldens `_DOPPLER_RATIO_REF = 5.15` (±10%) / `_DISK_MAX_REF = 14.45`
+(±8%). **Re-anchored 2026-06-13:** the old CKS-era 4.32× / 6.1667 references held
+through the doppler_strength knob (4.317× / 6.1665) but were silently invalidated by
+D3 / CKS-13 (commit 30f8511), which redefined the simple-model amplitude from the old
+`T_0: 5500` *inner-reference* temperature (peak T_eff ≈ 18,600 K) to
+`target_peak_temperature: 5500` (peak T_eff = 5500 K) — the warm-peak chroma shift
+moved both goldens. (The v1.14 changelog's "GPU regression bit-identical" claim was
+inaccurate; corrected in SKILL.md.) Plus flag-path guards on deepcopied configs:
+`page_thorne` renders NaN-free / beamed (> 2×, forced s=1.0 so the YAML's s=0.1 can't
+suppress it) / emitting (D1), and `doppler_strength: 0` collapses the disk-only
+left/right ratio to < 1.5 (knob guard). `pytest.mark.gpu`; **skips cleanly**
 without CUDA (Taichi init deferred into a module-scoped fixture).
 
 **`tests/cuda_smoke_test.py`** — confirms the Taichi CUDA backend JITs on this
@@ -463,7 +476,7 @@ celestial direction). CKS PART II index:
 | CKS-9 | g-factor = −E/(p_t u^t + p_x u^x + p_y u^y + p_z u^z) (Cartesian dot product) |
 | CKS-10 | Escaped-ray celestial dir = normalized contravariant (p^x,p^y,p^z) → (θ′,φ′) |
 | CKS-11 | Page-Thorne flux shape f_PT(r) (cubic roots + three-log bracket, zero-torque BC) — **wired** behind `disk.temperature_model: page_thorne` (D1) |
-| CKS-12 | Disk procedural turbulence (**planned**, D2): noise coords (u=ln r/r_inner, φ, ζ), Keplerian shear advection φ′=φ−Ω(r)·t with dual-phase reset blend (Ω = Formula 3 verbatim), modulation bookkeeping (amplitudes only — density/T_emit/edges/σ_θ; never p_μ/u^μ/g/g⁴/f_PT) |
+| CKS-12 | Disk procedural turbulence (**density wired** through D2.3, 2026-06-13; T/edges/σ_θ planned D2.4): noise coords (u=ln r/r_inner, φ, ζ), Keplerian shear advection φ′=φ−Ω(r)·t_disk with dual-phase reset blend (Ω = Formula 3 verbatim), modulation bookkeeping (amplitudes only — density/T_emit/edges/σ_θ; never p_μ/u^μ/g/g⁴/f_PT) |
 | CKS-13 | Derived-parameter config resolver (**wired**, D3, 2026-06-13): `kerr_params.resolve_config` injects r_plus (CKS-6), r_isco (Formula 2), `disk.r_inner` (auto→r_isco, override clamped), `disk.T_0` from `target_peak_temperature` (per temperature model), and `disk.dynamics` time mapping (T_orb=2π(r^{3/2}+a), t_wrap=2π/ΔΩ → `time_scale`, `shear_period_M`). No new physics — pinned formulas + trivial inverses; literature anchors in `tests/test_kerr_params.py` |
 
 PART I (retired/reused) formula index:
@@ -543,14 +556,17 @@ added `starfield.diffuse_gain` (default 1.0 = identity), applied at render time 
 Live config: `diffuse_gain: 3.0` (the StarNet2 plate is ~1.75× dimmer mean than the
 old milkyway band, so 1.75 restores parity, 3.0 brightens past it) and
 `mag_zero_point: 3.5` (≈25× stars: clearly visible but kept **below** the disk-edge
-peak ~6.17 so the disk stays the dominant feature — 5.0/100× made a lensed star
+peak — ~6.17 at the time; now ~14.45 post-CKS-13, so stars sit even further below it —
+so the disk stays the dominant feature — 5.0/100× made a lensed star
 outshine the disk, 10.0/10000× blew it out), re-ingested. Both are look-tuning
 starting points, not correctness values. **Test follow-on:** brightening Layer A
-exposed a latent assumption in `test_disk_peak_matches_reference` — it used the
+exposed a latent assumption in the disk-peak guard — it used the
 **global frame max** (`hdr.max()`) as a disk-peak proxy, which only holds while the
 disk is the brightest pixel. Fixed it to read the disk emission straight from
 `tr.disk_buf[..., :3]` (the final pixel is `disk_rgb + transm·bg`, so this is the
-beamed disk edge independent of the sky); reference 6.1667 unchanged, 44/44 pass.
+beamed disk edge independent of the sky). *(Reference was 6.1667 here; later
+re-anchored to 14.45 and made dynamic in `doppler_strength` — see the
+`test_gpu_regression.py` entry above and SKILL.md v1.16.)*
 
 **Disk-thickness step cap (2026-06-12).** Fixed a concentric **moiré band** around
 the disk on face-on / steep-crossing views. Root cause: the Pipe-B march sizes its
@@ -693,8 +709,8 @@ re-derive. **`disk.py`, `geodesic.py`/`metric.py` CPU references, and any
 | **2.3** | Hardware `ti.Texture` starmap + `sample_lod` | **Deferred (external)** — Taichi 1.7.4 has no mip-upload API; revisit only after a Taichi upgrade is independently justified and re-validated on sm_120 (CLAUDE.md pins 1.7.4) | External |
 | **T3** | Moving-camera observer model (camera peculiar velocity, not just ZAMO) | **Roadmap, gated** — needs a new `SKILL.md` tetrad-boost formula approved (human review) before any code; high risk if rushed (sign/normalization) | Physics (gated) |
 | **D1** | Decision-B physical disk: Page-Thorne flux profile (replaces simple `(6/r)^0.75`) | ✅ **Resolved (2026-06-12)** — wired behind `disk.temperature_model: page_thorne` (default `simple`); LUT in `src/renderer/disk_flux.py`; GPU guard in `test_gpu_regression.py`. Closed form is `SKILL.md` Formula **CKS-11** (numerically reproduces the conservation-law flux integral; guard `tests/test_disk_flux.py`; SKILL.md rev v1.11). The "wire the LUT" path: CPU-precompute `f_PT(r)` shape LUT → `T_eff=T₀·f_PT^{1/4}`, amplitude ×f_PT → sampled in the disk kernel **behind the config flag** (`T₀` stays the amplitude knob; g⁴-not-g⁸ respected, Formula 9 / CKS-11 Piece 3). Default disk stays Decision-B-simple, so golden frames / pinned GPU regression are unchanged. | Physics |
-| **D2** | Disk procedural turbulence: layered noise (Interstellar-base fBm + MRI clump/tear ridged-MF/Voronoi accents) with full Keplerian shear advection, modulating density, temperature, edges, and scale height | **Planned — design approved 2026-06-13.** Spec: `docs/specs/2026-06-13-disk-noise-turbulence.md`; math: SKILL.md Formula **CKS-12** (rev v1.13; Ω = Formula 3 verbatim, all noise amplitude-only); build order in **§10** (D2.1 noise lib → D2.2 static look-dev → D2.3 advection → D2.4 T/edges/height → D2.5 MB-jitter/golden/docs). **No code yet**; `disk.noise.enabled: false` will be a bit-identical branch, golden frames intact | Visualization |
-| **D3** | Dynamic derived parameters: editing base config (spin, target temperature, disk extent) must rescale every dependent quantity automatically | ✅ **Resolved (2026-06-13)** — `src/renderer/kerr_params.resolve_config` (SKILL.md Formula **CKS-13**, rev v1.14) runs inside every config loader (`taichi_renderer.load_config`, `thumb.py`); derives `r_plus`/`r_isco`/`disk.r_inner`/`disk.T_0` (from new base `disk.target_peak_temperature`) + `disk.dynamics` time mapping (`time_scale`, `shear_period_M` for D2). Desync-prone YAML literals removed. Closed forms (BPT 1972 — exact, beats any LUT; only CKS-11 f_PT needs tabulation), literature anchors pinned in `tests/test_kerr_params.py` (11 tests). Render impact: r_inner 1.182→1.181765 (exact ISCO); GPU regression metrics bit-identical except Doppler Δ5e-6; the 3 pre-existing `doppler_strength: 0.1` failures unchanged | Config |
+| **D2** | Disk procedural turbulence: layered noise (Interstellar-base fBm + MRI clump/tear ridged-MF/Voronoi accents) with full Keplerian shear advection, modulating density, temperature, edges, and scale height | **Planned — design approved 2026-06-13.** Spec: `docs/specs/2026-06-13-disk-noise-turbulence.md`; math: SKILL.md Formula **CKS-12** (rev v1.13; Ω = Formula 3 verbatim, all noise amplitude-only); build order in **§10** (D2.1 noise lib → D2.2 static look-dev → D2.3 advection → D2.4 T/edges/height → D2.5 MB-jitter/golden/docs). **D2.1 + D2.2 done (2026-06-13):** noise lib + static density modulation wired (`disk.noise` block, `_setup_disk_noise` param buffer, GPU `_disk_noise_density_mult` + CPU `noise.noise_density_mult` twin, thumb.py look-dev); `disk.noise.enabled: false` is a verified bit-identical branch (golden frames intact); D2.3+ (shear advection, T/edges/height) pending | Visualization |
+| **D3** | Dynamic derived parameters: editing base config (spin, target temperature, disk extent) must rescale every dependent quantity automatically | ✅ **Resolved (2026-06-13)** — `src/renderer/kerr_params.resolve_config` (SKILL.md Formula **CKS-13**, rev v1.14) runs inside every config loader (`taichi_renderer.load_config`, `thumb.py`); derives `r_plus`/`r_isco`/`disk.r_inner`/`disk.T_0` (from new base `disk.target_peak_temperature`) + `disk.dynamics` time mapping (`time_scale`, `shear_period_M` for D2). Desync-prone YAML literals removed. Closed forms (BPT 1972 — exact, beats any LUT; only CKS-11 f_PT needs tabulation), literature anchors pinned in `tests/test_kerr_params.py` (11 tests). Render impact: r_inner 1.182→1.181765 (exact ISCO). ⚠️ The original "GPU regression bit-identical except Doppler Δ5e-6" claim was wrong: re-keying `T_0`→`target_peak_temperature` dropped the simple-model peak T_eff 18,600→5,500 K, moving the disk peak 6.17→14.45 and Doppler ratio 4.32→5.15 — the `test_gpu_regression.py` goldens were re-anchored + made dynamic in `doppler_strength` 2026-06-13 (see the test entry above + SKILL.md v1.16) | Config |
 
 ### Code-review findings (verified against current code)
 
@@ -1024,8 +1040,21 @@ test confirmed); tune `starfield.mag_zero_point` (currently 0.0) against a grade
 
 ## 10. Accretion-disk procedural turbulence (PLANNED — D2)
 
-**Status: design approved 2026-06-13; docs landed (SKILL.md CKS-12 rev v1.13, spec
-below); NO renderer code yet.** Backlog row **D2** (§7).
+**Status: design approved 2026-06-13; docs landed (SKILL.md CKS-12, spec below).
+D2.1 (noise primitive library) + D2.2 (static density modulation) + D2.3 (Keplerian
+shear advection) shipped 2026-06-13: `src/renderer/noise.py` (primitives + `@ti.func`
+twins + the combined `noise_density_mult` stack, now with the §2 dual-phase reset
+blend), wired into the GPU beauty path (`disk.noise` config block, `_setup_disk_noise`
+param buffer, `_disk_noise_density_mult` kernel) and the CPU `thumb.py` look-dev path.
+The renderer's first time variable `t_disk = frame/fps·time_scale` is threaded through
+`render_beauty_frame{,_mb}` → `_disk_emit_cks`, `export_exr.py`, and
+`thumb.py --frame/--t-disk`; Ω is Formula 3 per disk sample. `disk.noise.enabled: false`
+**and** `shear_period ≤ 0` (no `disk.dynamics`) both keep the legacy/D2.2-static
+bit-identical branch (golden frames intact). Tests: `test_noise.py` (25 CPU, incl. §2
+advection: static fallback / evolution / determinism / reset-continuity / variance-
+preserve), `test_noise_gpu.py` (10 CUDA), `test_disk_noise.py` (6 CUDA: bit-identity,
+enabled-changes-disk, determinism, seed, static + advected GPU↔CPU stack agreement).
+D2.4 (T/edges/height) pending.** Backlog row **D2** (§7).
 
 **Spec of record:** `docs/specs/2026-06-13-disk-noise-turbulence.md` — layer stack,
 noise primitives, config draft, perf budget, test plan.
@@ -1068,9 +1097,9 @@ g⁴ bookkeeping, and f_PT shape are untouched.
 | Phase | Scope | Gate |
 |---|---|---|
 | D2.0 | Docs (CKS-12, spec, this section) | ✅ done 2026-06-13 |
-| D2.1 | `src/renderer/noise.py` CPU reference + `@ti.func` twins + `tests/test_noise.py` (CPU↔GPU agreement, φ-periodicity, determinism) | no renderer change |
-| D2.2 | Static structure: `(u,φ,ζ)` mapping + 3 layers on density only at `t_disk=0`; `disk.noise` config block; off-branch bit-identity vs goldens; **thumb.py look-dev loop** | perf ≤ 2× thumb, ≤ ~1.5× 4K |
-| D2.3 | Shear advection: `t_disk` plumbing, dual-phase reset + per-cycle reseed, temporal-continuity test | short thumb sequence review |
+| D2.1 | `src/renderer/noise.py` CPU reference + `@ti.func` twins + `tests/test_noise.py` (CPU) + `tests/test_noise_gpu.py` (CPU↔GPU agreement, φ-periodicity, determinism) | ✅ done 2026-06-13 — no renderer change; 26 tests green |
+| D2.2 | Static structure: `(u,φ,ζ)` mapping + 3 layers on density only at `t_disk=0`; `disk.noise` config block; off-branch bit-identity vs goldens; **thumb.py look-dev loop** | ✅ done 2026-06-13 — GPU `_disk_noise_density_mult` (reads `_setup_disk_noise` param buffer) + CPU `noise.noise_density_mult` twin; `test_disk_noise.py` (bit-identity / determinism / GPU↔CPU stack agreement). Perf noise-on ≈ 2.66× off at 960×540 (above the 2× target but sub-100 ms; offline render, tunable via config-only octave dials — defaults are look-dev placeholders) |
+| D2.3 | Shear advection: `t_disk` plumbing, dual-phase reset + per-cycle reseed, temporal-continuity test | ✅ done 2026-06-13 — `t_disk=frame/fps·time_scale` through `render_beauty_frame{,_mb}`/`export_exr.py`/`thumb.py`; §2 blend wraps the `m`-stack in `noise_density_mult` + GPU `_disk_noise_density_mult` (Ω = Formula 3/sample); `variance_preserve` dial; `shear_period≤0` ⇒ static D2.2 bit-identical. Tests: `test_noise.py §2` (5: static fallback/evolution/determinism/reset-continuity/variance-preserve) + `test_disk_noise.py::test_advected_stack_matches_cpu_reference` |
 | D2.4 | Temperature + edges + scale height (incl. step-cap σ_z fix, extended convergence test) | `test_disk_step_convergence.py` green |
 | D2.5 | MB `t_disk` jitter, perf pass, noise-on golden (fixed seed/t), docs/memory sync | owner sign-off; `enabled` stays `false` until owner flips it |
 
