@@ -68,10 +68,29 @@ _THIN = {"vertical_sigma_frac": 0.05, "theta_half_width": 0.06}
 _MAX_REL_DIVERGENCE = 0.02
 
 
-def _render_disk_luminance(disk_overrides: dict, render_overrides: dict | None = None) -> np.ndarray:
+# A static (t_disk=0) noise block whose §3 scale-height modulation makes the slab
+# LUMPY — the case CKS-12 constraint 4 protects: the Pipe-B step cap must size on the
+# worst-case σ_z·(1 − h_amp/2), or the thinned lumps re-introduce the face-on moiré.
+_MOD_THIN_NOISE = {
+    "enabled": True, "seed": 1234, "m_max": 2.5, "dynamism": 1.0,
+    "layers": {"base": {"enabled": True, "amp": 0.6, "octaves": 4, "lacunarity": 2.0,
+                        "gain": 0.5, "freq_u": 6.0, "freq_phi": 24}},
+    "modulation": {"enabled": True, "octaves": 3, "lacunarity": 2.0, "gain": 0.5,
+                   "freq_u": 4.0, "freq_phi": 16, "temp_amp": 0.0, "edge_in_amp": 0.0,
+                   "edge_out_amp": 0.0, "edge_softness": 0.0, "height_amp": 0.8},
+}
+
+
+def _render_disk_luminance(disk_overrides: dict, render_overrides: dict | None = None,
+                           noise_override: dict | None = None) -> np.ndarray:
     cfg = copy.deepcopy(tr.load_config())
     cfg["disk"].update(_THIN)
     cfg["disk"].update(disk_overrides)
+    # The production config now ships disk.noise.enabled: true (D2.4). This test
+    # guards the *geometric* step cap, so force noise OFF unless a case explicitly
+    # injects a block — otherwise the procedural texture would confound the
+    # smooth-Gaussian convergence reference.
+    cfg["disk"]["noise"] = noise_override if noise_override is not None else {"enabled": False}
     if render_overrides:
         cfg["render"].update(render_overrides)
     # setup_renderer re-runs ti.init (destroying all fields) and rebuilds the LUT;
@@ -115,3 +134,43 @@ def divergence() -> float:
 
 def test_disk_emission_resolves_thin_slab(divergence):
     assert divergence <= _MAX_REL_DIVERGENCE
+
+
+# Looser than the smooth-slab bound: the lumpy §3 height field adds genuine
+# high-frequency structure, so the capped march and the fine reference differ a
+# touch more than for the plain Gaussian — but still an order of magnitude below the
+# uncapped aliasing (which the worst-case σ_z cap is what prevents).
+_MAX_REL_DIVERGENCE_MOD = 0.06
+
+
+@pytest.fixture(scope="module")
+def divergence_modulated() -> float:
+    import taichi as ti
+
+    try:
+        ti.init(arch=ti.cuda)
+    except Exception as exc:  # pragma: no cover - host without a CUDA driver
+        pytest.skip(f"CUDA backend unavailable: {exc}")
+    if str(ti.cfg.arch) != "Arch.cuda":
+        pytest.skip(f"CUDA backend unavailable (Taichi selected {ti.cfg.arch})")
+
+    # Production cap, lumpy scale height ON (worst-case σ_z·(1−h_amp/2) step cap).
+    prod = _render_disk_luminance({}, noise_override=_MOD_THIN_NOISE)
+    # Ground truth: tight cap + raised step budget, SAME lumpy field.
+    gt = _render_disk_luminance({"max_step_vfrac": 0.1}, {"max_steps_pipe_a": 16000},
+                                noise_override=_MOD_THIN_NOISE)
+
+    mask = gt > 0.02 * float(gt.max())
+    if not np.any(mask):
+        pytest.skip("no disk emission in modulated reference frame — check camera/config")
+    rel = np.abs(prod[mask] - gt[mask]) / (gt[mask] + 1e-9)
+    div = float(rel.mean())
+    print(f"\n[disk slab-convergence, §3 height-modulated] mean relative divergence "
+          f"= {div:.4f} (emitting px = {int(mask.sum())}, threshold = {_MAX_REL_DIVERGENCE_MOD})")
+    return div
+
+
+def test_disk_emission_resolves_lumpy_slab(divergence_modulated):
+    """CKS-12 constraint 4: with §3 scale-height modulation the worst-case-σ_z step
+    cap must still resolve the (now lumpy) thin slab — no returning moiré."""
+    assert divergence_modulated <= _MAX_REL_DIVERGENCE_MOD

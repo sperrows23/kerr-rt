@@ -192,7 +192,48 @@ _NI_L0_EN, _NI_L0_AMP, _NI_L0_OCT, _NI_L0_LAC, _NI_L0_GAIN, _NI_L0_FU, _NI_L0_FP
 _NI_SHEAR_T = 29
 _NI_VAR_PRESERVE = 30
 _NI_DYNAMISM = 31
-_NOISE_N = 32
+# D2.4 (CKS-12 §3) modulation block — emitted-temperature / inner-&-outer-edge /
+# scale-height envelopes (each an advected [0,1] fBm, co-moving with the gas).
+# _NI_MOD_EN gates the whole §3 application: 0 ⇒ the D2.3 density-only path,
+# bit-identical (constraint 6). The amplitudes are the τ_amp / e_in / e_out / h_amp
+# of §3; edge_soft is the smoothstep window width (in r) at each modulated edge.
+# Read in BOTH _disk_noise_mod_fields (the fBm freqs) and _disk_emit_cks / the
+# trace kernel (the amps, edge_soft — for the worst-case σ_z step cap + band widen).
+_NI_MOD_EN = 32
+_NI_MOD_OCT = 33
+_NI_MOD_LAC = 34
+_NI_MOD_GAIN = 35
+_NI_MOD_FU = 36
+_NI_MOD_FP = 37
+_NI_MOD_TEMP_AMP = 38
+_NI_MOD_EIN_AMP = 39
+_NI_MOD_EOUT_AMP = 40
+_NI_MOD_EDGE_SOFT = 41
+_NI_MOD_HEIGHT_AMP = 42
+_NOISE_N = 43
+
+# CKS-14 RTE source-function march: divide guard on dτ. Below this the source
+# function S = emission/dτ is numerically undefined AND physically the optically-
+# thin limit where w=1−e^{−dτ}→dτ makes the RTE term equal the legacy emission
+# add — so the kernel falls back to the legacy term, with no discontinuity.
+_RTE_TAU_EPS = 1e-6
+
+# --- CKS-15 radial deep-shadow-map self-shadow (V1.2; SKILL.md CKS-15, spec §2) --- #
+# A 3-D cumulative absorption-optical-depth field τ_shadow[NU, NPHI, NZ] on the
+# CKS-12 noise coordinates (u=ln r/r_inner, φ=atan2(y,x), ζ=Δθ/σ_θ). Baked once per
+# frame by ``bake_disk_shadow`` from the SHARED ``_disk_density_cks`` (so the shadow
+# ρ can never drift from the emission ρ), then trilinearly sampled per primary disk
+# sample to dim the emissivity j → j·e^{−strength·τ_s} — VISUALIZATION occlusion
+# bookkeeping (a straight radial CKS ray, not a geodesic), flagged like
+# ``doppler_strength``; it never touches p_μ/u^μ/g/g⁴/f_PT (CKS-15 governance). The
+# grid EXTENTS (u_max=ln(r_outer/r_inner), ζ_max) are baked into module globals at
+# setup (same pattern as ``_PT_LUT_R0``) so the per-sample lookup needs no extra
+# kernel args; the grid RESOLUTION is the field shape, read inside the kernels. The
+# field is ALWAYS allocated by ``_setup_disk_shadow`` so the kernels JIT against a
+# live field; ``self_shadow==0`` ⇒ no bake, no lookup (legacy path bit-identical).
+disk_shadow_tau: ti.Field = None  # type: ignore[assignment]  (NU,NPHI,NZ) f32
+_SHADOW_U_MAX = 1.0
+_SHADOW_ZETA_MAX = 3.0
 
 # Layer-stack constants — sourced from noise.py (the CPU twin) so the GPU kernel
 # and the CPU reference noise.noise_density_mult can never drift apart.
@@ -205,6 +246,11 @@ _NOISE_RIDGE_FEEDBACK = noise.RIDGE_FEEDBACK
 _NOISE_MASK_SOFT = noise.MASK_SOFT
 _NCYC_PHASE = noise.NCYC_PHASE  # dual-phase reseed offsets (CKS-12 §2, D2.3)
 _NCYC_CYCLE = noise.NCYC_CYCLE
+# D2.4 §3 modulation-envelope seed offsets (decorrelate n_T/n_e/n_e'/n_h).
+_NSEED_MOD_T = noise.NSEED_MOD_T
+_NSEED_MOD_EIN = noise.NSEED_MOD_EIN
+_NSEED_MOD_EOUT = noise.NSEED_MOD_EOUT
+_NSEED_MOD_H = noise.NSEED_MOD_H
 _INV_TWO_PI = 1.0 / (2.0 * math.pi)
 
 
@@ -317,6 +363,7 @@ def setup_renderer(cfg: dict) -> Starmap:
     _setup_dngr(cfg)
     _setup_disk_flux(cfg)
     _setup_disk_noise(cfg)
+    _setup_disk_shadow(cfg)
     return sm
 
 
@@ -490,8 +537,58 @@ def _setup_disk_noise(cfg: dict) -> None:
     buf[_NI_L2_FU] = float(patch.get("freq_u", 1.5))
     buf[_NI_L2_FP] = float(patch.get("freq_phi", 4))
 
+    # D2.4 — §3 temperature / edge / scale-height modulation. enabled:false (or an
+    # absent block) ⇒ _NI_MOD_EN = 0 ⇒ the kernel skips §3 entirely (the density-only
+    # D2.3 path stays bit-identical). The fBm freqs feed _disk_noise_mod_fields; the
+    # amps + edge_soft are read by _disk_emit_cks and the trace kernel (band widen +
+    # worst-case σ_z step cap, constraint 4).
+    mod = nz.get("modulation", {}) or {}
+    buf[_NI_MOD_EN] = 1.0 if mod.get("enabled", False) else 0.0
+    buf[_NI_MOD_OCT] = float(mod.get("octaves", 3))
+    buf[_NI_MOD_LAC] = float(mod.get("lacunarity", 2.0))
+    buf[_NI_MOD_GAIN] = float(mod.get("gain", 0.5))
+    buf[_NI_MOD_FU] = float(mod.get("freq_u", 4.0))
+    buf[_NI_MOD_FP] = float(mod.get("freq_phi", 16))
+    buf[_NI_MOD_TEMP_AMP] = float(mod.get("temp_amp", 0.0))
+    buf[_NI_MOD_EIN_AMP] = float(mod.get("edge_in_amp", 0.0))
+    buf[_NI_MOD_EOUT_AMP] = float(mod.get("edge_out_amp", 0.0))
+    buf[_NI_MOD_EDGE_SOFT] = float(mod.get("edge_softness", 0.0))
+    buf[_NI_MOD_HEIGHT_AMP] = float(mod.get("height_amp", 0.0))
+
     disk_noise_params = ti.field(dtype=ti.f32, shape=_NOISE_N)
     disk_noise_params.from_numpy(buf)
+
+
+def _setup_disk_shadow(cfg: dict) -> None:
+    """Allocate the CKS-15 radial deep-shadow-map field + bake its grid extents.
+
+    ALWAYS runs (like ``_setup_disk_noise``): the field is sized from the
+    ``disk.volumetric.self_shadow`` grid config so toggling ``enabled`` per render
+    needs no re-JIT (the kernel just skips the bake + lookup when off). The grid
+    EXTENTS (``u_max = ln(r_outer/r_inner)``, ``ζ_max``) are baked into module
+    globals here so the per-sample lookup ``_sample_shadow_tau`` needs no extra
+    kernel args (same pattern as ``_PT_LUT_R0``); the grid RESOLUTION is the field
+    shape, read inside the bake/lookup. The τ VALUES are filled per frame by
+    ``bake_disk_shadow`` (it depends on ``t_disk``), not here — the field is just
+    zeroed so a pre-bake render (or the disabled path) reads no shadow.
+    """
+    global disk_shadow_tau, _SHADOW_U_MAX, _SHADOW_ZETA_MAX
+
+    d = cfg.get("disk", {}) or {}
+    vol = d.get("volumetric", {}) or {}
+    ss = vol.get("self_shadow", {}) or {}
+
+    nu = int(ss.get("grid_nu", 96))
+    nphi = int(ss.get("grid_nphi", 256))
+    nz = int(ss.get("grid_nz", 16))
+    r_inner = float(d["r_inner"])
+    r_outer = float(d["r_outer"])
+    # u = ln(r/r_inner) spans [0, u_max]; the slab is ~Gaussian so ±ζ_max·σ covers it.
+    _SHADOW_U_MAX = math.log(r_outer / r_inner)
+    _SHADOW_ZETA_MAX = float(ss.get("zeta_max", 3.0))
+
+    disk_shadow_tau = ti.field(dtype=ti.f32, shape=(nu, nphi, nz))
+    disk_shadow_tau.fill(0.0)
 
 
 def _horizon_radius(a: float) -> float:
@@ -1002,9 +1099,241 @@ def _disk_noise_density_mult(u, phi, zeta, t_disk, omega, seed):
 
 
 @ti.func
+def _smoothstep_ti(e0, e1, x):
+    """Hermite smoothstep, twin of the NumPy ``t*t*(3−2t)`` form used by the CPU
+    edge windows. Returns 0 below ``e0``, 1 above ``e1``; ``e1==e0`` ⇒ a hard step."""
+    t = 0.0
+    if e1 > e0:
+        t = ti.min(ti.max((x - e0) / (e1 - e0), 0.0), 1.0)
+    else:
+        t = 1.0 if x >= e0 else 0.0
+    return t * t * (3.0 - 2.0 * t)
+
+
+@ti.func
+def _mod_fbm4(u, phi, seed):
+    """The four §3 modulation envelopes ``(n_T, n_e_in, n_e_out, n_h)`` at one
+    (already-advected) phase — GPU twin of :func:`noise._mod_fbm_stack`. Each is a
+    single ``fbm2`` in ``[0, 1]`` over ``(u·freq_u, φ/(2π)·freq_phi)`` with integer
+    φ-period ``freq_phi`` (constraint 5), keyed by a distinct seed offset so the
+    four envelopes are mutually decorrelated. Returns a ``ti.Vector`` of 4 f32."""
+    fpf = disk_noise_params[_NI_MOD_FP]
+    fp = ti.cast(fpf, ti.i32)
+    x = u * disk_noise_params[_NI_MOD_FU]
+    y = phi * _INV_TWO_PI * fpf
+    oct_ = ti.cast(disk_noise_params[_NI_MOD_OCT], ti.i32)
+    lac = ti.cast(disk_noise_params[_NI_MOD_LAC], ti.i32)
+    gain = disk_noise_params[_NI_MOD_GAIN]
+    return ti.Vector([
+        noise.fbm2_ti(x, y, fp, oct_, lac, gain, seed + _NSEED_MOD_T),
+        noise.fbm2_ti(x, y, fp, oct_, lac, gain, seed + _NSEED_MOD_EIN),
+        noise.fbm2_ti(x, y, fp, oct_, lac, gain, seed + _NSEED_MOD_EOUT),
+        noise.fbm2_ti(x, y, fp, oct_, lac, gain, seed + _NSEED_MOD_H),
+    ])
+
+
+@ti.func
+def _disk_noise_mod_fields(u, phi, t_disk, omega, seed):
+    """Advected ``[0, 1]`` envelopes ``(n_T, n_e_in, n_e_out, n_h)`` for the CKS-12
+    §3 temperature / edge / scale-height modulation — GPU twin of
+    :func:`noise.noise_modulation_fields`. Advected with the SAME dual-phase reset +
+    ``_NI_DYNAMISM`` gain as the density field (:func:`_disk_noise_density_mult`) so
+    the envelopes co-move with the gas. **No** ``variance_preserve`` divide — the
+    convex triangle weights (``w_0 + w_1 ≡ 1``) keep each blend in ``[0, 1]`` so
+    ``n − ½`` is a bounded ``±½`` modulation. With ``T ≤ 0`` the field is static.
+    Only called inside the ``_NI_MOD_EN == 1`` branch of :func:`_disk_emit_cks`."""
+    T = disk_noise_params[_NI_SHEAR_T]
+    out = ti.Vector([0.5, 0.5, 0.5, 0.5])
+    if T <= 0.0:
+        out = _mod_fbm4(u, phi, seed)
+    else:
+        s = t_disk / T
+        g = disk_noise_params[_NI_DYNAMISM]
+        c0 = ti.floor(s)
+        a0 = s - c0
+        w0 = 1.0 - ti.abs(2.0 * a0 - 1.0)
+        seed0 = seed + ti.cast(c0, ti.i32) * _NCYC_CYCLE
+        v0 = _mod_fbm4(u, phi - g * omega * (a0 * T), seed0)
+        ar1 = s + 0.5
+        c1 = ti.floor(ar1)
+        a1 = ar1 - c1
+        w1 = 1.0 - ti.abs(2.0 * a1 - 1.0)
+        seed1 = seed + _NCYC_PHASE + ti.cast(c1, ti.i32) * _NCYC_CYCLE
+        v1 = _mod_fbm4(u, phi - g * omega * (a1 * T), seed1)
+        out = w0 * v0 + w1 * v1
+    return out
+
+
+@ti.func
+def _disk_density_cks(
+    x, y, r, dz_ang, sigma_theta, r_inner, r_outer, r_isco,
+    noise_enabled, noise_seed, t_disk, a,
+):
+    """Volumetric mass density ρ at a CKS equatorial-slab point (CKS-12 §3 stack).
+
+    Single source of truth for the density used by BOTH the emission march
+    (``_disk_emit_cks``) and the CKS-15 radial deep-shadow bake — extracting it
+    here is what keeps the two from drifting. Returns
+    ``vec2(density, temp_factor)``:
+
+    - ``density`` — Gaussian envelope × §3 noise multiplier × ragged-edge window.
+      Feeds emission, dτ, and the shadow optical depth. enabled==0 ⇒ the bare
+      Gaussian (legacy path bit-identical, constraint 6).
+    - ``temp_factor`` — the §3 emitted-temperature lump (applied to ``T_emit``
+      downstream, BEFORE the g shift — constraint 2). 1.0 unless §3 modulation
+      (``_NI_MOD_EN``) is on, so the non-modulated path is unaffected.
+
+    Caller supplies ``sigma_theta = theta_half · sigma_frac`` and the slab
+    ``dz_ang = θ − π/2`` so the bake can reuse them off its grid coordinates.
+    """
+    density = ti.exp(-0.5 * (dz_ang / sigma_theta) ** 2)
+    temp_factor = 1.0
+    # D2.2 procedural turbulence (SKILL.md CKS-12 §3): multiply the Gaussian
+    # density by the noise field (amplitude only — feeds BOTH emission and
+    # absorption). enabled==0 skips this entirely ⇒ the legacy path is
+    # bit-identical (constraint 6).
+    if noise_enabled == 1:
+        u_n = ti.log(r / r_inner)
+        phi_n = ti.atan2(y, x)
+        zeta_n = dz_ang / sigma_theta
+        # Ω(r) = 1/(r^{3/2}+a) — Formula 3 (prograde), the shear-advection rate
+        # (CKS-12 §2). d/dt atan2(y,x) = Ω co-moves with the CKS-8 gas.
+        omega = 1.0 / (r * ti.sqrt(r) + a)
+        dmult = _disk_noise_density_mult(u_n, phi_n, zeta_n, t_disk, omega, noise_seed)
+        gauss = density  # base Gaussian (unmodulated σ); reassigned below
+        win = 1.0        # edge window (1.0 = hard cutoff already enforced)
+        # D2.4 §3 modulation (temperature / ragged edges / lumpy scale height).
+        # _NI_MOD_EN==0 ⇒ skip ⇒ density = gauss·dmult exactly (the D2.3 path,
+        # bit-identical — constraint 6).
+        if disk_noise_params[_NI_MOD_EN] > 0.5:
+            mf = _disk_noise_mod_fields(u_n, phi_n, t_disk, omega, noise_seed)
+            # Lumpy scale height: re-evaluate the Gaussian at the modulated σ_θ
+            # (the worst-case-thin σ is what the trace step cap guards,
+            # constraint 4). n_h = mf[3].
+            h_amp = disk_noise_params[_NI_MOD_HEIGHT_AMP]
+            sigma_m = sigma_theta * (1.0 + h_amp * (mf[3] - 0.5))
+            gauss = ti.exp(-0.5 * (dz_ang / sigma_m) ** 2)
+            # Ragged edges: smoothstep windows replace the hard radial cutoffs.
+            # r_in_eff ≥ r_isco (zero-torque BC, constraint 3).
+            ein = disk_noise_params[_NI_MOD_EIN_AMP]
+            eout = disk_noise_params[_NI_MOD_EOUT_AMP]
+            soft = disk_noise_params[_NI_MOD_EDGE_SOFT]
+            r_in_eff = ti.max(r_inner * (1.0 + ein * (mf[1] - 0.5)), r_isco)
+            r_out_eff = r_outer * (1.0 + eout * (mf[2] - 0.5))
+            win = _smoothstep_ti(r_in_eff, r_in_eff + soft, r) * (
+                1.0 - _smoothstep_ti(r_out_eff - soft, r_out_eff, r)
+            )
+            # Emitted-temperature lumps (applied to T_emit, pre-g — n_T=mf[0]).
+            t_amp = disk_noise_params[_NI_MOD_TEMP_AMP]
+            temp_factor = 1.0 + t_amp * (mf[0] - 0.5)
+        density = gauss * dmult * win
+    return vec2(density, temp_factor)
+
+
+@ti.func
+def _sample_shadow_tau(u_n, phi_n, zeta_n):
+    """Trilinear lookup into the CKS-15 deep-shadow-map (φ periodic).
+
+    Returns the cumulative absorption optical depth between ``r_inner`` and the
+    sample at noise coords ``(u_n, φ_n, ζ_n)``. ``u`` and ``ζ`` clamp at the grid
+    edges (a sample at ``r > r_outer`` reads the outermost column; beyond ±ζ_max the
+    rim cell), ``φ`` wraps (the disk is azimuthally periodic — no φ=0 seam). The
+    field stores τ at each cell's INNER edge (gas strictly inward of the sample), so
+    a cell never shadows itself (see ``bake_disk_shadow``).
+    """
+    NU = disk_shadow_tau.shape[0]
+    NPHI = disk_shadow_tau.shape[1]
+    NZ = disk_shadow_tau.shape[2]
+    # Continuous bin coordinates (cell centres sit at index + 0.5).
+    fu = u_n / _SHADOW_U_MAX * NU - 0.5
+    fp = (phi_n + math.pi) / _TWO_PI * NPHI - 0.5
+    fz = (zeta_n + _SHADOW_ZETA_MAX) / (2.0 * _SHADOW_ZETA_MAX) * NZ - 0.5
+    # u, ζ clamp to the valid cell-centre span [0, N-1]; φ wraps below.
+    fu = ti.min(ti.max(fu, 0.0), ti.cast(NU - 1, ti.f32))
+    fz = ti.min(ti.max(fz, 0.0), ti.cast(NZ - 1, ti.f32))
+    i0 = ti.cast(ti.floor(fu), ti.i32)
+    j0 = ti.cast(ti.floor(fp), ti.i32)
+    k0 = ti.cast(ti.floor(fz), ti.i32)
+    tu = fu - i0
+    tp = fp - j0
+    tz = fz - k0
+    i1 = ti.min(i0 + 1, NU - 1)
+    k1 = ti.min(k0 + 1, NZ - 1)
+    # φ periodic wrap on both interpolation endpoints (handles j0 = -1 or NPHI-1).
+    j0w = (j0 % NPHI + NPHI) % NPHI
+    j1w = ((j0 + 1) % NPHI + NPHI) % NPHI
+    c00 = disk_shadow_tau[i0, j0w, k0] * (1.0 - tu) + disk_shadow_tau[i1, j0w, k0] * tu
+    c01 = disk_shadow_tau[i0, j0w, k1] * (1.0 - tu) + disk_shadow_tau[i1, j0w, k1] * tu
+    c10 = disk_shadow_tau[i0, j1w, k0] * (1.0 - tu) + disk_shadow_tau[i1, j1w, k0] * tu
+    c11 = disk_shadow_tau[i0, j1w, k1] * (1.0 - tu) + disk_shadow_tau[i1, j1w, k1] * tu
+    c0 = c00 * (1.0 - tp) + c10 * tp
+    c1 = c01 * (1.0 - tp) + c11 * tp
+    return c0 * (1.0 - tz) + c1 * tz
+
+
+@ti.kernel
+def bake_disk_shadow(
+    r_inner: float,
+    r_outer: float,
+    r_isco: float,
+    theta_half: float,
+    sigma_frac: float,
+    zeta_max: float,
+    max_tau: float,
+    absb_c: float,
+    noise_enabled: int,
+    noise_seed: int,
+    t_disk: float,
+    a: float,
+):
+    """Bake the CKS-15 radial deep-shadow-map ``τ_shadow[NU,NPHI,NZ]`` (spec §2.1).
+
+    For each ``(φ, ζ)`` column (parallelized), march ``u`` OUTWARD from ``u=0``
+    (``r=r_inner``) accumulating the SAME absorption the emission march uses —
+    ``κ·ρ·dr`` with ``κ=absb_c``, ``dr = r·du`` (since ``u=ln r/r_inner``) and ``ρ``
+    the shared ``_disk_density_cks`` at this ``(u,φ,ζ,t_disk)``. Each cell stores the
+    τ accumulated from gas STRICTLY INWARD of it (the running sum BEFORE adding the
+    cell's own dτ) so a cell never shadows itself; clamped to ``max_tau`` (caustic /
+    overflow safety). VISUALIZATION occlusion bookkeeping — a straight radial CKS
+    ray, NOT a geodesic (CKS-15 governance); it never touches p_μ/u^μ/g/g⁴/f_PT.
+
+    Density reconstruction (must match ``_disk_emit_cks`` exactly at the same noise
+    coords): ``_disk_density_cks`` reads ``(x, y)`` ONLY through ``atan2(y, x)=φ`` and
+    otherwise uses the passed ``r`` / ``dz_ang`` / ``σ_θ``, so feeding ``x=cos φ``,
+    ``y=sin φ``, ``r=r_inner·e^u`` and ``dz_ang=ζ·σ_θ`` reproduces the identical
+    ``ρ(u, φ, ζ; t)`` — including its §2 shear advection and §3 modulation.
+    """
+    NU = disk_shadow_tau.shape[0]
+    NPHI = disk_shadow_tau.shape[1]
+    NZ = disk_shadow_tau.shape[2]
+    u_max = ti.log(r_outer / r_inner)
+    du = u_max / NU
+    sigma_theta = theta_half * sigma_frac
+    for i_phi, i_z in ti.ndrange(NPHI, NZ):
+        phi = -math.pi + (i_phi + 0.5) * (_TWO_PI / NPHI)
+        zeta = -zeta_max + (i_z + 0.5) * (2.0 * zeta_max / NZ)
+        x = ti.cos(phi)
+        y = ti.sin(phi)
+        dz_ang = zeta * sigma_theta
+        tau = 0.0
+        for i_u in range(NU):
+            # Store τ from STRICTLY inner gas (running sum before this cell's own
+            # contribution) ⇒ no self-shadow within a cell. Serial scan (nested
+            # range loop) over the parallel (φ, ζ) column.
+            disk_shadow_tau[i_u, i_phi, i_z] = ti.min(tau, max_tau)
+            u = (i_u + 0.5) * du
+            r = r_inner * ti.exp(u)
+            dens = _disk_density_cks(
+                x, y, r, dz_ang, sigma_theta, r_inner, r_outer, r_isco,
+                noise_enabled, noise_seed, t_disk, a,
+            )[0]
+            tau += absb_c * dens * (r * du)
+
+
+@ti.func
 def _disk_emit_cks(
-    x, y, z, p_cov, a, r_inner, r_outer, theta_half, sigma_frac, T_0, emis_c, absb_c, ds,
-    disk_model, doppler_strength, noise_enabled, noise_seed, t_disk,
+    x, y, z, p_cov, a, r_inner, r_outer, r_isco, theta_half, sigma_frac, T_0, emis_c, absb_c, ds,
+    disk_model, doppler_strength, noise_enabled, noise_seed, t_disk, self_shadow, shadow_strength,
 ):
     """One volumetric disk sample at a CKS geodesic point → (emission RGB, dτ).
 
@@ -1058,22 +1387,38 @@ def _disk_emit_cks(
                 if doppler_strength != 1.0:
                     g_eff = ti.pow(g, doppler_strength)
                 sigma_theta = theta_half * sigma_frac
-                density = ti.exp(-0.5 * (dz_ang / sigma_theta) ** 2)
-                # D2.2 procedural turbulence (SKILL.md CKS-12 §3): multiply the
-                # Gaussian density by the noise field (amplitude only — feeds BOTH
-                # emission and absorption). enabled==0 skips this entirely ⇒ the
-                # legacy path is bit-identical (constraint 6).
-                if noise_enabled == 1:
+                # Density (Gaussian × §3 noise × ragged-edge window) and the §3
+                # temperature lump come from the shared CKS-12 stack so the
+                # emission march and the CKS-15 shadow bake can't drift. The
+                # noise/modulation gating lives inside; enabled==0 ⇒ bare
+                # Gaussian (legacy bit-identical).
+                dens_tf = _disk_density_cks(
+                    x, y, r, dz_ang, sigma_theta, r_inner, r_outer, r_isco,
+                    noise_enabled, noise_seed, t_disk, a,
+                )
+                density = dens_tf[0]
+                # temp_factor carries the §3 emitted-temperature modulation forward
+                # to T_emit below (BEFORE the g shift — constraint 2). 1.0 = identity.
+                temp_factor = dens_tf[1]
+                g4 = g_eff * g_eff * g_eff * g_eff  # Formula 9 (3D volume: g⁴)
+
+                # CKS-15 radial self-shadow (VISUALIZATION). Dim the EMISSIVITY j by
+                # the absorption between r_inner and this sample (the deep-shadow-map
+                # baked along the SAME density), BEFORE it becomes the source
+                # function S — so a shadowed clump reads dark, not just dim, and
+                # composes with CKS-14 (S·e^{−τ_s}). dτ (κ) is NOT attenuated: the
+                # gas still occludes regardless of how lit it is. self_shadow==0 ⇒
+                # shadow_atten ≡ 1 (legacy path bit-identical). It multiplies the
+                # emission AMPLITUDE only — never p_μ/u^μ/g/g⁴/f_PT (CKS-15 / CKS-12
+                # constraint 1); the straight-radial shadow ray is a viz approx,
+                # flagged like doppler_strength.
+                shadow_atten = 1.0
+                if self_shadow == 1:
                     u_n = ti.log(r / r_inner)
                     phi_n = ti.atan2(y, x)
                     zeta_n = dz_ang / sigma_theta
-                    # Ω(r) = 1/(r^{3/2}+a) — Formula 3 (prograde), the shear-advection
-                    # rate (CKS-12 §2). d/dt atan2(y,x) = Ω co-moves with the CKS-8 gas.
-                    omega = 1.0 / (r * ti.sqrt(r) + a)
-                    density *= _disk_noise_density_mult(
-                        u_n, phi_n, zeta_n, t_disk, omega, noise_seed
-                    )
-                g4 = g_eff * g_eff * g_eff * g_eff  # Formula 9 (3D volume: g⁴)
+                    tau_s = _sample_shadow_tau(u_n, phi_n, zeta_n)
+                    shadow_atten = ti.exp(-shadow_strength * tau_s)
 
                 # Radial profile: simple (Decision B) or Page-Thorne (CKS-11).
                 T_emit = 0.0
@@ -1092,6 +1437,16 @@ def _disk_emit_cks(
                     # Decision B temperature model: T = T_0·(6/r)^0.75.
                     T_emit = T_0 * ti.pow(6.0 / r, 0.75)
                     emission = emis_c * density * g4 * ds
+
+                # CKS-15: apply the self-shadow attenuation to the emissivity in both
+                # radial-profile branches (shadow_atten ≡ 1 when self_shadow==0, so
+                # bit-identical). κ/dτ below stays untouched.
+                emission *= shadow_atten
+
+                # §3 emitted-temperature modulation — applied to T_emit BEFORE the
+                # g_eff shift (constraint 2: chroma(g_eff·T_emit) keeps g⁴-not-g⁸).
+                # temp_factor == 1.0 unless _NI_MOD_EN is set, so bit-identical otherwise.
+                T_emit *= temp_factor
 
                 if emit == 1:
                     chroma = _blackbody_rgb(g_eff * T_emit)
@@ -1228,6 +1583,7 @@ def render_beauty_physics(
     depth_infinity: float,
     r_inner: float,
     r_outer: float,
+    r_isco: float,
     theta_half: float,
     bound_sin_half: float,
     sigma_frac: float,
@@ -1240,6 +1596,9 @@ def render_beauty_physics(
     noise_enabled: int,
     noise_seed: int,
     t_disk: float,
+    source_function: int,
+    self_shadow: int,
+    shadow_strength: float,
 ):
     """Kernel 1 (Phase 2.4 split): trace ONE primary ray per pixel (no offset ray).
 
@@ -1318,11 +1677,23 @@ def render_beauty_physics(
                 # can read dz/dλ = k1[3] for free (the step reuses this same k1).
                 k1 = _eom(s, a)
 
+                # D2.4 §3 ragged edges (CKS-12): when modulation is on the emitting
+                # band can bulge OUT to r_outer·(1+e_out/2)+edge_soft and the inner
+                # edge can recede IN to r_isco (r_in_eff ≥ r_isco, constraint 3), so
+                # the geometric early-out must use the WIDEST possible band or a ray
+                # would skip the soft falloff region. _NI_MOD_EN==0 ⇒ r_lo/r_hi stay
+                # r_inner/r_outer ⇒ bit-identical to D2.3.
+                r_lo = r_inner
+                r_hi = r_outer
+                if disk_noise_params[_NI_MOD_EN] > 0.5:
+                    r_lo = r_isco
+                    r_hi = r_outer * (1.0 + 0.5 * disk_noise_params[_NI_MOD_EOUT_AMP]) \
+                        + disk_noise_params[_NI_MOD_EDGE_SOFT]
                 in_band = (
                     disk_enabled == 1
                     and ti.abs(z / r) < bound_sin_half
-                    and r >= r_inner
-                    and r <= r_outer
+                    and r >= r_lo
+                    and r <= r_hi
                 )
                 if in_band:
                     # Disk-thickness step cap. The base rule sizes h only by distance
@@ -1336,6 +1707,11 @@ def render_beauty_physics(
                     # on grazers (dz/dλ→0) keep the full radial step, so the cap adds
                     # no steps there and cannot push those rays into the max_steps cap.
                     sigma_z = r * theta_half * sigma_frac
+                    # §3 lumpy scale height: the cap must resolve the WORST-CASE (thinnest)
+                    # modulated σ, σ_z·(1 − h_amp/2), or the face-on moiré returns where a
+                    # lump thins below the step (CKS-12 constraint 4). h_amp=0 ⇒ unchanged.
+                    if disk_noise_params[_NI_MOD_EN] > 0.5:
+                        sigma_z = sigma_z * (1.0 - 0.5 * disk_noise_params[_NI_MOD_HEIGHT_AMP])
                     vz = ti.abs(k1[3])
                     h_cap = max_step_vfrac * sigma_z / ti.max(vz, _DISK_STEP_V_EPS)
                     local_h = ti.min(local_h, h_cap)
@@ -1353,6 +1729,7 @@ def render_beauty_physics(
                         a,
                         r_inner,
                         r_outer,
+                        r_isco,
                         theta_half,
                         sigma_frac,
                         T_0,
@@ -1364,12 +1741,35 @@ def render_beauty_physics(
                         noise_enabled,
                         noise_seed,
                         t_disk,
+                        self_shadow,
+                        shadow_strength,
                     )
-                    disk_col += transm * vec3(ev[0], ev[1], ev[2])
-                    contribution = transm * (ev[0] + ev[1] + ev[2])
+                    # CKS-14 radiative-transfer source-function march. The kernel
+                    # still returns (emission=j·ds, dτ=κ·ds); the term ACTUALLY
+                    # added this step is `added`:
+                    #   legacy (source_function==0 or dτ≈0): added = emission, i.e.
+                    #     dI = j·ds → disk_col += T·emission (bit-identical fallback).
+                    #   RTE  (source_function==1, dτ>ε): added = w·S with
+                    #     S = emission/dτ = (emis_c/absb_c)·[f_PT]·g_eff⁴·chroma
+                    #     (ρ and ds cancel) and w = 1−e^{−dτ}.
+                    # SAME continuum integral as legacy (transm·j·ds = transm·S·dτ);
+                    # CKS-14 is just the EXACT per-step quadrature (legacy is the
+                    # left-endpoint rectangle, which over-counts thick steps). Thin
+                    # limit w→dτ ⇒ w·S→emission (→ legacy to O(dτ²)). Its real payoff
+                    # is materialising S so CKS-15 self-shadow can dim it (S·e^{−τ_s}).
+                    # g-bookkeeping unchanged: S carries g_eff⁴·chroma exactly once.
+                    dtau = ev[3]
+                    added = vec3(ev[0], ev[1], ev[2])
+                    if source_function == 1 and dtau > _RTE_TAU_EPS:
+                        w = (1.0 - ti.exp(-dtau)) / dtau     # = w·(1/dτ); ·emission = w·S
+                        added = vec3(ev[0] * w, ev[1] * w, ev[2] * w)
+                    disk_col += transm * added
+                    # depth / total_emission key off the radiance actually contributed,
+                    # so the transmittance-weighted Z stays consistent with the march.
+                    contribution = transm * (added[0] + added[1] + added[2])
                     weighted_depth += ray_length * contribution
                     total_emission += contribution
-                    transm *= ti.exp(-ev[3])
+                    transm *= ti.exp(-dtau)
 
                 s = _rk4_step_k1(s, a, local_h, k1)
                 ray_length += local_h
@@ -1861,6 +2261,46 @@ def render_beauty_frame(
     nz = d.get("noise", {}) or {}
     noise_enabled = 1 if nz.get("enabled", False) else 0
     noise_seed = int(nz.get("seed", 1234))
+    # V1 CKS-14 volumetric RTE source-function march (SKILL.md CKS-14). Runtime
+    # kernel arg, no re-JIT; false ⇒ legacy ``color += T·emission`` (golden frames
+    # bit-identical). true ⇒ thick gas converges to a bright emitting surface
+    # (brightness ~ emission_coeff/absorption_coeff) instead of reading black.
+    vol = d.get("volumetric", {}) or {}
+    source_function = 1 if vol.get("source_function", False) else 0
+    # V1.2 CKS-15 radial deep-shadow-map self-shadow (SKILL.md CKS-15). enabled:false
+    # ⇒ no bake, no lookup (golden frames bit-identical). When on, the τ_shadow field
+    # is re-baked per frame (it tracks the shear-advected density at t_disk) before
+    # the trace; the per-sample lookup then dims emissivity by exp(−strength·τ_s).
+    ss = vol.get("self_shadow", {}) or {}
+    self_shadow = 1 if ss.get("enabled", False) else 0
+    shadow_strength = float(ss.get("strength", 1.0))
+    r_isco_cfg = float(cfg.get("black_hole", {}).get("r_isco", d["r_inner"]))
+    # V1.3 LOD gate (spec §3.1): the per-frame bake + per-sample lookup are close-up
+    # cost. When the camera sits beyond ``self_shadow.lod_max_camera_radius`` (the
+    # disk subtends a small solid angle — wide/mid Gargantua), drop the self-shadow
+    # so those frames pay ZERO added cost and ride the cheap legacy march. ``<= 0``
+    # (default) ⇒ no gate, so the default look is unchanged. Only the (expensive,
+    # bake-bearing) self-shadow is gated; the source-function march is a cheap
+    # march-loop reinterpretation with no bake, so it is left always-honored to avoid
+    # a look-pop between a wide and a close shot of the same scene.
+    lod_max = float(ss.get("lod_max_camera_radius", 0.0))
+    if self_shadow == 1 and lod_max > 0.0 and float(np.linalg.norm(pos)) > lod_max:
+        self_shadow = 0
+    if self_shadow == 1:
+        bake_disk_shadow(
+            float(d["r_inner"]),
+            float(d["r_outer"]),
+            r_isco_cfg,
+            float(d["theta_half_width"]),
+            float(d["vertical_sigma_frac"]),
+            float(ss.get("zeta_max", 3.0)),
+            float(ss.get("max_tau", 8.0)),
+            float(d["absorption_coeff"]),
+            noise_enabled,
+            noise_seed,
+            float(t_disk),
+            a,
+        )
 
     _alloc_frame(width, height)
     # Phase 2.4 kernel split: physics pass writes exit_buf/disk_buf, shading pass
@@ -1893,6 +2333,9 @@ def render_beauty_frame(
         depth_infinity,
         float(d["r_inner"]),
         float(d["r_outer"]),
+        # r_isco (CKS-13-derived) — the zero-torque floor the §3 ragged inner edge
+        # may recede to but never below (constraint 3). Falls back to r_inner.
+        float(cfg.get("black_hole", {}).get("r_isco", d["r_inner"])),
         float(d["theta_half_width"]),
         bound_sin_half,
         float(d["vertical_sigma_frac"]),
@@ -1905,6 +2348,9 @@ def render_beauty_frame(
         noise_enabled,
         noise_seed,
         float(t_disk),
+        source_function,
+        self_shadow,
+        shadow_strength,
     )
     # starfield.mode: dngr ⇒ Formula-13 two-layer background; else legacy F10 texture.
     dngr_mode = 1 if str(cfg.get("starfield", {}).get("mode", "texture")) == "dngr" else 0

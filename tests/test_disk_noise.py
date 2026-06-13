@@ -290,3 +290,63 @@ def test_dynamism_gain_matches_cpu_and_changes_shear():
     cpu_unit = noise.noise_density_mult(u, phi, zeta, _NOISE_ON, seed=seed,
                                         t_disk=t_disk, omega=omega, shear_period=T)
     assert not np.allclose(cpu_gain, cpu_unit, rtol=1e-2, atol=1e-2)
+
+
+# A modulation block (D2.4 §3) for the twin-agreement test below.
+_MOD_BLOCK = {
+    "enabled": True, "octaves": 3, "lacunarity": 2.0, "gain": 0.5,
+    "freq_u": 4.0, "freq_phi": 16, "temp_amp": 0.6, "edge_in_amp": 0.3,
+    "edge_out_amp": 0.2, "edge_softness": 0.4, "height_amp": 0.5,
+}
+
+
+def test_mod_fields_match_cpu_reference():
+    """D2.4 (CKS-12 §3): the kernel's modulation-envelope twin
+    ``_disk_noise_mod_fields`` (n_T, n_e_in, n_e_out, n_h) must match the CPU source
+    of truth ``noise.noise_modulation_fields`` under the same dual-phase shear
+    advection as the density field. Driven past one reset cycle (s = 1.3) with a
+    per-sample Ω and the ``dynamism`` gain so the reseed + crossfade + gain all bite.
+    """
+    import taichi as ti
+
+    from renderer import noise
+
+    _ensure_cuda()
+    T = 10.0
+    t_disk = 1.3 * T
+    nz = copy.deepcopy(_NOISE_ON)
+    nz["dynamism"] = 4.0
+    nz["modulation"] = copy.deepcopy(_MOD_BLOCK)
+    tr._setup_disk_noise({"disk": {"noise": nz, "dynamics": {"shear_period_M": T}}})
+    seed = int(nz["seed"])
+
+    rng = np.random.default_rng(3)
+    n = 4096
+    u = rng.uniform(0.0, 3.0, n).astype(np.float32)
+    phi = rng.uniform(-np.pi, np.pi, n).astype(np.float32)
+    zeta = rng.uniform(-2.5, 2.5, n).astype(np.float32)
+    omega = rng.uniform(0.05, 0.4, n).astype(np.float32)
+
+    uf = ti.field(ti.f32, n)
+    pf = ti.field(ti.f32, n)
+    omf = ti.field(ti.f32, n)
+    out = ti.field(ti.f32, shape=(n, 4))
+    uf.from_numpy(u); pf.from_numpy(phi); omf.from_numpy(omega)
+
+    @ti.kernel
+    def k_mod(s: ti.i32, td: ti.f32):
+        for i in range(n):
+            v = tr._disk_noise_mod_fields(uf[i], pf[i], td, omf[i], s)
+            for j in ti.static(range(4)):
+                out[i, j] = v[j]
+
+    k_mod(seed, t_disk)
+    gpu = out.to_numpy()  # (n, 4)
+    cpu = noise.noise_modulation_fields(u, phi, zeta, nz, seed=seed,
+                                        t_disk=t_disk, omega=omega, shear_period=T)
+    for j in range(4):
+        assert np.allclose(gpu[:, j], cpu[j], rtol=1e-3, atol=2e-3), (
+            j, float(np.abs(gpu[:, j] - cpu[j]).max())
+        )
+    # Sanity: the advected envelopes stay in [0,1] (convex triangle-weight blend).
+    assert gpu.min() >= -1e-4 and gpu.max() <= 1.0 + 1e-4

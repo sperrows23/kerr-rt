@@ -183,6 +183,116 @@ def test_cell_wall_is_f2_minus_f1():
 
 
 # --------------------------------------------------------------------------- #
+# §3.6 Simplex (Perlin/Gustavson) — the isotropic basis for the V3 curl potential.
+#
+# Unlike the cubic-lattice family these are NOT lattice-periodic (the input skew
+# couples the axes), so they carry no φ-periodicity guard — that is precisely why
+# they are a library basis, not wired into the φ-periodic disk stack (noise.py
+# §3.6). Their reason to exist is the isotropy guard at the bottom of this section:
+# simplex has no axis-aligned grid bias the square-lattice Perlin basis leaks.
+# --------------------------------------------------------------------------- #
+def _simplex_grid(n: int = 24):
+    """A non-periodic (x, y, z) sample grid (simplex needs no integer φ-period)."""
+    return (np.linspace(-4.1, 5.3, n), np.linspace(-3.7, 6.1, n),
+            np.linspace(-2.9, 3.3, n))
+
+
+@pytest.mark.parametrize("fn,dim", [(noise.snoise2, 2), (noise.snoise3, 3)])
+def test_snoise_in_unit_range(fn, dim):
+    """Simplex maps to [0, 1] (the Gustavson 70/32 normalizers + _to01 clamp) and is
+    not a constant field."""
+    x, y, z = _simplex_grid()
+    X, Y, Z = np.meshgrid(x, y, z, indexing="ij")
+    n = fn(X, Y, 0) if dim == 2 else fn(X, Y, Z, 0)
+    assert n.dtype == np.float32
+    assert n.min() >= 0.0 and n.max() <= 1.0
+    assert n.std() > 0.05
+
+
+def test_snoise_deterministic():
+    """Pure function of inputs + seed (PCG hash, no global RNG; CKS-12 constraint 7)."""
+    x, y, z = _simplex_grid()
+    X, Y, Z = np.meshgrid(x, y, z, indexing="ij")
+    assert np.array_equal(noise.snoise3(X, Y, Z, 0, seed=4),
+                          noise.snoise3(X, Y, Z, 0, seed=4))
+
+
+def test_snoise_seed_changes_field():
+    x, y, _ = _simplex_grid()
+    X, Y = np.meshgrid(x, y, indexing="ij")
+    assert not np.array_equal(noise.snoise2(X, Y, 0, seed=1),
+                              noise.snoise2(X, Y, 0, seed=2))
+
+
+def test_sfbm_single_octave_equals_base():
+    """One octave of the simplex fBm is exactly the base simplex noise (the octave
+    machinery is shared with the cubic-lattice fBm)."""
+    x, y, _ = _simplex_grid()
+    X, Y = np.meshgrid(x, y, indexing="ij")
+    one = noise.sfbm2(X, Y, 0, octaves=1, gain=0.5)
+    base = noise.snoise2(X, Y, 0)
+    assert np.allclose(one, base, atol=1e-6)
+
+
+def test_sfbm_in_unit_range_3d():
+    x, y, z = _simplex_grid()
+    X, Y, Z = np.meshgrid(x, y, z, indexing="ij")
+    n = noise.sfbm3(X, Y, Z, 0, octaves=5, lacunarity=2, gain=0.5)
+    assert n.min() >= 0.0 and n.max() <= 1.0
+    assert n.std() > 0.03
+
+
+def test_snoise_is_continuous():
+    """Simplex noise is C2 — the radial corner kernel (r₀²−|d|²)₊⁴ vanishes smoothly
+    at the support boundary, so there is no lattice-edge discontinuity. Sampled on a
+    fine line (step 0.01), the largest adjacent jump must stay far below the field's
+    own [0, 1] span (a discontinuity would spike this)."""
+    t = np.arange(0.0, 30.0, 0.01, dtype=np.float32)
+    line = noise.snoise2(t, 0.37 * t + 1.1, 0, seed=3)
+    assert np.abs(np.diff(line)).max() < 0.05
+
+
+def _m4_anisotropy(field: np.ndarray) -> float:
+    """Normalized amplitude of the cos(4θ)/sin(4θ) angular harmonic of the noise
+    power spectrum within a mid radial band. A **square lattice** (Perlin) is
+    strongly 4-fold symmetric ⇒ large; a hexagonal **simplex** lattice is not ⇒
+    near zero. This is the quantitative signature of the axis-aligned grid bias."""
+    f = field - field.mean()
+    P = np.abs(np.fft.fftshift(np.fft.fft2(f))) ** 2
+    n = P.shape[0]
+    c = n // 2
+    yy, xx = np.mgrid[0:n, 0:n]
+    ky = yy - c
+    kx = xx - c
+    rad = np.hypot(kx, ky)
+    th = np.arctan2(ky, kx)
+    band = (rad >= 0.06 * n) & (rad <= 0.30 * n)  # skip DC + extreme highs
+    w = P[band]
+    w = w / w.sum()
+    t = th[band]
+    c4 = float((w * np.cos(4 * t)).sum())
+    s4 = float((w * np.sin(4 * t)).sum())
+    return np.hypot(c4, s4)
+
+
+def test_simplex_more_isotropic_than_perlin():
+    """THE acceptance for V1.5: simplex removes the axis-aligned grid artifact of the
+    square-lattice Perlin basis. At a matched feature scale (10 cells across a 256²
+    grid) the 4-fold angular anisotropy of the power spectrum is ~12× smaller for
+    simplex than for Perlin gradient noise (measured: Perlin ≈ 0.52, simplex ≈ 0.04,
+    stable across seeds). The margins below are conservative against that gap."""
+    n = 256
+    cells = 10
+    g = np.linspace(0.0, cells, n, endpoint=False).astype(np.float32)
+    X, Y = np.meshgrid(g, g, indexing="ij")
+    perlin = np.mean([_m4_anisotropy(noise.gnoise2(X, Y, cells, seed=s)) for s in (1, 2, 3)])
+    simplex = np.mean([_m4_anisotropy(noise.snoise2(X, Y, 0, seed=s)) for s in (1, 2, 3)])
+    assert perlin > 0.30, perlin           # the square lattice IS strongly 4-fold
+    assert simplex < 0.15, simplex         # simplex is near-isotropic at m=4
+    assert simplex < 0.4 * perlin, (simplex, perlin)  # ≥2.5× more isotropic
+
+
+# --------------------------------------------------------------------------- #
 # §4 combined layer stack — noise_density_mult (CPU source of truth, D2.2)
 # --------------------------------------------------------------------------- #
 _NZ = {
@@ -351,3 +461,62 @@ def test_dynamism_gain_emphasises_winding():
     dev1 = np.abs(np.log(g1) - np.log(static)).mean()
     dev4 = np.abs(np.log(g4) - np.log(static)).mean()
     assert dev4 > dev1
+
+
+# --------------------------------------------------------------------------- #
+# §3 modulation envelopes — noise_modulation_fields (D2.4, CKS-12 §3)
+# --------------------------------------------------------------------------- #
+_MOD = {
+    **_NZ,
+    "dynamism": 1.0,
+    "modulation": {
+        "enabled": True, "octaves": 3, "lacunarity": 2, "gain": 0.5,
+        "freq_u": 4.0, "freq_phi": 16, "temp_amp": 0.6, "edge_in_amp": 0.3,
+        "edge_out_amp": 0.2, "edge_softness": 0.4, "height_amp": 0.5,
+    },
+}
+
+
+def test_modulation_disabled_is_half():
+    """No ``modulation`` block (or ``enabled: false``) ⇒ every envelope is the no-op
+    midpoint 0.5 (n − ½ = 0 ⇒ identity), matching the kernel's skipped §3 branch."""
+    u, phi, zeta = _stack_grid()
+    for nz in (_NZ, {**_MOD, "modulation": {**_MOD["modulation"], "enabled": False}}):
+        fields = noise.noise_modulation_fields(u, phi, zeta, nz, seed=7)
+        assert len(fields) == 4
+        for f in fields:
+            assert f.dtype == np.float32
+            assert np.array_equal(f, np.full_like(f, 0.5))
+
+
+def test_modulation_fields_in_unit_range():
+    """The four envelopes are fBm in [0,1]; the advected dual-phase blend (convex
+    triangle weights, no variance_preserve) stays in [0,1] so n − ½ is a bounded ±½."""
+    u, phi, zeta, omega = _adv_grid()
+    for kw in ({}, {"t_disk": 1.7 * 4.0, "omega": omega, "shear_period": 4.0}):
+        fields = noise.noise_modulation_fields(u, phi, zeta, _MOD, seed=5, **kw)
+        for f in fields:
+            assert f.min() >= -1e-5 and f.max() <= 1.0 + 1e-5
+
+
+def test_modulation_envelopes_decorrelated():
+    """The four envelopes use distinct seed offsets ⇒ they are different fields
+    (a shared field would make T/edge/height move in lockstep)."""
+    u, phi, zeta = _stack_grid()
+    nT, nein, neout, nh = noise.noise_modulation_fields(u, phi, zeta, _MOD, seed=5)
+    assert not np.array_equal(nT, nein)
+    assert not np.array_equal(nT, nh)
+    assert not np.array_equal(nein, neout)
+
+
+def test_modulation_advects_and_is_deterministic():
+    """Advection moves the envelopes with t_disk, and the result is a pure function
+    of (inputs, seed, t_disk) — no global RNG (constraint 7)."""
+    u, phi, zeta, omega = _adv_grid()
+    T = 4.0
+    kw = dict(seed=9, omega=omega, shear_period=T)
+    a = noise.noise_modulation_fields(u, phi, zeta, _MOD, t_disk=0.2 * T, **kw)
+    b = noise.noise_modulation_fields(u, phi, zeta, _MOD, t_disk=0.2 * T, **kw)
+    c = noise.noise_modulation_fields(u, phi, zeta, _MOD, t_disk=0.7 * T, **kw)
+    assert all(np.array_equal(x, y) for x, y in zip(a, b))  # deterministic
+    assert not np.array_equal(a[0], c[0])                   # evolves with t_disk

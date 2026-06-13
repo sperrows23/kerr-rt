@@ -179,9 +179,11 @@ only. Frequencies `freq_phi` are integers (φ-periodicity, §3.1).
 | `_setup_disk_noise` (new, beside `_setup_disk_flux`) | upload per-layer params into a small `ti.field` **param buffer** (not baked module constants) so look-dev tuning does **not** re-JIT; `t_disk`, `enabled`, `seed` are kernel args. Follow the D1 `ti.init`-re-setup gotcha: setup must run after `ti.init` on every renderer (re)initialization. |
 | `scripts/thumb.py` | accept `--t-disk` (or `--frame`) for advection look-dev |
 
-**Step-cap interaction (required, D2.4):** the Pipe-B vertical step cap
-(`disk.max_step_vfrac`, CKS-5 note) currently uses `σ_z = r·θ_half·σ_frac`. With
-height modulation it must use `σ_z·(1 − height.amp/2)`.
+**Step-cap interaction (required, D2.4 — ✅ done):** the Pipe-B vertical step cap
+(`disk.max_step_vfrac`, CKS-5 note) used `σ_z = r·θ_half·σ_frac`. With height
+modulation it now uses the worst-case `σ_z·(1 − height_amp/2)` in
+`render_beauty_physics` (only when `_NI_MOD_EN > 0.5`), guarded by
+`test_disk_step_convergence.py::test_disk_emission_resolves_lumpy_slab`.
 
 ## 7. Performance
 
@@ -246,11 +248,30 @@ peak 6.17→14.45 and Doppler ratio 4.32→5.15 — NOT just `doppler_strength`.
   `inner_lap_seconds`. The gain emphasises it without touching reset cadence/continuity.
   Tests: `test_noise.py` (unit-gain bit-identity + winding-emphasis) +
   `test_disk_noise.py::test_dynamism_gain_matches_cpu_and_changes_shear`.
-- **D2.4 — Temperature + edges + scale height.** Including the step-cap σ_z
-  interaction and the extended convergence test.
+- **D2.4 — Temperature + edges + scale height. ✅ done 2026-06-13.** Four advected
+  [0,1] fBm envelopes (`n_T, n_e_in, n_e_out, n_h`) co-moving with the §2 dual-phase
+  reset blend + `dynamism` gain: CPU `noise.noise_modulation_fields` + GPU twin
+  `_disk_noise_mod_fields` (vec4), decorrelated by seed offsets `NSEED_MOD_T/EIN/EOUT/H
+  = 503/601/701/809`, **no** variance-preserve divide (convex triangle weights keep a
+  [0,1] fBm in range). Applied per CKS-12 §3: `T_emit·(1+τ·(n_T−½))` **pre-g**
+  (constraint 2); `r_in_eff = max(r_inner·(1+e_in·(n_e_in−½)), r_isco)` (constraint 3);
+  `r_out_eff = r_outer·(1+e_out·(n_e_out−½))`; `_smoothstep_ti` edge windows replace
+  hard cutoffs; `σ_θ·(1+h·(n_h−½))` lumpy scale height with the Pipe-B step cap on the
+  worst-case `σ_z·(1−h/2)` (constraint 4). σ-circularity avoided by sampling at the
+  unmodulated σ then re-evaluating the Gaussian at σ_m. `_setup_disk_noise` buffer grew
+  32→43 (`_NI_MOD_*` 32-42); `_disk_emit_cks`/`render_beauty_physics` gained `r_isco`,
+  trace band widened to `[r_isco, r_outer·(1+½e_out)+soft]` when modulation is on.
+  `thumb.py` look-dev twin. Tests: `test_noise.py §3` (disabled-is-½, unit-range,
+  decorrelation, advect+determinism), `test_disk_noise.py::test_mod_fields_match_cpu_reference`
+  (GPU↔CPU), `test_disk_step_convergence.py::test_disk_emission_resolves_lumpy_slab`
+  (constraint-4 worst-case-σ_z cap, ≤0.06). **Applied globally:** `configs/render.yaml`
+  now ships `disk.noise.enabled: true` + `modulation.enabled: true`; the GR/calibration
+  guards force noise OFF so the global enable doesn't shift the pinned goldens.
+  `enabled:false`/`modulation.enabled:false` stay bit-identical to D2.3 (constraint 6).
 - **D2.5 — Finish.** Motion-blur `t_disk` jitter, perf pass, noise-on golden
-  frame, PROJECT.md/SKILL.md/memory sync, owner sign-off on the default
-  (`enabled` stays `false` until the owner flips it for production).
+  frame, owner sign-off. (PROJECT.md/SKILL.md/memory synced through D2.4;
+  `disk.noise.enabled` was flipped to `true` for production at D2.4 per owner
+  request — "apply it globally".)
 
 ## 10. Research provenance
 

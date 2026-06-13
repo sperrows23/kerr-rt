@@ -85,6 +85,31 @@ disk:
                            # inner edge → time_scale = T_orb(r_inner)/this. Smaller = faster disk.
     shear_wrap_budget: 3.0 # [look-dev] differential 2π-wraps across [r_inner, r_outer] tolerated
                            # before the CKS-12 reseed → shear_period_M = budget·2π/(Ω_in−Ω_out).
+  volumetric:              # V1 volumetric lighting (spec docs/specs/2026-06-13-V1-self-shadow-
+                           # source-function.md). Both flags default OFF ⇒ the legacy emission+
+                           # extinction march is bit-identical to the D2 goldens.
+    source_function: false # CKS-14 radiative-transfer source-function march. false ⇒ legacy
+                           # color += T·emission. true ⇒ dI=(S−I)dτ with S = emission/dτ =
+                           # (emis_c/absb_c)·[f_PT]·g_eff⁴·chroma (ρ,ds cancel). SAME continuum
+                           # integral as legacy (∫S e^{−τ}dτ) — CKS-14 is its EXACT per-step
+                           # quadrature (legacy over-counts thick steps), and it MATERIALISES S
+                           # for the CKS-15 self_shadow below (S·e^{−τ_shadow} ⇒ voids). Thin
+                           # limit reduces to Formula 9. The voids need source_function + the
+                           # self_shadow block together, not source_function alone.
+    self_shadow:           # CKS-15 radial deep-shadow-map self-shadow (VISUALIZATION, like
+                           # doppler_strength — not a metric). WIRED V1.2; off here.
+      enabled: false       # false ⇒ no bake, no shadow lookup (bit-identical). true ⇒ τ_shadow
+                           # baked radially outward from r_inner per frame, then emission *=
+                           # exp(−strength·τ_shadow) per sample. Pair with source_function for voids.
+      strength: 1.0        # depth of the voids (0 = off; higher = darker shadow lanes).
+      grid_nu: 96          # deep-shadow-map log-radial bins (u = ln r/r_inner).
+      grid_nphi: 256       # azimuthal bins (φ, periodic).
+      grid_nz: 16          # vertical bins across the slab (ζ = dz_ang/σ_θ).
+      zeta_max: 3.0        # ±ζ extent of the grid (≈3σ covers the Gaussian slab).
+      max_tau: 8.0         # clamp on accumulated shadow τ (overflow / caustic safety).
+      lod_max_camera_radius: 0.0  # V1.3 LOD gate (M). 0 ⇒ off (always honor enabled). >0 ⇒
+                           # skip the bake + lookup when |camera| exceeds it (wide/mid shots
+                           # ride the cheap legacy march; close-ups keep the voids).
   noise:                   # D2 procedural turbulence (SKILL.md CKS-12, spec docs/specs/
                            # 2026-06-13-disk-noise-turbulence.md). D2.2 = static DENSITY
                            # structure; D2.3 = Keplerian SHEAR ADVECTION (the field wraps
@@ -93,19 +118,42 @@ disk:
                            # field stays static (bit-identical to D2.2). temperature/edges/
                            # height are D2.4. All amps/freqs are [look-dev] placeholders.
                            # freq_phi MUST be an integer (2π periodicity, CKS-12 constraint 5).
-    enabled: false         # master switch; false ⇒ branch bit-identical to the legacy
+    enabled: true          # master switch; false ⇒ branch bit-identical to the legacy
                            # kernel (golden frames untouched, CKS-12 constraint 6).
+                           # Enabled globally 2026-06-13 (D2.4) so the production beauty
+                           # path renders the turbulent disk. The GPU regression / step-
+                           # convergence guards force this back to false so their goldens
+                           # stay a pure GR/calibration check (noise is art, not physics).
     seed: 1234             # deterministic integer hash seed (no ti.random; same seed +
                            # same t_disk ⇒ identical frame, constraint 7).
     m_max: 2.5             # clamp on the log-density sum: density_mult = exp(clamp(m, ±m_max)).
     variance_preserve: true # D2.3: divide the dual-phase blend by √(w0²+w1²) so contrast
                            # doesn't "breathe" at mid-crossfade (w0=w1=0.5). No effect on
                            # the static path (single phase).
-    dynamism: 1.0          # NON-PHYSICAL viz gain on the shear amount: φ′ = φ − dynamism·Ω·a·T.
+    dynamism: 6.0          # NON-PHYSICAL viz gain on the shear amount: φ′ = φ − dynamism·Ω·a·T.
                            # 1.0 = the CKS-12 §2 formula exactly (bit-identical). >1 emphasises
                            # the per-frame differential winding (swirl) without speeding up the
                            # reset cadence — bump this (e.g. 3–6) when the swirl reads too weak.
                            # Artistic dial, like disk.doppler_strength; not a metric change.
+    modulation:            # D2.4 (SKILL.md CKS-12 §3): modulate EMISSION AMPLITUDES only —
+                           # emitted temperature, the inner/outer edges, and the local scale
+                           # height — never p_μ/u^μ/g/g⁴/f_PT (hard constraints 1–4). Each is
+                           # an advected [0,1] fBm (co-moves with the gas, like the density
+                           # field); n−½ ⇒ a ±½ swing. enabled:false ⇒ density-only D2.3 path,
+                           # bit-identical. amps are [look-dev]; freq_phi MUST be an integer.
+      enabled: true
+      octaves: 3
+      lacunarity: 2.0
+      gain: 0.5
+      freq_u: 4.0          # log-radial feature frequency of the envelopes
+      freq_phi: 16         # azimuthal frequency (integer — 2π periodicity, constraint 5)
+      temp_amp: 0.6        # τ_amp: T_emit ·= (1 + τ_amp·(n_T − ½)) BEFORE the g shift
+                           # (constraint 2) — hot/cool filaments, the most visible cue.
+      edge_in_amp: 0.30    # e_in:  r_in_eff = max(r_inner·(1 + e_in·(n_e − ½)), r_isco)
+      edge_out_amp: 0.20   # e_out: r_out_eff = r_outer·(1 + e_out·(n_e' − ½)) — ragged rim
+      edge_softness: 0.4   # smoothstep window width (geometric M) at each modulated edge
+      height_amp: 0.5      # h_amp: σ_θ ·= (1 + h_amp·(n_h − ½)) — lumpy thickness. The Pipe-B
+                           # step cap uses the worst-case σ_θ·(1 − h_amp/2) (constraint 4).
     layers:
       # L0 base streaks — fBm, features long along the orbit (freq_phi ≪ freq_u).
       base:  {enabled: true, amp: 0.6, octaves: 5, lacunarity: 2.0, gain: 0.5,

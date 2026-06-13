@@ -30,9 +30,16 @@ Coordinates are **lattice-space** (already scaled by per-axis frequency); the
 renderer-facing ``(u = ln r/r_inner, φ, ζ)`` → lattice mapping and the CKS-12
 shear advection are applied by the caller in D2.2+, not here.
 
-Primitive sources: Perlin, *Improving Noise* (2002); Worley, *A cellular texture
-basis function* (1996); Musgrave, *Texturing & Modeling* (ridged construction).
-See spec §3 and §10 for provenance.
+Primitive sources: Perlin, *Improving Noise* (2002); Perlin, *Simplex noise*
+(2001) / Gustavson, *Simplex noise demystified* (2005) — the isotropic ``snoise*``
+basis (§3.6, V1.5); Worley, *A cellular texture basis function* (1996); Musgrave,
+*Texturing & Modeling* (ridged construction). See spec §3 and §10 for provenance.
+
+Note on periodicity: the cubic-lattice family (``gnoise*`` and everything built on
+it) is **exactly φ-periodic** via wrapped lattice indices (CKS-12 constraint 5);
+the skewed simplex family (``snoise*``) is **not** lattice-periodic and is a
+library basis for the V3 curl-flow potential, not wired into the φ-periodic disk
+density stack — see §3.6.
 """
 from __future__ import annotations
 
@@ -378,6 +385,153 @@ def cell_wall3(x, y, z, period, seed=0) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- #
+# §3.6 Simplex gradient noise (Perlin/Gustavson skewed-simplex) — V1.5
+#
+# An *isotropic* gradient basis: the lattice is the skewed simplicial grid
+# (triangles in 2D, tetrahedra in 3D), not the axis-aligned cubic grid of
+# :func:`gnoise2`/:func:`gnoise3`. Its whole reason to exist here is that the
+# square-lattice Perlin basis leaks faint **axis-aligned directional artifacts**
+# (visible as a grid bias in a curl/flow field); the hexagonal simplex lattice
+# has no such preferred direction (pinned by ``test_noise.py``'s isotropy guard).
+#
+# Scope (volumetric spec §1a / V3 step 7, decision D-V4 → "add Simplex, V1.5"):
+# this is the basis for the **curl-flow potential** built in V3, NOT a drop-in for
+# the φ-periodic disk density stack. Classic simplex is **not exactly φ-periodic**
+# — the input skew couples the axes, so a 2π φ-period is not a lattice period the
+# way it is for the wrapped cubic lattice (CKS-12 constraint 5). Exact φ-seamlessness
+# for the disk is obtained at the V3 integration point (cylinder embedding of the
+# periodic axis), not here. Accordingly nothing in V1.5 wires simplex into the
+# render path, so every golden frame is bit-identical (it is pure library addition,
+# exactly as the D2.1 primitives were added before D2.2 consumed them).
+#
+# Construction follows Perlin (*Simplex noise*, 2001) / Gustavson (*Simplex noise
+# demystified*, 2005) verbatim — the project does not re-derive it. Reuses this
+# file's PCG corner hash and the Perlin-2002 12-gradient set (:func:`_grad3`, which
+# already returns grad·(x,y,z)); the radial kernel is ``(r0² − |d|²)₊⁴ · grad·d``.
+# float32 throughout, no transcendentals on the lattice path — same discipline as
+# the rest of the library, so the @ti.func twins match to ~1e-6.
+# --------------------------------------------------------------------------- #
+# Skew/unskew constants, written as f32-exact decimal literals so np.float32(lit)
+# and the GPU ti.f32(lit) round to identical bits.
+_F2 = np.float32(0.3660254037844386)   # (√3 − 1)/2
+_G2 = np.float32(0.21132486540518713)  # (3 − √3)/6
+_F3 = np.float32(0.3333333333333333)   # 1/3
+_G3 = np.float32(0.16666666666666666)  # 1/6
+_SR2 = np.float32(0.5)   # 2D corner support radius² (r0² = 0.5)
+_SR3 = np.float32(0.6)   # 3D corner support radius² (r0² = 0.6)
+_SSCALE2 = np.float32(70.0)  # raw → ~[−1, 1] normalizer (Gustavson)
+_SSCALE3 = np.float32(32.0)
+
+
+def _scorner2(ix, iy, x, y, seed) -> np.ndarray:
+    """One 2D simplex corner: ``(0.5 − x² − y²)₊⁴ · grad·(x, y)`` (Gustavson §2D)."""
+    t = np.maximum(_SR2 - x * x - y * y, np.float32(0.0)).astype(np.float32)
+    t2 = (t * t).astype(np.float32)
+    g = _grad3(_hash3(ix, iy, 0, seed), x, y, np.float32(0.0))
+    return (t2 * t2 * g).astype(np.float32)
+
+
+def snoise2(x, y, period: int = 0, seed: int = 0) -> np.ndarray:
+    """2D simplex noise in ``[0, 1]`` (Perlin/Gustavson). ``period`` is accepted and
+    **ignored** (simplex is not lattice-periodic) so it slots into the shared
+    :func:`_octaves` fBm machinery exactly like :func:`gnoise2`."""
+    x = _f32(x)
+    y = _f32(y)
+    s = ((x + y) * _F2).astype(np.float32)            # skew to the simplex grid
+    i = np.floor(x + s).astype(np.int32)
+    j = np.floor(y + s).astype(np.int32)
+    t = ((i + j).astype(np.float32) * _G2).astype(np.float32)
+    x0 = (x - (i.astype(np.float32) - t)).astype(np.float32)  # unskewed offset from cell origin
+    y0 = (y - (j.astype(np.float32) - t)).astype(np.float32)
+
+    upper = x0 > y0                                   # which of the two triangles
+    i1 = upper.astype(np.int32)
+    j1 = (~upper).astype(np.int32)
+    x1 = (x0 - i1.astype(np.float32) + _G2).astype(np.float32)
+    y1 = (y0 - j1.astype(np.float32) + _G2).astype(np.float32)
+    x2 = (x0 - np.float32(1.0) + np.float32(2.0) * _G2).astype(np.float32)
+    y2 = (y0 - np.float32(1.0) + np.float32(2.0) * _G2).astype(np.float32)
+
+    n = (_scorner2(i, j, x0, y0, seed)
+         + _scorner2(i + i1, j + j1, x1, y1, seed)
+         + _scorner2(i + 1, j + 1, x2, y2, seed))
+    return _to01((_SSCALE2 * n).astype(np.float32))
+
+
+def _scorner3(ix, iy, iz, x, y, z, seed) -> np.ndarray:
+    """One 3D simplex corner: ``(0.6 − x² − y² − z²)₊⁴ · grad·(x, y, z)``."""
+    t = np.maximum(_SR3 - x * x - y * y - z * z, np.float32(0.0)).astype(np.float32)
+    t2 = (t * t).astype(np.float32)
+    g = _grad3(_hash3(ix, iy, iz, seed), x, y, z)
+    return (t2 * t2 * g).astype(np.float32)
+
+
+def snoise3(x, y, z, period: int = 0, seed: int = 0) -> np.ndarray:
+    """3D simplex noise in ``[0, 1]`` (Perlin/Gustavson). ``period`` accepted/ignored
+    (see :func:`snoise2`)."""
+    x = _f32(x)
+    y = _f32(y)
+    z = _f32(z)
+    s = ((x + y + z) * _F3).astype(np.float32)
+    i = np.floor(x + s).astype(np.int32)
+    j = np.floor(y + s).astype(np.int32)
+    k = np.floor(z + s).astype(np.int32)
+    t = ((i + j + k).astype(np.float32) * _G3).astype(np.float32)
+    x0 = (x - (i.astype(np.float32) - t)).astype(np.float32)
+    y0 = (y - (j.astype(np.float32) - t)).astype(np.float32)
+    z0 = (z - (k.astype(np.float32) - t)).astype(np.float32)
+
+    # Rank the unskewed offsets to pick the tetrahedron (Gustavson's 6 cases). The
+    # comparison operators (≥) match the GPU twin exactly so the two cannot split a tie.
+    c1 = x0 >= y0
+    c2 = y0 >= z0
+    c3 = x0 >= z0
+    A = c1 & c2                # X Y Z
+    B = c1 & ~c2 & c3          # X Z Y
+    C = c1 & ~c2 & ~c3         # Z X Y
+    D = ~c1 & ~c2              # Z Y X
+    E = ~c1 & c2 & ~c3         # Y Z X
+    F = ~c1 & c2 & c3          # Y X Z
+    sel = [A, B, C, D, E, F]
+    i1 = np.select(sel, [1, 1, 0, 0, 0, 0]).astype(np.int32)
+    j1 = np.select(sel, [0, 0, 0, 0, 1, 1]).astype(np.int32)
+    k1 = np.select(sel, [0, 0, 1, 1, 0, 0]).astype(np.int32)
+    i2 = np.select(sel, [1, 1, 1, 0, 0, 1]).astype(np.int32)
+    j2 = np.select(sel, [1, 0, 0, 1, 1, 1]).astype(np.int32)
+    k2 = np.select(sel, [0, 1, 1, 1, 1, 0]).astype(np.int32)
+
+    g3 = _G3
+    x1 = (x0 - i1.astype(np.float32) + g3).astype(np.float32)
+    y1 = (y0 - j1.astype(np.float32) + g3).astype(np.float32)
+    z1 = (z0 - k1.astype(np.float32) + g3).astype(np.float32)
+    x2 = (x0 - i2.astype(np.float32) + np.float32(2.0) * g3).astype(np.float32)
+    y2 = (y0 - j2.astype(np.float32) + np.float32(2.0) * g3).astype(np.float32)
+    z2 = (z0 - k2.astype(np.float32) + np.float32(2.0) * g3).astype(np.float32)
+    x3 = (x0 - np.float32(1.0) + np.float32(3.0) * g3).astype(np.float32)
+    y3 = (y0 - np.float32(1.0) + np.float32(3.0) * g3).astype(np.float32)
+    z3 = (z0 - np.float32(1.0) + np.float32(3.0) * g3).astype(np.float32)
+
+    n = (_scorner3(i, j, k, x0, y0, z0, seed)
+         + _scorner3(i + i1, j + j1, k + k1, x1, y1, z1, seed)
+         + _scorner3(i + i2, j + j2, k + k2, x2, y2, z2, seed)
+         + _scorner3(i + 1, j + 1, k + 1, x3, y3, z3, seed))
+    return _to01((_SSCALE3 * n).astype(np.float32))
+
+
+def sfbm2(x, y, period: int = 0, octaves=4, lacunarity=2, gain=0.5, seed=0) -> np.ndarray:
+    """fBm of :func:`snoise2`, normalized to ``[0, 1]`` (isotropic counterpart of
+    :func:`fbm2`). ``period`` is carried for signature symmetry but unused."""
+    return _fbm(snoise2, _f32(x), _f32(y), None, period, octaves, lacunarity, gain, seed,
+                lambda n: n)
+
+
+def sfbm3(x, y, z, period: int = 0, octaves=4, lacunarity=2, gain=0.5, seed=0) -> np.ndarray:
+    """fBm of :func:`snoise3` (isotropic counterpart of :func:`fbm3`)."""
+    return _fbm(snoise3, _f32(x), _f32(y), _f32(z), period, octaves, lacunarity, gain, seed,
+                lambda n: n)
+
+
+# --------------------------------------------------------------------------- #
 # §4 layer stack — combined density multiplier (CPU source of truth).
 #
 # Constants shared with the GPU twin
@@ -403,6 +557,16 @@ _INV_TWO_PI = np.float32(1.0 / (2.0 * np.pi))
 # animation length (c_k = footage_seconds·time_scale / shear_period_M ≪ 10⁴).
 NCYC_PHASE = 50021   # k-phase offset
 NCYC_CYCLE = 100003  # per-reset-cycle stride
+
+# D2.4 modulation-field seed offsets (CKS-12 §3). The four §3 envelopes
+# (emitted temperature, inner/outer edge, scale height) are decorrelated from
+# each other AND from the density stack's NSEED_* family by these strides — the
+# PCG lattice hash avalanches any seed delta, so the four envelopes are visually
+# independent fBm fields sharing the same advection/reseed bookkeeping.
+NSEED_MOD_T = 503     # n_T  — emitted-temperature lumps
+NSEED_MOD_EIN = 601   # n_e  — inner-edge raggedness
+NSEED_MOD_EOUT = 701  # n_e' — outer-edge raggedness
+NSEED_MOD_H = 809     # n_h  — scale-height lumpiness
 
 
 def _noise_m_stack(u, phi, zeta, nz, seed: int) -> np.ndarray:
@@ -527,6 +691,86 @@ def noise_density_mult(u, phi, zeta, nz, seed: int = 1234,
 
     m = np.clip(m, -mmax, mmax)
     return np.exp(m).astype(np.float32)
+
+
+def _mod_fbm_stack(u, phi, mod, seed_offsets, seed_base):
+    """Evaluate the four §3 modulation envelopes at one (already-advected) phase.
+
+    Each is a single fBm of :func:`fbm2` in ``[0, 1]`` over the disk-natural
+    lattice ``(u·freq_u, φ/(2π)·freq_phi)`` with integer φ-period ``freq_phi``
+    (exact 2π periodicity, constraint 5). Returns a 4-tuple of f32 arrays
+    ``(n_T, n_e_in, n_e_out, n_h)`` keyed by ``seed_offsets`` so the envelopes are
+    mutually decorrelated. Shared by the static and advected paths of
+    :func:`noise_modulation_fields`.
+    """
+    fp = int(mod["freq_phi"])
+    x = u * np.float32(mod["freq_u"])
+    y = phi * _INV_TWO_PI * np.float32(fp)
+    oct_ = int(mod.get("octaves", 3))
+    lac = int(mod.get("lacunarity", 2))
+    gain = mod.get("gain", 0.5)
+    return tuple(
+        fbm2(x, y, fp, octaves=oct_, lacunarity=lac, gain=gain, seed=int(seed_base) + off)
+        for off in seed_offsets
+    )
+
+
+def noise_modulation_fields(u, phi, zeta, nz, seed: int = 1234,
+                            t_disk: float = 0.0, omega=0.0, shear_period: float = 0.0):
+    """Advected ``[0, 1]`` envelopes ``(n_T, n_e_in, n_e_out, n_h)`` for the CKS-12
+    §3 temperature / edge / scale-height modulation. **CPU source of truth**; the
+    GPU twin is ``taichi_renderer._disk_noise_mod_fields`` (held to this by
+    ``tests/test_disk_noise.py``). These are NOT the density field — they are the
+    four *amplitude* envelopes the disk kernel uses to modulate the **emitted**
+    temperature (before the g shift), the inner/outer edge windows, and the local
+    Gaussian scale height (SKILL.md CKS-12 §3, hard constraints 1–4).
+
+    Advected with the SAME dual-phase reset + ``dynamism`` gain as the density
+    field (:func:`noise_density_mult`) so the envelopes co-move with the gas:
+    ``φ′_k = φ − dynamism·Ω(r)·(a_k·T)``, triangle weights ``w_k = 1 − |2a_k − 1|``
+    (``w_0 + w_1 ≡ 1``), per-cycle reseed ``seed + k·NCYC_PHASE + c_k·NCYC_CYCLE``.
+    Unlike the density blend there is **no** ``variance_preserve`` divide — a
+    ``√(Σw²)`` rescale could push a ``[0, 1]`` fBm outside ``[0, 1]``; the convex
+    triangle weights keep each blended envelope in ``[0, 1]`` (so ``n − ½`` stays a
+    bounded ``±½`` modulation). ``zeta`` is accepted for signature symmetry with
+    the density sampler (and so the caller can pass the same coords) but the
+    envelopes are sampled in ``(u, φ)`` only — they are slowly-varying along the
+    slab.
+
+    With ``shear_period ≤ 0`` (no ``disk.dynamics`` block) the field is static
+    (sampled at ``φ``). When the ``disk.noise.modulation`` block is absent or
+    ``enabled: false`` every envelope is the **no-op midpoint 0.5** (so ``n − ½ = 0``
+    ⇒ identity modulation), matching the kernel's skipped branch.
+    """
+    mod = nz.get("modulation", {}) or {}
+    shape = np.broadcast(u, phi, zeta).shape
+    half = np.full(shape, np.float32(0.5), dtype=np.float32)
+    if not mod.get("enabled", False):
+        return half, half, half, half
+
+    u = _f32(u)
+    phi = _f32(phi)
+    offs = (NSEED_MOD_T, NSEED_MOD_EIN, NSEED_MOD_EOUT, NSEED_MOD_H)
+    T = np.float32(shear_period)
+
+    if T <= np.float32(0.0):
+        vals = _mod_fbm_stack(u, phi, mod, offs, int(seed))
+        return tuple(np.broadcast_to(v, shape).astype(np.float32) for v in vals)
+
+    omega = _f32(omega)
+    s = np.float32(t_disk) / T
+    g = np.float32(nz.get("dynamism", 1.0))  # same viz gain as the density shear
+    acc = [np.zeros(shape, dtype=np.float32) for _ in offs]
+    for k in (0, 1):
+        ar = s + np.float32(0.5 * k)
+        ck = int(np.floor(ar))
+        ak = ar - np.float32(ck)
+        wk = np.float32(1.0) - np.abs(np.float32(2.0) * ak - np.float32(1.0))
+        seed_k = int(seed) + k * NCYC_PHASE + ck * NCYC_CYCLE
+        phi_k = phi - g * omega * (ak * T)
+        vk = _mod_fbm_stack(u, phi_k, mod, offs, seed_k)
+        acc = [a + wk * v for a, v in zip(acc, vk)]
+    return tuple(np.broadcast_to(a, shape).astype(np.float32) for a in acc)
 
 
 # =========================================================================== #
@@ -847,3 +1091,159 @@ def cell_wall2_ti(x, y, period, seed):
 def cell_wall3_ti(x, y, z, period, seed):
     d = worley3_ti(x, y, z, period, seed)
     return d[1] - d[0]
+
+
+# --- Simplex (Perlin/Gustavson) — twin of :func:`snoise2` / :func:`snoise3` --- #
+# The skew/unskew constants are written as the same decimal literals as the CPU
+# module constants so the f32 rounding is identical; ``period`` is accepted for
+# signature parity with the cubic-lattice twins but ignored (simplex is not
+# lattice-periodic). The 3D tetrahedron selection mirrors the CPU ``np.select``
+# branch case-for-case (≥ comparisons identical ⇒ no tie split).
+@ti.func
+def _scorner2_ti(ix, iy, x, y, seed):
+    """One 2D simplex corner; twin of :func:`_scorner2`."""
+    t = 0.5 - x * x - y * y
+    res = 0.0
+    if t > 0.0:
+        t2 = t * t
+        res = t2 * t2 * _grad3_ti(_hash3_ti(ix, iy, 0, seed), x, y, 0.0)
+    return res
+
+
+@ti.func
+def snoise2_ti(x, y, period, seed):
+    """Twin of :func:`snoise2` (2D simplex in [0, 1])."""
+    s = (x + y) * 0.3660254037844386
+    i = ti.cast(ti.floor(x + s), ti.i32)
+    j = ti.cast(ti.floor(y + s), ti.i32)
+    t = ti.cast(i + j, ti.f32) * 0.21132486540518713
+    x0 = x - (ti.cast(i, ti.f32) - t)
+    y0 = y - (ti.cast(j, ti.f32) - t)
+    i1 = 1 if x0 > y0 else 0
+    j1 = 0 if x0 > y0 else 1
+    g2 = 0.21132486540518713
+    x1 = x0 - ti.cast(i1, ti.f32) + g2
+    y1 = y0 - ti.cast(j1, ti.f32) + g2
+    x2 = x0 - 1.0 + 2.0 * g2
+    y2 = y0 - 1.0 + 2.0 * g2
+    n = (_scorner2_ti(i, j, x0, y0, seed)
+         + _scorner2_ti(i + i1, j + j1, x1, y1, seed)
+         + _scorner2_ti(i + 1, j + 1, x2, y2, seed))
+    return _to01_ti(70.0 * n)
+
+
+@ti.func
+def _scorner3_ti(ix, iy, iz, x, y, z, seed):
+    """One 3D simplex corner; twin of :func:`_scorner3`."""
+    t = 0.6 - x * x - y * y - z * z
+    res = 0.0
+    if t > 0.0:
+        t2 = t * t
+        res = t2 * t2 * _grad3_ti(_hash3_ti(ix, iy, iz, seed), x, y, z)
+    return res
+
+
+@ti.func
+def snoise3_ti(x, y, z, period, seed):
+    """Twin of :func:`snoise3` (3D simplex in [0, 1])."""
+    g3 = 0.16666666666666666
+    s = (x + y + z) * 0.3333333333333333
+    i = ti.cast(ti.floor(x + s), ti.i32)
+    j = ti.cast(ti.floor(y + s), ti.i32)
+    k = ti.cast(ti.floor(z + s), ti.i32)
+    t = ti.cast(i + j + k, ti.f32) * g3
+    x0 = x - (ti.cast(i, ti.f32) - t)
+    y0 = y - (ti.cast(j, ti.f32) - t)
+    z0 = z - (ti.cast(k, ti.f32) - t)
+
+    i1 = 0
+    j1 = 0
+    k1 = 0
+    i2 = 0
+    j2 = 0
+    k2 = 0
+    if x0 >= y0:
+        if y0 >= z0:        # A: X Y Z
+            i1 = 1
+            i2 = 1
+            j2 = 1
+        elif x0 >= z0:      # B: X Z Y
+            i1 = 1
+            i2 = 1
+            k2 = 1
+        else:               # C: Z X Y
+            k1 = 1
+            i2 = 1
+            k2 = 1
+    else:
+        if y0 < z0:         # D: Z Y X
+            k1 = 1
+            j2 = 1
+            k2 = 1
+        elif x0 < z0:       # E: Y Z X
+            j1 = 1
+            j2 = 1
+            k2 = 1
+        else:               # F: Y X Z
+            j1 = 1
+            i2 = 1
+            j2 = 1
+
+    x1 = x0 - ti.cast(i1, ti.f32) + g3
+    y1 = y0 - ti.cast(j1, ti.f32) + g3
+    z1 = z0 - ti.cast(k1, ti.f32) + g3
+    x2 = x0 - ti.cast(i2, ti.f32) + 2.0 * g3
+    y2 = y0 - ti.cast(j2, ti.f32) + 2.0 * g3
+    z2 = z0 - ti.cast(k2, ti.f32) + 2.0 * g3
+    x3 = x0 - 1.0 + 3.0 * g3
+    y3 = y0 - 1.0 + 3.0 * g3
+    z3 = z0 - 1.0 + 3.0 * g3
+
+    n = (_scorner3_ti(i, j, k, x0, y0, z0, seed)
+         + _scorner3_ti(i + i1, j + j1, k + k1, x1, y1, z1, seed)
+         + _scorner3_ti(i + i2, j + j2, k + k2, x2, y2, z2, seed)
+         + _scorner3_ti(i + 1, j + 1, k + 1, x3, y3, z3, seed))
+    return _to01_ti(32.0 * n)
+
+
+# Simplex fBm octave stacks (identity transform only; twin of :func:`sfbm2/3`).
+@ti.func
+def _sstack2_ti(x, y, period, octaves, lac, gain, seed):
+    total = 0.0
+    norm = 0.0
+    freq = 1
+    per = period
+    amp = 1.0
+    for o in range(octaves):
+        total += snoise2_ti(x * freq, y * freq, per, seed + o) * amp
+        norm += amp
+        amp *= gain
+        freq *= lac
+        per *= lac
+    return total / norm
+
+
+@ti.func
+def _sstack3_ti(x, y, z, period, octaves, lac, gain, seed):
+    total = 0.0
+    norm = 0.0
+    freq = 1
+    per = period
+    amp = 1.0
+    for o in range(octaves):
+        total += snoise3_ti(x * freq, y * freq, z * freq, per, seed + o) * amp
+        norm += amp
+        amp *= gain
+        freq *= lac
+        per *= lac
+    return total / norm
+
+
+@ti.func
+def sfbm2_ti(x, y, period, octaves, lac, gain, seed):
+    return _sstack2_ti(x, y, period, octaves, lac, gain, seed)
+
+
+@ti.func
+def sfbm3_ti(x, y, z, period, octaves, lac, gain, seed):
+    return _sstack3_ti(x, y, z, period, octaves, lac, gain, seed)

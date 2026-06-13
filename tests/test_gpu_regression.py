@@ -135,6 +135,12 @@ def beauty_frame() -> dict:
         pytest.skip(f"CUDA backend unavailable (Taichi selected {ti.cfg.arch})")
 
     cfg = tr.load_config()
+    # D2.4: the production config ships disk.noise.enabled: true. This regression
+    # guards the GR / redshift / calibration chain (a pure-physics check), so force
+    # the procedural turbulence OFF — its whole job is to break disk symmetry, which
+    # would make the pinned Doppler ratio / disk-peak goldens fragile. Noise has its
+    # own twin/agreement guards (test_disk_noise.py).
+    cfg.setdefault("disk", {}).setdefault("noise", {})["enabled"] = False
 
     # camera_matrix.json is UTF-8-with-BOM (Blender export), per scripts/gpu_test.py.
     with open(_CAMERA_PATH, encoding="utf-8-sig") as fh:
@@ -232,6 +238,9 @@ def _disk_metrics(doppler_strength: float, model: str = "simple") -> dict:
     cfg = copy.deepcopy(tr.load_config())
     cfg["disk"]["temperature_model"] = model
     cfg["disk"]["doppler_strength"] = float(doppler_strength)
+    # Force the D2.4 procedural turbulence off — these guards pin the GR/beaming
+    # response, not the art (see the beauty_frame fixture note).
+    cfg["disk"].setdefault("noise", {})["enabled"] = False
 
     with open(_CAMERA_PATH, encoding="utf-8-sig") as fh:
         cam = json.load(fh)[_FRAME_INDEX]
