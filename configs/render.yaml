@@ -166,6 +166,21 @@ disk:
       edge_softness: 0.4   # smoothstep window width (geometric M) at each modulated edge
       height_amp: 0.5      # h_amp: σ_θ ·= (1 + h_amp·(n_h − ½)) — lumpy thickness. The Pipe-B
                            # step cap uses the worst-case σ_θ·(1 − h_amp/2) (constraint 4).
+    curl:                  # V3.0 (SKILL.md CKS-18): in-plane divergence-free domain warp of
+                           # the noise coords (u, φ) = 2-D curl of an sfbm3 potential on the
+                           # (cosφ, sinφ, u) cylinder embedding (seamless across φ=0; freqs may
+                           # be any real). Adds turbulent eddies the laminar §2 shear can't —
+                           # the §2 winding then draws them into filaments. Texturing only —
+                           # never p_μ/u^μ/g/g⁴/f_PT. enabled:false (or amp:0) ⇒ bit-identical.
+      enabled: false
+      amp: 0.0             # A — displacement amplitude [look-dev]; 0 ⇒ identity. Try ~0.05–0.2.
+      freq_phi: 3.0        # ρ_c — angular feature density (real; not constrained to integers)
+      freq_u: 1.0          # k_u — log-radial feature density
+      octaves: 4
+      lacunarity: 2
+      gain: 0.5
+      seed: 1337           # fixed (NOT the per-cycle reseed) ⇒ V3.0 warp is static; only §2 animates
+      fd_eps: 0.001        # central finite-difference step for the curl gradient (in the u,φ chart)
     layers:
       # L0 base streaks — fBm, features long along the orbit (freq_phi ≪ freq_u).
       base:  {enabled: true, amp: 0.6, octaves: 5, lacunarity: 2.0, gain: 0.5,

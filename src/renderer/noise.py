@@ -532,6 +532,84 @@ def sfbm3(x, y, z, period: int = 0, octaves=4, lacunarity=2, gain=0.5, seed=0) -
 
 
 # --------------------------------------------------------------------------- #
+# §3.7 Curl-flow domain warp (V3.0; SKILL.md Formula CKS-18).
+#
+# An in-plane, divergence-free distortion of the disk-noise coordinate (u, φ),
+# built as the 2-D curl of a scalar potential on the V1.5 simplex basis. The
+# potential is sampled on the (cosφ, sinφ, u) CYLINDER EMBEDDING of the φ-axis, so
+# the displacement is exactly 2π-periodic in φ — seamless across φ=0 (CKS-12
+# constraint 5) even though classic simplex is not lattice-periodic — and ρ_c /
+# k_u (freq_phi / freq_u) may be any real. The curl of a scalar is divergence-free
+# by construction (the incompressible-flow look). Texturing only: it relocates the
+# noise sample coordinate, never a metric/transport quantity (CKS-18 governance).
+# --------------------------------------------------------------------------- #
+CURL_FD_EPS = np.float32(1e-3)  # default central-difference step in the (u,φ) chart
+
+
+def curl_warp(u, phi, amp, freq_phi=3.0, freq_u=1.0, octaves=4, lacunarity=2,
+              gain=0.5, seed=0, fd_eps=CURL_FD_EPS):
+    """In-plane divergence-free curl warp of the disk-noise coords ``(u, φ)`` (CKS-18).
+
+    **CPU source of truth**; the GPU twin is :func:`curl_warp_ti` (held to this by
+    ``tests/test_disk_noise.py``). Returns ``(u', φ')`` displaced by the 2-D curl of
+    the scalar potential ``ψ(u,φ) = sfbm3(cosφ·ρ_c, sinφ·ρ_c, u·k_u)``::
+
+        δu = +∂ψ/∂φ      δφ = −∂ψ/∂u      (∇·(δu,δφ) ≡ 0)
+        u' = u + amp·δu   φ' = φ + amp·δφ
+
+    The gradient is a CENTRAL finite difference with step ``ε = fd_eps`` (simplex has
+    no analytic gradient on this path). Because ψ is built on ``cos φ`` / ``sin φ``,
+    ``δu`` and ``δφ`` are exactly 2π-periodic in φ ⇒ ``φ'`` is continuous across the
+    seam. ``amp == 0`` ⇒ identity (the disabled path). ``u`` / ``phi`` may be scalars
+    or broadcastable arrays.
+    """
+    u = _f32(u)
+    phi = _f32(phi)
+    rho = np.float32(freq_phi)
+    ku = np.float32(freq_u)
+    eps = np.float32(fd_eps)
+    oct_ = int(octaves)
+    lac = int(lacunarity)
+    g = np.float32(gain)
+    sd = int(seed)
+
+    def _psi(uu, pp):
+        return sfbm3(np.cos(pp) * rho, np.sin(pp) * rho, uu * ku,
+                     0, octaves=oct_, lacunarity=lac, gain=g, seed=sd)
+
+    inv2e = np.float32(1.0) / (np.float32(2.0) * eps)
+    dpsi_du = ((_psi(u + eps, phi) - _psi(u - eps, phi)) * inv2e).astype(np.float32)
+    dpsi_dphi = ((_psi(u, phi + eps) - _psi(u, phi - eps)) * inv2e).astype(np.float32)
+    a = np.float32(amp)
+    u_w = (u + a * dpsi_dphi).astype(np.float32)   # δu = +∂ψ/∂φ
+    phi_w = (phi - a * dpsi_du).astype(np.float32)  # δφ = −∂ψ/∂u
+    return u_w, phi_w
+
+
+def _apply_curl(u, phi, curl):
+    """Apply :func:`curl_warp` if the ``curl`` config block is enabled, else return
+    ``(u, phi)`` unchanged. Shared entry for the density layer stack AND the §3
+    modulation stack so the two warp identically (one warp, coherent swirl). An
+    absent block / ``enabled: false`` / ``amp == 0`` is the bit-identical disabled
+    path (CKS-12 constraint 6)."""
+    if not curl or not curl.get("enabled", False):
+        return u, phi
+    amp = float(curl.get("amp", 0.0))
+    if amp == 0.0:
+        return u, phi
+    return curl_warp(
+        u, phi, amp,
+        freq_phi=curl.get("freq_phi", 3.0),
+        freq_u=curl.get("freq_u", 1.0),
+        octaves=int(curl.get("octaves", 4)),
+        lacunarity=int(curl.get("lacunarity", 2)),
+        gain=curl.get("gain", 0.5),
+        seed=int(curl.get("seed", 0)),
+        fd_eps=float(curl.get("fd_eps", float(CURL_FD_EPS))),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # §4 layer stack — combined density multiplier (CPU source of truth).
 #
 # Constants shared with the GPU twin
@@ -579,7 +657,12 @@ def _noise_m_stack(u, phi, zeta, nz, seed: int) -> np.ndarray:
     single shared clamp+exp. φ enters each lattice as ``y = phi/(2π)·freq_phi`` with
     integer period ``freq_phi`` (exact 2π-periodicity, constraint 5). Disabled layers
     contribute nothing (``m`` stays 0 ⇒ multiplier 1.0, the kernel's skipped branch).
+
+    The CKS-18 curl warp (if ``nz["curl"]`` is enabled) distorts ``(u, φ)`` HERE, at
+    the stack entry — applied to the already-sheared per-phase ``φ`` so the eddies are
+    frozen into the gas's material frame and the §2 shear winds them into filaments.
     """
+    u, phi = _apply_curl(u, phi, nz.get("curl"))
     phi01 = phi * _INV_TWO_PI  # φ/(2π); ×freq_phi → lattice y
     m = np.zeros(np.broadcast(u, phi, zeta).shape, dtype=np.float32)
 
@@ -693,7 +776,7 @@ def noise_density_mult(u, phi, zeta, nz, seed: int = 1234,
     return np.exp(m).astype(np.float32)
 
 
-def _mod_fbm_stack(u, phi, mod, seed_offsets, seed_base):
+def _mod_fbm_stack(u, phi, mod, seed_offsets, seed_base, curl=None):
     """Evaluate the four §3 modulation envelopes at one (already-advected) phase.
 
     Each is a single fBm of :func:`fbm2` in ``[0, 1]`` over the disk-natural
@@ -702,7 +785,12 @@ def _mod_fbm_stack(u, phi, mod, seed_offsets, seed_base):
     ``(n_T, n_e_in, n_e_out, n_h)`` keyed by ``seed_offsets`` so the envelopes are
     mutually decorrelated. Shared by the static and advected paths of
     :func:`noise_modulation_fields`.
+
+    The CKS-18 curl warp (``curl`` block, if enabled) distorts ``(u, φ)`` at entry —
+    the SAME warp the density stack applies, so the §3 envelopes swirl coherently with
+    the density.
     """
+    u, phi = _apply_curl(u, phi, curl)
     fp = int(mod["freq_phi"])
     x = u * np.float32(mod["freq_u"])
     y = phi * _INV_TWO_PI * np.float32(fp)
@@ -753,8 +841,9 @@ def noise_modulation_fields(u, phi, zeta, nz, seed: int = 1234,
     offs = (NSEED_MOD_T, NSEED_MOD_EIN, NSEED_MOD_EOUT, NSEED_MOD_H)
     T = np.float32(shear_period)
 
+    curl = nz.get("curl")
     if T <= np.float32(0.0):
-        vals = _mod_fbm_stack(u, phi, mod, offs, int(seed))
+        vals = _mod_fbm_stack(u, phi, mod, offs, int(seed), curl=curl)
         return tuple(np.broadcast_to(v, shape).astype(np.float32) for v in vals)
 
     omega = _f32(omega)
@@ -768,7 +857,7 @@ def noise_modulation_fields(u, phi, zeta, nz, seed: int = 1234,
         wk = np.float32(1.0) - np.abs(np.float32(2.0) * ak - np.float32(1.0))
         seed_k = int(seed) + k * NCYC_PHASE + ck * NCYC_CYCLE
         phi_k = phi - g * omega * (ak * T)
-        vk = _mod_fbm_stack(u, phi_k, mod, offs, seed_k)
+        vk = _mod_fbm_stack(u, phi_k, mod, offs, seed_k, curl=curl)
         acc = [a + wk * v for a, v in zip(acc, vk)]
     return tuple(np.broadcast_to(a, shape).astype(np.float32) for a in acc)
 
@@ -1247,3 +1336,27 @@ def sfbm2_ti(x, y, period, octaves, lac, gain, seed):
 @ti.func
 def sfbm3_ti(x, y, z, period, octaves, lac, gain, seed):
     return _sstack3_ti(x, y, z, period, octaves, lac, gain, seed)
+
+
+@ti.func
+def curl_warp_ti(u, phi, amp, freq_phi, freq_u, octaves, lac, gain, seed, eps):
+    """Twin of :func:`curl_warp` (CKS-18 in-plane divergence-free curl warp).
+
+    Returns ``ti.Vector([u', φ'])`` displaced by the 2-D curl of the scalar potential
+    ``ψ = sfbm3(cosφ·ρ_c, sinφ·ρ_c, u·k_u)``, with a central finite-difference
+    gradient (step ``eps``) — the SAME 4-point stencil as the CPU reference, so the
+    two agree to ~1e-5. Built on ``cos φ`` / ``sin φ`` ⇒ seamless across φ=0."""
+    inv2e = 1.0 / (2.0 * eps)
+    cphi = ti.cos(phi)
+    sphi = ti.sin(phi)
+    cphi_p = ti.cos(phi + eps)
+    sphi_p = ti.sin(phi + eps)
+    cphi_m = ti.cos(phi - eps)
+    sphi_m = ti.sin(phi - eps)
+    psi_up = sfbm3_ti(cphi * freq_phi, sphi * freq_phi, (u + eps) * freq_u, 0, octaves, lac, gain, seed)
+    psi_um = sfbm3_ti(cphi * freq_phi, sphi * freq_phi, (u - eps) * freq_u, 0, octaves, lac, gain, seed)
+    psi_pp = sfbm3_ti(cphi_p * freq_phi, sphi_p * freq_phi, u * freq_u, 0, octaves, lac, gain, seed)
+    psi_pm = sfbm3_ti(cphi_m * freq_phi, sphi_m * freq_phi, u * freq_u, 0, octaves, lac, gain, seed)
+    dpsi_du = (psi_up - psi_um) * inv2e
+    dpsi_dphi = (psi_pp - psi_pm) * inv2e
+    return ti.Vector([u + amp * dpsi_dphi, phi - amp * dpsi_du])

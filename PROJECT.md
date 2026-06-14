@@ -737,6 +737,32 @@ work below predates and is **superseded by** the CKS migration above):
   `test_bake_matches_analytic_3d_ray_integral` re-derived to the tilted-ray line integral);
   `test_gpu_regression.py` unchanged. Spec
   `docs/specs/2026-06-14-V2-vertical-self-shadow.md`; SKILL.md rev v1.25.
+- **V epoch — curl-flow domain warp / V3.0 (2026-06-14, Formula CKS-18):** adds
+  divergence-free turbulent structure (eddies/billows) that the laminar §2 Keplerian
+  shear can't produce, by warping the noise **sample coordinate** `(u,φ)` with the 2-D
+  curl of a scalar potential `ψ = sfbm3(cosφ·ρ_c, sinφ·ρ_c, u·k_u)` on the **V1.5
+  isotropic simplex basis**: `δu=+∂ψ/∂φ`, `δφ=−∂ψ/∂u` (central FD), `u'=u+A·δu`,
+  `φ'=φ+A·δφ`. **Divergence-free** by construction (curl of a scalar) and **seamless
+  across φ=0** because `δu`/`δφ` are built on `cos φ`/`sin φ` (CKS-12 constraint 5 holds
+  even though simplex is not lattice-periodic — seamlessness from the cylinder
+  *embedding*, so `ρ_c`/`k_u` may be any real). Owner decisions: stage **static warp
+  (V3.0) → curl-flow advection (V3.1)** (the D2.2→D2.3 split); V3.0 displacement is
+  **in-plane `(u,φ)`** only (ζ untouched). Applied at the entry of `_disk_noise_m` /
+  `_mod_fbm4` on the already-sheared per-phase `φ′_k` (material-frame — eddies freeze
+  into the gas, §2 winds them into filaments; density + §3 modulation share one warp),
+  using a **fixed `curl.seed`** (not the per-cycle reseed) so V3.0 is genuinely static —
+  only the §2 winding animates. VISUALIZATION / texturing — relocates the noise
+  coordinate only, never `p_μ`/`u^μ`/`g`/`g⁴`/`f_PT`. New code: `noise.py`
+  `curl_warp`/`curl_warp_ti`; `taichi_renderer.py` warp at the two stack entries +
+  `disk.noise.curl` dials through `_setup_disk_noise` (`_NOISE_N` 43→52); **no CKS-13
+  resolver change** (all base look dials). Gated by `disk.noise.curl.enabled` (default
+  `false`, `amp=0` ⇒ identity) ⇒ bit-identical to V2. *Verified:* `tests/test_noise.py`
+  (divergence-free, seamlessness, determinism, zero-amp identity, moves-density) +
+  `tests/test_noise_gpu.py` (`curl_warp_ti` twin parity to derived `amp·_SATOL/fd_eps`
+  — the warp is a derivative, so the ~1e-5 `sfbm3` twin gap is amplified ×1/(2ε); obs
+  ~6.5e-5); `test_gpu_regression.py` default-off goldens unshifted. *GPU-verified
+  2026-06-14:* noise_gpu 15, disk_noise + gpu_regression pass, noise 44 (CPU). Spec
+  `docs/specs/2026-06-14-V3-curl-domain-warp.md`; SKILL.md rev v1.26.
 
 *Note — `render_pipe_a`* (the 256² dev LOD kernel for `_gate2_lod_test`) was
 migrated to `[y,u,…]` but **intentionally keeps its offset ray** as the offset-ray
@@ -763,7 +789,8 @@ re-derive. **`disk.py`, `geodesic.py`/`metric.py` CPU references, and any
 | **D1** | Decision-B physical disk: Page-Thorne flux profile (replaces simple `(6/r)^0.75`) | ✅ **Resolved (2026-06-12)** — wired behind `disk.temperature_model: page_thorne` (default `simple`); LUT in `src/renderer/disk_flux.py`; GPU guard in `test_gpu_regression.py`. Closed form is `SKILL.md` Formula **CKS-11** (numerically reproduces the conservation-law flux integral; guard `tests/test_disk_flux.py`; SKILL.md rev v1.11). The "wire the LUT" path: CPU-precompute `f_PT(r)` shape LUT → `T_eff=T₀·f_PT^{1/4}`, amplitude ×f_PT → sampled in the disk kernel **behind the config flag** (`T₀` stays the amplitude knob; g⁴-not-g⁸ respected, Formula 9 / CKS-11 Piece 3). Default disk stays Decision-B-simple, so golden frames / pinned GPU regression are unchanged. | Physics |
 | **D2** | Disk procedural turbulence: layered noise (Interstellar-base fBm + MRI clump/tear ridged-MF/Voronoi accents) with full Keplerian shear advection, modulating density, temperature, edges, and scale height | **D2.1–D2.4 SHIPPED 2026-06-13; noise ON by default.** Spec: `docs/specs/2026-06-13-disk-noise-turbulence.md`; math: SKILL.md Formula **CKS-12** (rev v1.20; Ω = Formula 3 verbatim, all noise amplitude-only). Wired: noise lib + static density (D2.2) + Keplerian shear advection (D2.3) + T/edge/scale-height modulation (D2.4) — `disk.noise` block (`enabled: true`, `modulation.enabled: true`), `_setup_disk_noise` buffer (`_NOISE_N=43`), GPU `_disk_noise_density_mult`/`_disk_noise_mod_fields` + CPU twins, `thumb.py` look-dev. `disk.noise.enabled: false` is a verified bit-identical branch; GR/calibration guards force noise off so goldens are unshifted. **Remaining: D2.5** (MB `t_disk` jitter, perf pass, noise-on golden, owner sign-off) | Visualization |
 | **V2** | Flared 3D volumetric density: radius-varying scale height so the noise stack gets real vertical bulk | ✅ **Resolved (2026-06-14)** — `σ_θ(r)=σ0·(r/r_inner)^β` in the shared `_disk_density_cks` (SKILL.md Formula **CKS-16**, rev v1.24); CKS-13 resolver derives `flare_beta` + `theta_half_bound`; gated by `disk.volumetric.flare.enabled` (default `false` ⇒ bit-identical). GEOMETRY/TEXTURE only. Guard `tests/test_disk_flare.py` (7 CPU + 2 GPU); `test_gpu_regression.py`/`test_disk_step_convergence.py` unchanged. Spec `docs/specs/2026-06-14-V2-flared-3d-density.md`. | Visualization |
-| **V2b** | Vertical self-shadow: top/inner gas shadows the midplane (the V1 deep-shadow-map was in-plane/radial only) | ✅ **Resolved (2026-06-14)** — `bake_disk_shadow` generalised from the CKS-15 radial column scan to a **3D inner-edge ray** (SKILL.md Formula **CKS-17**, rev v1.25): ray from the inner edge in the midplane `(u=0,ζ=0)` to the sample `(u_s,φ,ζ_s)`, tilted ρ sample + 3D arc length `ds=√((r·du)²+ΔZ²)`. CKS-15 is the ζ=0 limit (bit-exact). **No new config/field/flag** — same `disk.volumetric.self_shadow.enabled` (default `false` ⇒ goldens bit-identical); only the bake's ray geometry changed. VISUALIZATION/amplitude-only. Guard `tests/test_disk_self_shadow.py` (relational checks carry over; `test_bake_matches_analytic_3d_ray_integral` re-derived to the tilted-ray line integral); `test_gpu_regression.py` unchanged. Spec `docs/specs/2026-06-14-V2-vertical-self-shadow.md`. **Next V-epoch increment: V3 curl-flow** (consumes the V1.5 simplex basis) | Visualization |
+| **V2b** | Vertical self-shadow: top/inner gas shadows the midplane (the V1 deep-shadow-map was in-plane/radial only) | ✅ **Resolved (2026-06-14)** — `bake_disk_shadow` generalised from the CKS-15 radial column scan to a **3D inner-edge ray** (SKILL.md Formula **CKS-17**, rev v1.25): ray from the inner edge in the midplane `(u=0,ζ=0)` to the sample `(u_s,φ,ζ_s)`, tilted ρ sample + 3D arc length `ds=√((r·du)²+ΔZ²)`. CKS-15 is the ζ=0 limit (bit-exact). **No new config/field/flag** — same `disk.volumetric.self_shadow.enabled` (default `false` ⇒ goldens bit-identical); only the bake's ray geometry changed. VISUALIZATION/amplitude-only. Guard `tests/test_disk_self_shadow.py` (relational checks carry over; `test_bake_matches_analytic_3d_ray_integral` re-derived to the tilted-ray line integral); `test_gpu_regression.py` unchanged. Spec `docs/specs/2026-06-14-V2-vertical-self-shadow.md`. | Visualization |
+| **V3.0** | Curl-flow **domain warp**: divergence-free turbulent eddies the laminar §2 shear can't make (the static half of V3; advection is V3.1) | ✅ **Resolved (2026-06-14)** — in-plane curl warp of the noise coord `(u,φ)` = 2-D curl of an `sfbm3` scalar potential on the `(cosφ,sinφ,u)` cylinder embedding (SKILL.md Formula **CKS-18**, rev v1.26): `δu=+∂ψ/∂φ`, `δφ=−∂ψ/∂u` (central FD); divergence-free + seamless across φ=0 (embedding, not lattice period ⇒ freqs may be any real). Applied at `_disk_noise_m`/`_mod_fbm4` entry on the already-sheared `φ′_k` (material-frame; fixed `curl.seed` ⇒ static, only §2 animates). Consumes the parked V1.5 simplex basis. `noise.py` `curl_warp`/`curl_warp_ti`; `disk.noise.curl` dials through `_setup_disk_noise` (`_NOISE_N` 43→52); **no CKS-13 change**. Gated by `disk.noise.curl.enabled` (default `false`, `amp=0` ⇒ identity ⇒ bit-identical). VISUALIZATION/texturing-only. Guards `tests/test_noise.py` (divergence-free / seamless / determinism / identity / moves-density) + `tests/test_noise_gpu.py` (twin parity); `test_gpu_regression.py` unchanged. Spec `docs/specs/2026-06-14-V3-curl-domain-warp.md`. **Next V-epoch increment: V3.1 curl-flow advection** (animate ψ + dual-phase reset), then 3D-curl / V4 free cam. | Visualization |
 | **D3** | Dynamic derived parameters: editing base config (spin, target temperature, disk extent) must rescale every dependent quantity automatically | ✅ **Resolved (2026-06-13)** — `src/renderer/kerr_params.resolve_config` (SKILL.md Formula **CKS-13**, rev v1.14) runs inside every config loader (`taichi_renderer.load_config`, `thumb.py`); derives `r_plus`/`r_isco`/`disk.r_inner`/`disk.T_0` (from new base `disk.target_peak_temperature`) + `disk.dynamics` time mapping (`time_scale`, `shear_period_M` for D2). Desync-prone YAML literals removed. Closed forms (BPT 1972 — exact, beats any LUT; only CKS-11 f_PT needs tabulation), literature anchors pinned in `tests/test_kerr_params.py` (11 tests). Render impact: r_inner 1.182→1.181765 (exact ISCO). ⚠️ The original "GPU regression bit-identical except Doppler Δ5e-6" claim was wrong: re-keying `T_0`→`target_peak_temperature` dropped the simple-model peak T_eff 18,600→5,500 K, moving the disk peak 6.17→14.45 and Doppler ratio 4.32→5.15 — the `test_gpu_regression.py` goldens were re-anchored + made dynamic in `doppler_strength` 2026-06-13 (see the test entry above + SKILL.md v1.16) | Config |
 
 ### Code-review findings (verified against current code)
@@ -1258,7 +1285,8 @@ thin slab. **Math of record:** SKILL.md **Formula CKS-16** (flared scale height
 
 **Out of V2 scope (one-variable-at-a-time):** ~~vertical self-shadow (CKS-15 extension)~~
 ✅ shipped 2026-06-14 (Formula CKS-17, below); a dedicated V2 volumetric golden (deferred to
-V5 sign-off); V3 curl-flow.
+V5 sign-off); ~~V3 curl-flow~~ → V3.0 static curl domain warp ✅ shipped 2026-06-14 (Formula
+CKS-18, below); V3.1 curl-flow advection next.
 
 ### Vertical self-shadow — 3D inner-edge ray (shipped 2026-06-14, Formula CKS-17)
 
@@ -1289,3 +1317,46 @@ illuminator, single-scatter, amplitude-only). **Spec of record:**
   3d_ray_integral` re-derives the analytic column to the 3D-ray line integral (the
   constant-ζ radial closed form was the CKS-15 model, superseded off-midplane). Unchanged
   `test_gpu_regression.py`. SKILL.md rev v1.25.
+
+### Curl-flow domain warp — V3.0 static (shipped 2026-06-14, Formula CKS-18)
+
+**Status: shipped 2026-06-14, default OFF (bit-identical to V2).** Adds divergence-free
+turbulent structure (eddies/billows) that the laminar §2 Keplerian shear cannot produce,
+by warping the noise **sample coordinate** `(u,φ)` with the 2-D curl of a scalar potential
+on the **V1.5 isotropic simplex basis** (finally consumed). **Math of record:** SKILL.md
+**Formula CKS-18** (VISUALIZATION, same governance class as CKS-12 §2/§3 — texturing only,
+never `p_μ`/`u^μ`/`g`/`g⁴`/`f_PT`). **Spec of record:**
+`docs/specs/2026-06-14-V3-curl-domain-warp.md`. **Owner decisions (2026-06-14):** stage
+*static warp (V3.0) → curl-flow advection (V3.1)* (the D2.2→D2.3 split); V3.0 displacement
+is *in-plane `(u,φ)`* only (ζ untouched).
+
+- **The warp.** `ψ(u,φ) = sfbm3(cosφ·ρ_c, sinφ·ρ_c, u·k_u)` on the cylinder embedding;
+  `δu=+∂ψ/∂φ`, `δφ=−∂ψ/∂u` (central finite difference — simplex has no analytic gradient
+  here); `u'=u+A·δu`, `φ'=φ+A·δφ`.
+- **Divergence-free** by construction (the curl of a scalar ⇒ the incompressible-flow
+  look). **Seamless across φ=0**: `δu`/`δφ` are built on `cos φ`/`sin φ` ⇒ exactly
+  2π-periodic, so CKS-12 constraint 5 holds even though classic simplex is not
+  lattice-periodic — seamlessness comes from the *embedding*, not a lattice period, so
+  `ρ_c`/`k_u` may be any real (no integer-period restriction the density stack has).
+- **Material-frame integration.** Applied at the entry of `_disk_noise_m` (density) and
+  `_mod_fbm4` (§3 envelopes) on the already-sheared per-phase `φ′_k`, so eddies freeze into
+  the gas and the §2 shear winds them into filaments; density + modulation share one warp ⇒
+  swirl coherently. A **fixed `curl.seed`** (not the per-cycle reseed) keeps V3.0 genuinely
+  static — only the §2 winding animates over `t_disk`. V3.1 makes ψ itself time-dependent.
+- **Surface.** `noise.py` `curl_warp` (CPU source of truth) + `curl_warp_ti` (`@ti.func`
+  twin); `taichi_renderer.py` warp at the two stack entries + `disk.noise.curl` dials
+  through `_setup_disk_noise` (`_NOISE_N` 43→52). **No CKS-13 resolver change** — all base
+  look dials, nothing derived. Cost: central-diff gradient = 4 `sfbm3` evals × octaves per
+  phase, for density AND modulation (offline-acceptable; analytic-gradient / 3-eval forward
+  diff deferred).
+- **Gating.** `disk.noise.curl.enabled` (default `false`, and `amp=0` ⇒ identity) ⇒
+  bit-identical to V2; every V1/V2/D2 golden stays green.
+- **Guards.** `tests/test_noise.py` (divergence-free via the curl-vs-gradient divergence
+  ratio; 2π-periodic seamlessness; determinism/seed-sensitivity; zero-amp identity;
+  moves-the-density-stack + enabled:false bit-identity) + `tests/test_noise_gpu.py`
+  (`curl_warp_ti` twin parity to derived `amp·_SATOL/fd_eps` — derivative amplifies the
+  ~1e-5 `sfbm3` twin gap ×1/(2ε), obs ~6.5e-5); unchanged `test_gpu_regression.py`.
+  GPU-verified 2026-06-14 (noise_gpu 15, disk_noise + gpu_regression). SKILL.md rev v1.26.
+- **Deferred:** V3.1 curl-flow advection (animate ψ + dual-phase reset, composed with the §2
+  shear); 3D curl (vector potential, churn ζ); analytic simplex gradient; a curl-on golden
+  (V5 sign-off).

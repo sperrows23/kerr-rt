@@ -111,6 +111,15 @@ def _kernels(ti):
         for i in range(x.shape[0]):
             out[i] = noise.sfbm3_ti(x[i], y[i], z[i], 0, oct, lac, gain, seed)
 
+    @ti.kernel
+    def k_curl(u: f32, phi: f32, u_out: f32, phi_out: f32, amp: ti.f32, fp: ti.f32,
+               fu: ti.f32, oct: ti.i32, lac: ti.i32, gain: ti.f32, seed: ti.i32,
+               eps: ti.f32):
+        for i in range(u.shape[0]):
+            w = noise.curl_warp_ti(u[i], phi[i], amp, fp, fu, oct, lac, gain, seed, eps)
+            u_out[i] = w[0]
+            phi_out[i] = w[1]
+
     return locals()
 
 
@@ -268,3 +277,25 @@ def test_sfbm3_twin_matches_reference(ti_cuda):
     K["k_sfbm3"](x, y, z, out, 5, 2, 0.5, 1)
     ref = noise.sfbm3(x, y, z, 0, octaves=5, lacunarity=2, gain=0.5, seed=1)
     assert np.allclose(out, ref, atol=_SATOL), np.abs(out - ref).max()
+
+
+def test_curl_warp_twin_matches_reference(ti_cuda):
+    """CKS-18 curl warp GPU twin (``curl_warp_ti``) matches the NumPy source of truth
+    (``curl_warp``) — same 4-point central-difference stencil.
+
+    Tolerance is NOT ``_SATOL``: the warp is a *derivative* of the noise, dividing
+    ``(ψ₊ − ψ₋)`` by ``2·fd_eps``. The GPU/CPU ``sfbm3`` twins agree only to ``_SATOL``
+    (FMA / transcendental ordering), so the displacement ``amp·(ψ₊−ψ₋)/(2ε)`` inherits a
+    worst-case twin error of ``amp·_SATOL/ε``. Asserting ``_SATOL`` on a ``1/(2ε)``-amplified
+    quantity is the wrong expectation (observed ~6.5e-5); the bound below is derived from
+    the call's own amp/ε so it cannot desync."""
+    amp, fd_eps = 0.15, 1e-3
+    curl_atol = amp * _SATOL / fd_eps  # = 1.5e-3 worst-case; observed ~6.5e-5
+    K = _kernels(ti_cuda)
+    x, y, _z = _grid()
+    u_out, phi_out = _out(x.size), _out(x.size)
+    K["k_curl"](x, y, u_out, phi_out, amp, 3.0, 1.3, 4, 2, 0.5, 1337, fd_eps)
+    ru, rp = noise.curl_warp(x, y, amp=amp, freq_phi=3.0, freq_u=1.3, octaves=4,
+                             lacunarity=2, gain=0.5, seed=1337, fd_eps=fd_eps)
+    assert np.allclose(u_out, ru, atol=curl_atol), np.abs(u_out - ru).max()
+    assert np.allclose(phi_out, rp, atol=curl_atol), np.abs(phi_out - rp).max()

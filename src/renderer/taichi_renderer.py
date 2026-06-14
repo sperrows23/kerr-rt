@@ -210,7 +210,21 @@ _NI_MOD_EIN_AMP = 39
 _NI_MOD_EOUT_AMP = 40
 _NI_MOD_EDGE_SOFT = 41
 _NI_MOD_HEIGHT_AMP = 42
-_NOISE_N = 43
+# V3.0 (CKS-18) curl-flow domain warp — an in-plane, divergence-free distortion of
+# the noise coordinate (u, φ) = the 2-D curl of an sfbm3 scalar potential on the
+# (cosφ, sinφ, u) cylinder embedding (seamless across φ=0; ρ_c/k_u may be any real).
+# _NI_CURL_EN gates it: 0 ⇒ no warp (bit-identical, constraint 6). Read at the entry
+# of BOTH _disk_noise_m (density) and _mod_fbm4 (§3 envelopes) so they warp identically.
+_NI_CURL_EN = 43
+_NI_CURL_AMP = 44
+_NI_CURL_FP = 45    # ρ_c — angular feature density (freq_phi)
+_NI_CURL_FU = 46    # k_u — radial feature density (freq_u)
+_NI_CURL_OCT = 47
+_NI_CURL_LAC = 48
+_NI_CURL_GAIN = 49
+_NI_CURL_SEED = 50
+_NI_CURL_EPS = 51   # central finite-difference step in the (u,φ) chart
+_NOISE_N = 52
 
 # CKS-14 RTE source-function march: divide guard on dτ. Below this the source
 # function S = emission/dτ is numerically undefined AND physically the optically-
@@ -554,6 +568,21 @@ def _setup_disk_noise(cfg: dict) -> None:
     buf[_NI_MOD_EOUT_AMP] = float(mod.get("edge_out_amp", 0.0))
     buf[_NI_MOD_EDGE_SOFT] = float(mod.get("edge_softness", 0.0))
     buf[_NI_MOD_HEIGHT_AMP] = float(mod.get("height_amp", 0.0))
+
+    # V3.0 (CKS-18) curl-flow domain warp. enabled:false (or absent) ⇒ _NI_CURL_EN = 0
+    # ⇒ the warp is skipped at both stack entries (bit-identical, constraint 6). freqs
+    # ρ_c/k_u may be any real (seamlessness is from the cylinder embedding, not a
+    # lattice period). All base look dials — nothing derived, so no CKS-13 change.
+    curl = nz.get("curl", {}) or {}
+    buf[_NI_CURL_EN] = 1.0 if curl.get("enabled", False) else 0.0
+    buf[_NI_CURL_AMP] = float(curl.get("amp", 0.0))
+    buf[_NI_CURL_FP] = float(curl.get("freq_phi", 3.0))
+    buf[_NI_CURL_FU] = float(curl.get("freq_u", 1.0))
+    buf[_NI_CURL_OCT] = float(curl.get("octaves", 4))
+    buf[_NI_CURL_LAC] = float(curl.get("lacunarity", 2))
+    buf[_NI_CURL_GAIN] = float(curl.get("gain", 0.5))
+    buf[_NI_CURL_SEED] = float(curl.get("seed", 0))
+    buf[_NI_CURL_EPS] = float(curl.get("fd_eps", float(noise.CURL_FD_EPS)))
 
     disk_noise_params = ti.field(dtype=ti.f32, shape=_NOISE_N)
     disk_noise_params.from_numpy(buf)
@@ -963,6 +992,24 @@ def _pt_flux_sample(r):
 
 
 @ti.func
+def _disk_curl_warp(u, phi):
+    """In-plane CKS-18 curl warp of ``(u, φ)`` from the ``disk_noise_params`` dials;
+    GPU wrapper over :func:`noise.curl_warp_ti`. Returns ``ti.Vector([u', φ'])``.
+    Only called when ``_NI_CURL_EN > 0.5`` (the disabled path never touches coords)."""
+    return noise.curl_warp_ti(
+        u, phi,
+        disk_noise_params[_NI_CURL_AMP],
+        disk_noise_params[_NI_CURL_FP],
+        disk_noise_params[_NI_CURL_FU],
+        ti.cast(disk_noise_params[_NI_CURL_OCT], ti.i32),
+        ti.cast(disk_noise_params[_NI_CURL_LAC], ti.i32),
+        disk_noise_params[_NI_CURL_GAIN],
+        ti.cast(disk_noise_params[_NI_CURL_SEED], ti.i32),
+        disk_noise_params[_NI_CURL_EPS],
+    )
+
+
+@ti.func
 def _disk_noise_m(u, phi, zeta, seed):
     """Unclamped log-density sum ``m = Σ amp·(layer − bias)`` (CKS-12 §3, spec §4);
     GPU twin of :func:`noise._noise_m_stack`. Reads the per-layer dials from
@@ -971,7 +1018,15 @@ def _disk_noise_m(u, phi, zeta, seed):
     enters each lattice as ``y = φ/(2π)·freq_phi`` with integer period ``= freq_phi``
     (exact 2π-periodicity, constraint 5). Called once per shear-advection phase by
     :func:`_disk_noise_density_mult`.
+
+    The CKS-18 curl warp (when ``_NI_CURL_EN``) distorts ``(u, φ)`` HERE, on the
+    already-sheared per-phase ``φ`` — the eddies freeze into the gas's material frame
+    and the §2 shear winds them into filaments; ``ζ`` is untouched (V3.0 in-plane).
     """
+    if disk_noise_params[_NI_CURL_EN] > 0.5:
+        w = _disk_curl_warp(u, phi)
+        u = w[0]
+        phi = w[1]
     m = 0.0
     phi01 = phi * _INV_TWO_PI  # φ/(2π) ∈ [−0.5, 0.5]; ×freq_phi → lattice y
 
@@ -1116,7 +1171,14 @@ def _mod_fbm4(u, phi, seed):
     (already-advected) phase — GPU twin of :func:`noise._mod_fbm_stack`. Each is a
     single ``fbm2`` in ``[0, 1]`` over ``(u·freq_u, φ/(2π)·freq_phi)`` with integer
     φ-period ``freq_phi`` (constraint 5), keyed by a distinct seed offset so the
-    four envelopes are mutually decorrelated. Returns a ``ti.Vector`` of 4 f32."""
+    four envelopes are mutually decorrelated. Returns a ``ti.Vector`` of 4 f32.
+
+    Applies the SAME CKS-18 curl warp as :func:`_disk_noise_m` (when ``_NI_CURL_EN``)
+    so the §3 envelopes swirl coherently with the density."""
+    if disk_noise_params[_NI_CURL_EN] > 0.5:
+        w = _disk_curl_warp(u, phi)
+        u = w[0]
+        phi = w[1]
     fpf = disk_noise_params[_NI_MOD_FP]
     fp = ti.cast(fpf, ti.i32)
     x = u * disk_noise_params[_NI_MOD_FU]

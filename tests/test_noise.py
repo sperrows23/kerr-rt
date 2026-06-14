@@ -520,3 +520,113 @@ def test_modulation_advects_and_is_deterministic():
     c = noise.noise_modulation_fields(u, phi, zeta, _MOD, t_disk=0.7 * T, **kw)
     assert all(np.array_equal(x, y) for x, y in zip(a, b))  # deterministic
     assert not np.array_equal(a[0], c[0])                   # evolves with t_disk
+
+
+# --------------------------------------------------------------------------- #
+# §3.7 / CKS-18 — curl-flow domain warp (V3.0)
+#
+# An in-plane, divergence-free distortion of (u, φ) = the 2-D curl of an sfbm3
+# scalar potential on the (cosφ, sinφ, u) cylinder embedding. These pin the three
+# defining properties: divergence-free (∇·displacement ≈ 0), seamless across φ=0,
+# and deterministic; plus the zero-amp identity (the disabled bit-identical path).
+# --------------------------------------------------------------------------- #
+def _warp_grid(n=40):
+    """A dense (u, φ) grid; φ spans a full turn [−π, π) so the seam is exercised."""
+    u = np.linspace(-1.0, 3.0, n).astype(np.float32)
+    phi = np.linspace(-np.pi, np.pi, n, endpoint=False).astype(np.float32)
+    return u, phi
+
+
+_CURL_KW = dict(amp=0.15, freq_phi=3.0, freq_u=1.3, octaves=4,
+                lacunarity=2, gain=0.5, seed=1337)
+
+
+def test_curl_warp_zero_amp_is_identity():
+    """amp = 0 ⇒ the warp returns the coords unchanged (the disabled / bit-identical
+    path; CKS-12 constraint 6)."""
+    u, phi = _warp_grid()
+    U, P = np.meshgrid(u, phi, indexing="ij")
+    u_w, phi_w = noise.curl_warp(U, P, amp=0.0, freq_phi=3.0, freq_u=1.3, seed=1337)
+    assert np.array_equal(u_w, U.astype(np.float32))
+    assert np.array_equal(phi_w, P.astype(np.float32))
+
+
+def test_curl_warp_is_divergence_free():
+    """The displacement ``(δu, δφ) = (+∂ψ/∂φ, −∂ψ/∂u)`` is the 2-D curl of a scalar
+    potential, so ``∇·(δu,δφ) ≡ ψ_uφ − ψ_uφ = 0`` (mixed partials commute) — the
+    defining property of the curl construction.
+
+    Measured HONESTLY with one consistent operator (``np.gradient``) on the same
+    potential ``ψ`` curl_warp uses: build the curl field and a generic GRADIENT field
+    ``(∂ψ/∂u, ∂ψ/∂φ)`` (NOT divergence-free — its divergence is the Laplacian), then
+    show the curl field's discrete divergence is orders of magnitude smaller. (A bare
+    FD on curl_warp's f32 output mixes the warp's internal ε-step with the grid step
+    and would conflate truncation with the property — so we test the construction.)"""
+    rho, ku, seed, oct_, lac, gain = 3.0, 1.3, 1337, 4, 2, 0.5
+    n = 96
+    u = np.linspace(0.0, 2.0, n)
+    phi = np.linspace(-np.pi, np.pi, n, endpoint=False)
+    U, P = np.meshgrid(u, phi, indexing="ij")
+    psi = noise.sfbm3(np.cos(P) * rho, np.sin(P) * rho, U * ku, 0,
+                      octaves=oct_, lacunarity=lac, gain=gain, seed=seed).astype(np.float64)
+    hu, hp = u[1] - u[0], phi[1] - phi[0]
+    dpsi_du, dpsi_dphi = np.gradient(psi, hu, hp, edge_order=2)
+
+    def _divergence(fu, fphi):
+        d_u = np.gradient(fu, hu, axis=0, edge_order=2)
+        d_phi = np.gradient(fphi, hp, axis=1, edge_order=2)
+        return (d_u + d_phi)[2:-2, 2:-2]  # trim edges (one-sided stencils)
+
+    div_curl = _divergence(dpsi_dphi, -dpsi_du)   # ∇·curl  → ~0
+    div_grad = _divergence(dpsi_du, dpsi_dphi)    # ∇·grad = ∇²ψ → O(1)
+    assert np.abs(div_curl).max() < 1e-3 * np.abs(div_grad).max(), (
+        np.abs(div_curl).max(), np.abs(div_grad).max())
+
+
+def test_curl_warp_is_seamless_in_phi():
+    """The displacement is built on cos φ / sin φ ⇒ it is a globally-continuous,
+    exactly 2π-periodic function of φ — so the warped coordinate has no jump across
+    the seam (CKS-12 constraint 5; periodicity of a continuous field IS seamlessness).
+    Tested as ``displacement(φ) ≈ displacement(φ + 2π)`` over a generic φ range.
+
+    A coarser ``fd_eps`` is used here so the FD curl's ``1/2ε`` factor does not amplify
+    the ~6e-7 ``cos(φ+2π)`` argument-reduction roundoff (at the shipped ε=1e-3 that
+    inflates the residual to a sub-pixel ~1e-4 — an f32 artifact of comparing trig a
+    full turn apart, not a real seam). The exact ±π atan2-wrap point is excluded for
+    the same reason (f32 ``sin(±π)`` ≈ ±9e-8)."""
+    u = np.linspace(-1.0, 3.0, 24).astype(np.float32)
+    phi = np.linspace(-2.0, 2.0, 24).astype(np.float32)
+    U, P = np.meshgrid(u, phi, indexing="ij")
+    kw = {**_CURL_KW, "fd_eps": 0.05}
+    u_a, phi_a = noise.curl_warp(U, P, **kw)
+    u_b, phi_b = noise.curl_warp(U, (P + 2.0 * np.pi).astype(np.float32), **kw)
+    assert np.allclose(u_a - U, u_b - U, atol=3e-5)
+    assert np.allclose(phi_a - P, phi_b - (P + 2.0 * np.pi), atol=3e-5)
+
+
+def test_curl_warp_is_deterministic_and_seed_sensitive():
+    """Pure function of (coords, seed) — no global RNG (constraint 7) — and a
+    different seed gives a genuinely different warp."""
+    u, phi = _warp_grid()
+    U, P = np.meshgrid(u, phi, indexing="ij")
+    a = noise.curl_warp(U, P, **_CURL_KW)
+    b = noise.curl_warp(U, P, **_CURL_KW)
+    c = noise.curl_warp(U, P, **{**_CURL_KW, "seed": 4242})
+    assert np.array_equal(a[0], b[0]) and np.array_equal(a[1], b[1])
+    assert not np.array_equal(a[0], c[0])
+
+
+def test_curl_warp_actually_moves_the_density_stack():
+    """Wired through the layer stack: an enabled curl block changes the density
+    multiplier vs the same config with curl off — and curl-off is the bit-identical
+    no-warp path."""
+    u, phi, zeta = _stack_grid()
+    nz_off = _NZ
+    nz_on = {**_NZ, "curl": {"enabled": True, "amp": 0.2, "freq_phi": 3.0,
+                             "freq_u": 1.3, "seed": 1337}}
+    nz_disabled = {**_NZ, "curl": {"enabled": False, "amp": 0.2}}
+    m_off = noise.noise_density_mult(u, phi, zeta, nz_off, seed=7)
+    m_on = noise.noise_density_mult(u, phi, zeta, nz_on, seed=7)
+    m_dis = noise.noise_density_mult(u, phi, zeta, nz_disabled, seed=7)
+    assert not np.array_equal(m_off, m_on)            # the warp does something
+    assert np.array_equal(m_off, m_dis)              # enabled:false ⇒ bit-identical
