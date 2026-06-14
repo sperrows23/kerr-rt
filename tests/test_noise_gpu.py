@@ -114,9 +114,10 @@ def _kernels(ti):
     @ti.kernel
     def k_curl(u: f32, phi: f32, u_out: f32, phi_out: f32, amp: ti.f32, fp: ti.f32,
                fu: ti.f32, oct: ti.i32, lac: ti.i32, gain: ti.f32, seed: ti.i32,
-               eps: ti.f32):
+               eps: ti.f32, t_disk: ti.f32, flow_period: ti.f32):
         for i in range(u.shape[0]):
-            w = noise.curl_warp_ti(u[i], phi[i], amp, fp, fu, oct, lac, gain, seed, eps)
+            w = noise.curl_warp_ti(u[i], phi[i], amp, fp, fu, oct, lac, gain, seed, eps,
+                                   t_disk, flow_period)
             u_out[i] = w[0]
             phi_out[i] = w[1]
 
@@ -294,8 +295,32 @@ def test_curl_warp_twin_matches_reference(ti_cuda):
     K = _kernels(ti_cuda)
     x, y, _z = _grid()
     u_out, phi_out = _out(x.size), _out(x.size)
-    K["k_curl"](x, y, u_out, phi_out, amp, 3.0, 1.3, 4, 2, 0.5, 1337, fd_eps)
+    # flow_period = 0 ⇒ the static V3.0 warp (curl-flow off); twin of the default path.
+    K["k_curl"](x, y, u_out, phi_out, amp, 3.0, 1.3, 4, 2, 0.5, 1337, fd_eps, 0.0, 0.0)
     ru, rp = noise.curl_warp(x, y, amp=amp, freq_phi=3.0, freq_u=1.3, octaves=4,
                              lacunarity=2, gain=0.5, seed=1337, fd_eps=fd_eps)
     assert np.allclose(u_out, ru, atol=curl_atol), np.abs(u_out - ru).max()
     assert np.allclose(phi_out, rp, atol=curl_atol), np.abs(phi_out - rp).max()
+
+
+def test_curl_flow_twin_matches_reference(ti_cuda):
+    """CKS-18 §2 curl-flow advection GPU twin: with ``flow_period > 0`` the
+    time-dependent dual-phase-blended ψ warp (``curl_warp_ti``) still matches the NumPy
+    source of truth (``curl_warp``) at several ``t_disk`` — verifies the §2 reseed
+    strides (``NCYC_PHASE``/``NCYC_CYCLE``) and triangle weights agree across the twin.
+
+    Same derived ``amp·_SATOL/ε`` bound as the static test — the blend is a convex
+    combination of the same per-phase derivatives, so the FD-amplification analysis is
+    unchanged (the ``ω_k`` weights are exact f32 on both sides)."""
+    amp, fd_eps, T_c = 0.15, 1e-3, 5.0
+    curl_atol = amp * _SATOL / fd_eps
+    K = _kernels(ti_cuda)
+    x, y, _z = _grid()
+    u_out, phi_out = _out(x.size), _out(x.size)
+    for t in (0.0, 1.7, 6.3):  # spans within-cycle and a reseed (s_c crosses 1)
+        K["k_curl"](x, y, u_out, phi_out, amp, 3.0, 1.3, 4, 2, 0.5, 1337, fd_eps, float(t), T_c)
+        ru, rp = noise.curl_warp(x, y, amp=amp, freq_phi=3.0, freq_u=1.3, octaves=4,
+                                 lacunarity=2, gain=0.5, seed=1337, fd_eps=fd_eps,
+                                 t_disk=float(t), flow_period=T_c)
+        assert np.allclose(u_out, ru, atol=curl_atol), (t, np.abs(u_out - ru).max())
+        assert np.allclose(phi_out, rp, atol=curl_atol), (t, np.abs(phi_out - rp).max())

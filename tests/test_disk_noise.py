@@ -243,6 +243,58 @@ def test_advected_stack_matches_cpu_reference():
     assert np.allclose(gpu, cpu, rtol=1e-3, atol=2e-3), float(np.abs(gpu - cpu).max())
 
 
+def test_curl_flow_advection_matches_cpu_and_animates():
+    """CKS-18 §2 curl-flow advection WIRED through the kernel. With a ``disk.noise.curl``
+    block carrying ``flow_period_M > 0`` and the STATIC shear path (no ``disk.dynamics``,
+    ``_NI_SHEAR_T = 0``), the time evolution comes purely from the curl flow — so this
+    isolates the new ``t_disk → _disk_curl_warp`` threading. Checks (a) the kernel's
+    ``_disk_noise_density_mult`` matches the CPU source of truth at a given ``t_disk``
+    (the §2 reset blend + reseed strides agree end-to-end through ``_setup_disk_noise``),
+    and (b) the field actually changes between two ``t_disk`` (the warp boils ⇒ ``t_disk``
+    really reaches the GPU warp; a dropped thread would render identical frames)."""
+    import taichi as ti
+
+    from renderer import noise
+
+    _ensure_cuda()
+    nz = copy.deepcopy(_NOISE_ON)
+    nz["curl"] = {"enabled": True, "amp": 0.25, "freq_phi": 3.0, "freq_u": 1.3,
+                  "octaves": 4, "lacunarity": 2, "gain": 0.5, "seed": 1337,
+                  "flow_period_M": 5.0}
+    # No dynamics block ⇒ _NI_SHEAR_T = 0 ⇒ static shear; only the curl flow animates.
+    tr._setup_disk_noise({"disk": {"noise": nz}})
+    seed = int(nz["seed"])
+
+    rng = np.random.default_rng(2)
+    n = 4096
+    u = rng.uniform(0.0, 3.0, n).astype(np.float32)
+    phi = rng.uniform(-np.pi, np.pi, n).astype(np.float32)
+    zeta = rng.uniform(-2.5, 2.5, n).astype(np.float32)
+
+    uf = ti.field(ti.f32, n); pf = ti.field(ti.f32, n); zf = ti.field(ti.f32, n)
+    of = ti.field(ti.f32, n)
+    uf.from_numpy(u); pf.from_numpy(phi); zf.from_numpy(zeta)
+
+    @ti.kernel
+    def k_flow(s: ti.i32, td: ti.f32):
+        for i in range(n):
+            # omega = 0 / static shear; td drives the CKS-18 §2 curl flow only.
+            of[i] = tr._disk_noise_density_mult(uf[i], pf[i], zf[i], td, 0.0, s)
+
+    t_a, t_b = 1.7, 3.9
+    k_flow(seed, t_a)
+    gpu_a = of.to_numpy()
+    cpu_a = noise.noise_density_mult(u, phi, zeta, nz, seed=seed,
+                                     t_disk=t_a, omega=0.0, shear_period=0.0)
+    # Same FD-amplified curl tolerance family as the advected guard (warp perturbs the
+    # lattice coords; GPU/CPU sfbm3 twins agree to ~1e-5, amplified by 1/2ε then fed fBm).
+    assert np.allclose(gpu_a, cpu_a, rtol=1e-3, atol=2e-3), float(np.abs(gpu_a - cpu_a).max())
+
+    k_flow(seed, t_b)
+    gpu_b = of.to_numpy()
+    assert not np.allclose(gpu_a, gpu_b, rtol=1e-3, atol=2e-3)  # the flow boils over t
+
+
 def test_dynamism_gain_matches_cpu_and_changes_shear():
     """The non-physical ``disk.noise.dynamism`` viz gain (φ′ = φ − dynamism·Ω·a·T)
     must (a) still agree GPU↔CPU at a gain ≠ 1, and (b) actually move the field versus

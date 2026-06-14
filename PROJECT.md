@@ -1357,8 +1357,54 @@ is *in-plane `(u,φ)`* only (ζ untouched).
   (`curl_warp_ti` twin parity to derived `amp·_SATOL/fd_eps` — derivative amplifies the
   ~1e-5 `sfbm3` twin gap ×1/(2ε), obs ~6.5e-5); unchanged `test_gpu_regression.py`.
   GPU-verified 2026-06-14 (noise_gpu 15, disk_noise + gpu_regression). SKILL.md rev v1.26.
-- **Deferred:** V3.1 curl-flow advection (animate ψ + dual-phase reset, composed with the §2
-  shear); 3D curl (vector potential, churn ζ); analytic simplex gradient; a curl-on golden
+- **Followed by:** V3.1 curl-flow advection (animate ψ — shipped 2026-06-15, below); then
+  3D curl (vector potential, churn ζ); analytic simplex gradient; a curl-on golden
+  (V5 sign-off).
+
+### Curl-flow advection — V3.1 (shipped 2026-06-15, Formula CKS-18 §2)
+
+**Status: shipped 2026-06-15, default OFF (bit-identical to V3.0).** Makes the V3.0 curl
+potential `ψ` **time-dependent** so the eddies *boil* (form/stretch/merge) over `t_disk`,
+composed additively on top of the §2 Keplerian shear (§2 = laminar bulk winding, V3.1 =
+in-place turbulent evolution). **Math of record:** SKILL.md **Formula CKS-18 §2** (same
+VISUALIZATION class as §1). **Spec of record:** `docs/specs/2026-06-14-V3.1-curl-flow-advection.md`.
+**Owner decisions (2026-06-14): Option A** (reuse the CKS-12 §2 dual-phase reset blend,
+applied to ψ) + **clock B1** (new independent dial `flow_period_M`, no CKS-13 change).
+
+- **The mechanism.** `ψ = ω_0·ψ_0 + ω_1·ψ_1` with triangle weights `ω_k = 1−|2α_k−1|`,
+  `α_k = frac(s_c + k/2)`, `s_c = t_disk/T_c`; each phase reseeded
+  `seed + k·NCYC_PHASE + γ_k·NCYC_CYCLE` (`γ_k = floor(s_c + k/2)`) — reusing the §2 reseed
+  strides. The central difference runs over the blended ψ.
+- **All three V3.0 invariants survive.** Divergence-free (curl is linear ⇒ a convex
+  combination of div-free fields is div-free); seamless in φ (per-phase, from the cylinder
+  embedding); **C0-continuous through reseeds** (`ω_k → 0` exactly at each reset — the §2
+  property, now on the time axis).
+- **Clock B1.** `T_c = disk.noise.curl.flow_period_M` is a NEW independent base dial, NOT
+  derived from `disk.dynamics.shear_period_M` (eddy turnover and bulk winding are separate
+  timescales) ⇒ **no CKS-13 resolver change**. Decoupled from the shear, so the curl can
+  boil even on the static-shear path.
+- **No `flow_dynamism` (flagged, deferred).** The §2 `dynamism` scales a *continuous* shear
+  displacement independently of the cadence; a pure reset-blend has no such separable
+  displacement (its only rate `1/T_c` sets boil speed and reseed cadence together), so a
+  C0-safe boil-rate-vs-cadence dial is not possible in Option A — it needs the Option-B
+  continuous 4-D time axis. Surfaced rather than shipping a dial that doesn't match its
+  §2 namesake.
+- **Surface.** `noise.py` `curl_warp`/`curl_warp_ti` gained `(t_disk, flow_period)` +
+  `_curl_psi_ti` (the dual-phase potential); `t_disk` threaded through `_disk_noise_m` /
+  `_mod_fbm4` → `_disk_curl_warp`; new `_NI_CURL_FLOWP` slot (`_NOISE_N` 52→53) in
+  `_setup_disk_noise`. Cost: 2× the §1 curl evals at `T_c>0` (the two phases), offline-OK.
+- **Gating.** `flow_period_M ≤ 0` (default / absent) ⇒ the V3.0 static warp **bit-for-bit**
+  (the regression hook; mirror of §2's `shear_period ≤ 0`). Every V1/V2/V3.0 golden stays
+  green.
+- **Guards.** `tests/test_noise.py` §2 (divergence-free at several `t`, seamless at each `t`,
+  C0-continuity through resets via a no-spike-vs-median step sweep, static-fallback
+  bit-identity, evolution+determinism) + `tests/test_noise_gpu.py`
+  (`curl_flow_twin_matches_reference` at several `t` to the derived `amp·_SATOL/fd_eps`
+  bound) + `tests/test_disk_noise.py` (`curl_flow_advection_matches_cpu_and_animates` —
+  end-to-end `t_disk → _disk_curl_warp` threading + actually animates); unchanged
+  `test_gpu_regression.py` (default-off ⇒ goldens bit-identical). SKILL.md rev v1.28.
+- **Deferred:** 3D curl (vector potential, churn ζ); analytic simplex gradient; the
+  Option-B 4-D `sfbm4` basis (would re-enable a true `flow_dynamism`); a curl-on golden
   (V5 sign-off).
 
 ### Look pipeline — warm-amber color grade + render-path ergonomics (shipped 2026-06-14)

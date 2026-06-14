@@ -547,7 +547,7 @@ CURL_FD_EPS = np.float32(1e-3)  # default central-difference step in the (u,φ) 
 
 
 def curl_warp(u, phi, amp, freq_phi=3.0, freq_u=1.0, octaves=4, lacunarity=2,
-              gain=0.5, seed=0, fd_eps=CURL_FD_EPS):
+              gain=0.5, seed=0, fd_eps=CURL_FD_EPS, t_disk=0.0, flow_period=0.0):
     """In-plane divergence-free curl warp of the disk-noise coords ``(u, φ)`` (CKS-18).
 
     **CPU source of truth**; the GPU twin is :func:`curl_warp_ti` (held to this by
@@ -562,6 +562,22 @@ def curl_warp(u, phi, amp, freq_phi=3.0, freq_u=1.0, octaves=4, lacunarity=2,
     ``δu`` and ``δφ`` are exactly 2π-periodic in φ ⇒ ``φ'`` is continuous across the
     seam. ``amp == 0`` ⇒ identity (the disabled path). ``u`` / ``phi`` may be scalars
     or broadcastable arrays.
+
+    **V3.1 — curl-flow advection (CKS-18 §2).** When ``flow_period`` (= the curl-flow
+    clock ``T_c = disk.noise.curl.flow_period_M``) is > 0 the potential ψ becomes
+    *time-dependent* via the SAME dual-phase reset blend CKS-12 §2 uses for the shear:
+    ``ψ = ω_0·ψ_0 + ω_1·ψ_1`` with ``ω_k = 1 − |2α_k − 1|``, ``α_k = frac(s_c + k/2)``,
+    ``s_c = t_disk/T_c``, each phase reseeded ``seed + k·NCYC_PHASE + γ_k·NCYC_CYCLE``
+    (``γ_k = floor(s_c + k/2)``) — so the eddies boil over ``t_disk``. The central
+    difference is taken over the BLENDED ψ; curl is linear so the result stays
+    divergence-free (a convex combination of div-free fields) and seamless per phase.
+    ``ω_k → 0`` exactly at each reset ⇒ C0-continuous through reseeds (the §2 property,
+    on the time axis). **``flow_period ≤ 0`` ⇒ the static V3.0 single-seed path
+    bit-for-bit** (the regression hook; mirror of §2's ``shear_period ≤ 0``). The curl
+    clock ``T_c`` is independent of the §2 ``shear_period`` — eddy turnover and bulk
+    winding are separate timescales (clock decision B1). No ``flow_dynamism`` gain: a
+    pure reset-blend has no continuous displacement to scale C0-safely (SKILL.md CKS-18
+    §2 flag).
     """
     u = _f32(u)
     phi = _f32(phi)
@@ -572,10 +588,32 @@ def curl_warp(u, phi, amp, freq_phi=3.0, freq_u=1.0, octaves=4, lacunarity=2,
     lac = int(lacunarity)
     g = np.float32(gain)
     sd = int(seed)
+    Tc = np.float32(flow_period)
 
-    def _psi(uu, pp):
-        return sfbm3(np.cos(pp) * rho, np.sin(pp) * rho, uu * ku,
-                     0, octaves=oct_, lacunarity=lac, gain=g, seed=sd)
+    if Tc <= np.float32(0.0):
+        # Static (V3.0 / backward-compatible default): single fixed-seed potential.
+        def _psi(uu, pp):
+            return sfbm3(np.cos(pp) * rho, np.sin(pp) * rho, uu * ku,
+                         0, octaves=oct_, lacunarity=lac, gain=g, seed=sd)
+    else:
+        # V3.1 curl-flow: dual-phase reset blend of ψ over the curl clock T_c.
+        sc = np.float32(t_disk) / Tc
+
+        def _psi(uu, pp):
+            xx = np.cos(pp) * rho
+            yy = np.sin(pp) * rho
+            zz = uu * ku
+            out = None
+            for k in (0, 1):
+                ar = sc + np.float32(0.5 * k)
+                ck = int(np.floor(ar))                       # γ_k reset-cycle index
+                ak = ar - np.float32(ck)                     # α_k age ∈ [0, 1)
+                wk = np.float32(1.0) - np.abs(np.float32(2.0) * ak - np.float32(1.0))
+                seed_k = sd + k * NCYC_PHASE + ck * NCYC_CYCLE
+                psik = wk * sfbm3(xx, yy, zz, 0, octaves=oct_, lacunarity=lac,
+                                  gain=g, seed=seed_k)
+                out = psik if out is None else out + psik
+            return out
 
     inv2e = np.float32(1.0) / (np.float32(2.0) * eps)
     dpsi_du = ((_psi(u + eps, phi) - _psi(u - eps, phi)) * inv2e).astype(np.float32)
@@ -586,12 +624,16 @@ def curl_warp(u, phi, amp, freq_phi=3.0, freq_u=1.0, octaves=4, lacunarity=2,
     return u_w, phi_w
 
 
-def _apply_curl(u, phi, curl):
+def _apply_curl(u, phi, curl, t_disk=0.0):
     """Apply :func:`curl_warp` if the ``curl`` config block is enabled, else return
     ``(u, phi)`` unchanged. Shared entry for the density layer stack AND the §3
     modulation stack so the two warp identically (one warp, coherent swirl). An
     absent block / ``enabled: false`` / ``amp == 0`` is the bit-identical disabled
-    path (CKS-12 constraint 6)."""
+    path (CKS-12 constraint 6).
+
+    ``t_disk`` drives the CKS-18 §2 curl-flow advection when ``flow_period_M > 0``
+    (the eddies boil over time); it is decoupled from the §2 shear clock, so the curl
+    can animate even on the static-shear path. Absent / ``≤ 0`` ⇒ the V3.0 static warp."""
     if not curl or not curl.get("enabled", False):
         return u, phi
     amp = float(curl.get("amp", 0.0))
@@ -606,6 +648,8 @@ def _apply_curl(u, phi, curl):
         gain=curl.get("gain", 0.5),
         seed=int(curl.get("seed", 0)),
         fd_eps=float(curl.get("fd_eps", float(CURL_FD_EPS))),
+        t_disk=float(t_disk),
+        flow_period=float(curl.get("flow_period_M", 0.0)),
     )
 
 
@@ -647,7 +691,7 @@ NSEED_MOD_EOUT = 701  # n_e' — outer-edge raggedness
 NSEED_MOD_H = 809     # n_h  — scale-height lumpiness
 
 
-def _noise_m_stack(u, phi, zeta, nz, seed: int) -> np.ndarray:
+def _noise_m_stack(u, phi, zeta, nz, seed: int, t_disk: float = 0.0) -> np.ndarray:
     """Unclamped log-density sum ``m = Σ amp·(layer − bias)`` at the (already-f32)
     disk-natural coords, BEFORE the ``m_max`` clamp and ``exp`` (CKS-12 §3, spec §4).
 
@@ -661,8 +705,10 @@ def _noise_m_stack(u, phi, zeta, nz, seed: int) -> np.ndarray:
     The CKS-18 curl warp (if ``nz["curl"]`` is enabled) distorts ``(u, φ)`` HERE, at
     the stack entry — applied to the already-sheared per-phase ``φ`` so the eddies are
     frozen into the gas's material frame and the §2 shear winds them into filaments.
+    ``t_disk`` additionally evolves the warp itself when ``flow_period_M > 0`` (CKS-18
+    §2 curl-flow advection — the eddies boil on their own clock).
     """
-    u, phi = _apply_curl(u, phi, nz.get("curl"))
+    u, phi = _apply_curl(u, phi, nz.get("curl"), t_disk=t_disk)
     phi01 = phi * _INV_TWO_PI  # φ/(2π); ×freq_phi → lattice y
     m = np.zeros(np.broadcast(u, phi, zeta).shape, dtype=np.float32)
 
@@ -750,7 +796,8 @@ def noise_density_mult(u, phi, zeta, nz, seed: int = 1234,
 
     if T <= np.float32(0.0):
         # Static (D2.2 / backward-compatible default): no advection, sample at φ.
-        m = _noise_m_stack(u, phi, zeta, nz, int(seed))
+        # t_disk still drives the CKS-18 §2 curl-flow (independent of the shear clock).
+        m = _noise_m_stack(u, phi, zeta, nz, int(seed), t_disk=t_disk)
     else:
         omega = _f32(omega)
         s = np.float32(t_disk) / T
@@ -766,7 +813,7 @@ def noise_density_mult(u, phi, zeta, nz, seed: int = 1234,
             wk = np.float32(1.0) - np.abs(np.float32(2.0) * ak - np.float32(1.0))
             seed_k = int(seed) + k * NCYC_PHASE + ck * NCYC_CYCLE
             phi_k = phi - g * omega * (ak * T)   # CKS-12 §2: φ sheared for ≤ T (×gain)
-            mk = wk * _noise_m_stack(u, phi_k, zeta, nz, seed_k)
+            mk = wk * _noise_m_stack(u, phi_k, zeta, nz, seed_k, t_disk=t_disk)
             m = mk if m is None else m + mk
             wsq = wsq + wk * wk
         if var_preserve and wsq > np.float32(0.0):
@@ -776,7 +823,7 @@ def noise_density_mult(u, phi, zeta, nz, seed: int = 1234,
     return np.exp(m).astype(np.float32)
 
 
-def _mod_fbm_stack(u, phi, mod, seed_offsets, seed_base, curl=None):
+def _mod_fbm_stack(u, phi, mod, seed_offsets, seed_base, curl=None, t_disk=0.0):
     """Evaluate the four §3 modulation envelopes at one (already-advected) phase.
 
     Each is a single fBm of :func:`fbm2` in ``[0, 1]`` over the disk-natural
@@ -788,9 +835,10 @@ def _mod_fbm_stack(u, phi, mod, seed_offsets, seed_base, curl=None):
 
     The CKS-18 curl warp (``curl`` block, if enabled) distorts ``(u, φ)`` at entry —
     the SAME warp the density stack applies, so the §3 envelopes swirl coherently with
-    the density.
+    the density. ``t_disk`` evolves the warp itself when ``flow_period_M > 0`` (CKS-18
+    §2 curl-flow advection), in lockstep with the density stack.
     """
-    u, phi = _apply_curl(u, phi, curl)
+    u, phi = _apply_curl(u, phi, curl, t_disk=t_disk)
     fp = int(mod["freq_phi"])
     x = u * np.float32(mod["freq_u"])
     y = phi * _INV_TWO_PI * np.float32(fp)
@@ -843,7 +891,8 @@ def noise_modulation_fields(u, phi, zeta, nz, seed: int = 1234,
 
     curl = nz.get("curl")
     if T <= np.float32(0.0):
-        vals = _mod_fbm_stack(u, phi, mod, offs, int(seed), curl=curl)
+        # Static shear, but the curl warp may still boil (CKS-18 §2, own clock).
+        vals = _mod_fbm_stack(u, phi, mod, offs, int(seed), curl=curl, t_disk=t_disk)
         return tuple(np.broadcast_to(v, shape).astype(np.float32) for v in vals)
 
     omega = _f32(omega)
@@ -857,7 +906,7 @@ def noise_modulation_fields(u, phi, zeta, nz, seed: int = 1234,
         wk = np.float32(1.0) - np.abs(np.float32(2.0) * ak - np.float32(1.0))
         seed_k = int(seed) + k * NCYC_PHASE + ck * NCYC_CYCLE
         phi_k = phi - g * omega * (ak * T)
-        vk = _mod_fbm_stack(u, phi_k, mod, offs, seed_k, curl=curl)
+        vk = _mod_fbm_stack(u, phi_k, mod, offs, seed_k, curl=curl, t_disk=t_disk)
         acc = [a + wk * v for a, v in zip(acc, vk)]
     return tuple(np.broadcast_to(a, shape).astype(np.float32) for a in acc)
 
@@ -1339,13 +1388,45 @@ def sfbm3_ti(x, y, z, period, octaves, lac, gain, seed):
 
 
 @ti.func
-def curl_warp_ti(u, phi, amp, freq_phi, freq_u, octaves, lac, gain, seed, eps):
+def _curl_psi_ti(cx, sx, uz, freq_phi, freq_u, octaves, lac, gain, seed, t_disk, flow_period):
+    """ψ(P) for :func:`curl_warp_ti` — the scalar curl potential at one chart point
+    ``P = (cx·ρ_c, sx·ρ_c, uz·k_u)`` (``cx/sx`` already = ``cos/sin(φ_arg)``).
+
+    Twin of the CPU ``_psi`` closure in :func:`curl_warp`. ``flow_period ≤ 0`` ⇒ the
+    static V3.0 single-seed ``sfbm3``; ``flow_period > 0`` ⇒ the CKS-18 §2 dual-phase
+    reset blend over the curl clock ``T_c`` (``ω_k = 1 − |2α_k − 1|`` triangle weights,
+    per-cycle reseed ``seed + k·NCYC_PHASE + γ_k·NCYC_CYCLE``), matching the CPU strides
+    so the time-evolved warp agrees with the reference."""
+    res = 0.0
+    if flow_period <= 0.0:
+        res = sfbm3_ti(cx * freq_phi, sx * freq_phi, uz * freq_u, 0, octaves, lac, gain, seed)
+    else:
+        sc = t_disk / flow_period
+        for k in range(2):
+            ar = sc + 0.5 * k
+            ck = ti.floor(ar)                                  # γ_k reset-cycle index
+            ak = ar - ck                                       # α_k age ∈ [0, 1)
+            wk = 1.0 - ti.abs(2.0 * ak - 1.0)
+            seed_k = seed + k * NCYC_PHASE + ti.cast(ck, ti.i32) * NCYC_CYCLE
+            res += wk * sfbm3_ti(cx * freq_phi, sx * freq_phi, uz * freq_u,
+                                 0, octaves, lac, gain, seed_k)
+    return res
+
+
+@ti.func
+def curl_warp_ti(u, phi, amp, freq_phi, freq_u, octaves, lac, gain, seed, eps,
+                 t_disk, flow_period):
     """Twin of :func:`curl_warp` (CKS-18 in-plane divergence-free curl warp).
 
     Returns ``ti.Vector([u', φ'])`` displaced by the 2-D curl of the scalar potential
     ``ψ = sfbm3(cosφ·ρ_c, sinφ·ρ_c, u·k_u)``, with a central finite-difference
     gradient (step ``eps``) — the SAME 4-point stencil as the CPU reference, so the
-    two agree to ~1e-5. Built on ``cos φ`` / ``sin φ`` ⇒ seamless across φ=0."""
+    two agree to ~1e-5. Built on ``cos φ`` / ``sin φ`` ⇒ seamless across φ=0.
+
+    **V3.1 (CKS-18 §2):** ``flow_period > 0`` makes ψ time-dependent via the dual-phase
+    reset blend (see :func:`_curl_psi_ti`); the central difference runs over the blended
+    ψ, so divergence-free / seamless survive. ``flow_period ≤ 0`` ⇒ the static V3.0
+    warp bit-for-bit (the regression hook)."""
     inv2e = 1.0 / (2.0 * eps)
     cphi = ti.cos(phi)
     sphi = ti.sin(phi)
@@ -1353,10 +1434,10 @@ def curl_warp_ti(u, phi, amp, freq_phi, freq_u, octaves, lac, gain, seed, eps):
     sphi_p = ti.sin(phi + eps)
     cphi_m = ti.cos(phi - eps)
     sphi_m = ti.sin(phi - eps)
-    psi_up = sfbm3_ti(cphi * freq_phi, sphi * freq_phi, (u + eps) * freq_u, 0, octaves, lac, gain, seed)
-    psi_um = sfbm3_ti(cphi * freq_phi, sphi * freq_phi, (u - eps) * freq_u, 0, octaves, lac, gain, seed)
-    psi_pp = sfbm3_ti(cphi_p * freq_phi, sphi_p * freq_phi, u * freq_u, 0, octaves, lac, gain, seed)
-    psi_pm = sfbm3_ti(cphi_m * freq_phi, sphi_m * freq_phi, u * freq_u, 0, octaves, lac, gain, seed)
+    psi_up = _curl_psi_ti(cphi, sphi, u + eps, freq_phi, freq_u, octaves, lac, gain, seed, t_disk, flow_period)
+    psi_um = _curl_psi_ti(cphi, sphi, u - eps, freq_phi, freq_u, octaves, lac, gain, seed, t_disk, flow_period)
+    psi_pp = _curl_psi_ti(cphi_p, sphi_p, u, freq_phi, freq_u, octaves, lac, gain, seed, t_disk, flow_period)
+    psi_pm = _curl_psi_ti(cphi_m, sphi_m, u, freq_phi, freq_u, octaves, lac, gain, seed, t_disk, flow_period)
     dpsi_du = (psi_up - psi_um) * inv2e
     dpsi_dphi = (psi_pp - psi_pm) * inv2e
     return ti.Vector([u + amp * dpsi_dphi, phi - amp * dpsi_du])

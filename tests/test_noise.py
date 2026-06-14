@@ -630,3 +630,130 @@ def test_curl_warp_actually_moves_the_density_stack():
     m_dis = noise.noise_density_mult(u, phi, zeta, nz_disabled, seed=7)
     assert not np.array_equal(m_off, m_on)            # the warp does something
     assert np.array_equal(m_off, m_dis)              # enabled:false ⇒ bit-identical
+
+
+# --------------------------------------------------------------------------- #
+# §3.7 / CKS-18 §2 — curl-flow advection (V3.1): time-dependent ψ.
+#
+# The static V3.0 potential ψ becomes time-dependent via the SAME CKS-12 §2
+# dual-phase reset blend (ω_k triangle weights, per-cycle reseed). These pin: the
+# static-fallback bit-identity (flow_period ≤ 0 ⇒ V3.0 exactly — the regression
+# hook), divergence-free AT EACH t (curl is linear so the blend preserves it),
+# seamless at each t, C0-continuity through reseeds (ω_k → 0 at each reset), and
+# evolution + determinism. Same honest np.gradient methodology as the V3.0 tests.
+# --------------------------------------------------------------------------- #
+_CURL_FLOW_KW = dict(amp=0.15, freq_phi=3.0, freq_u=1.3, octaves=4,
+                     lacunarity=2, gain=0.5, seed=1337)
+
+
+def _blended_psi(U, P, t_disk, flow_period, rho=3.0, ku=1.3, seed=1337,
+                 oct_=4, lac=2, gain=0.5):
+    """Reconstruct the time-blended potential ``ψ = Σ ω_k ψ_k`` exactly as the
+    ``flow_period > 0`` branch of :func:`noise.curl_warp` builds it — so a test can
+    apply a consistent ``np.gradient`` operator to the SAME potential the warp curls
+    (the honest divergence methodology, lifted to the time axis)."""
+    sc = np.float32(t_disk) / np.float32(flow_period)
+    out = np.zeros(np.broadcast(U, P).shape, dtype=np.float64)
+    for k in (0, 1):
+        ar = sc + np.float32(0.5 * k)
+        ck = int(np.floor(ar))
+        ak = ar - np.float32(ck)
+        wk = np.float32(1.0) - np.abs(np.float32(2.0) * ak - np.float32(1.0))
+        seed_k = int(seed) + k * noise.NCYC_PHASE + ck * noise.NCYC_CYCLE
+        out += float(wk) * noise.sfbm3(np.cos(P) * rho, np.sin(P) * rho, U * ku, 0,
+                                       octaves=oct_, lacunarity=lac, gain=gain,
+                                       seed=seed_k).astype(np.float64)
+    return out
+
+
+def test_curl_flow_static_fallback_is_bit_identical():
+    """``flow_period ≤ 0`` (and an absent clock) ⇒ the V3.0 static warp BIT-FOR-BIT,
+    for any ``t_disk`` — the regression hook (mirror of CKS-12 §2's static fallback).
+    This is what keeps the V3.0 / default-off goldens valid."""
+    u, phi = _warp_grid()
+    U, P = np.meshgrid(u, phi, indexing="ij")
+    static = noise.curl_warp(U, P, **_CURL_FLOW_KW)                       # no clock
+    for t in (0.0, 3.7, 100.0):
+        zero = noise.curl_warp(U, P, t_disk=t, flow_period=0.0, **_CURL_FLOW_KW)
+        neg = noise.curl_warp(U, P, t_disk=t, flow_period=-5.0, **_CURL_FLOW_KW)
+        assert np.array_equal(static[0], zero[0]) and np.array_equal(static[1], zero[1])
+        assert np.array_equal(static[0], neg[0]) and np.array_equal(static[1], neg[1])
+
+
+def test_curl_flow_is_divergence_free_at_each_time():
+    """The blend ``ψ = ω_0ψ_0 + ω_1ψ_1`` is still a scalar potential, so its curl
+    ``(+∂ψ/∂φ, −∂ψ/∂u)`` is divergence-free at every ``t_disk`` (curl is linear ⇒ a
+    convex combination of div-free fields is div-free). Same honest operator as the
+    V3.0 test: build the curl field and a generic gradient field from the SAME blended
+    ψ, show the curl divergence is orders of magnitude smaller."""
+    n, rho, ku = 96, 3.0, 1.3
+    u = np.linspace(0.0, 2.0, n)
+    phi = np.linspace(-np.pi, np.pi, n, endpoint=False)
+    U, P = np.meshgrid(u, phi, indexing="ij")
+    hu, hp = u[1] - u[0], phi[1] - phi[0]
+    for t in (0.0, 1.3, 4.1):
+        psi = _blended_psi(U, P, t, flow_period=6.0, rho=rho, ku=ku)
+        dpsi_du, dpsi_dphi = np.gradient(psi, hu, hp, edge_order=2)
+
+        def _divergence(fu, fphi):
+            d_u = np.gradient(fu, hu, axis=0, edge_order=2)
+            d_phi = np.gradient(fphi, hp, axis=1, edge_order=2)
+            return (d_u + d_phi)[2:-2, 2:-2]
+
+        div_curl = _divergence(dpsi_dphi, -dpsi_du)
+        div_grad = _divergence(dpsi_du, dpsi_dphi)
+        assert np.abs(div_curl).max() < 1e-3 * np.abs(div_grad).max(), (
+            t, np.abs(div_curl).max(), np.abs(div_grad).max())
+
+
+def test_curl_flow_is_seamless_at_each_time():
+    """The blended displacement is still built on ``cos φ`` / ``sin φ`` ⇒ exactly
+    2π-periodic in φ at every ``t_disk`` (seamlessness survives the time blend). Coarse
+    ``fd_eps`` as in the V3.0 seam test so the ``1/2ε`` factor doesn't amplify the f32
+    ``cos(φ+2π)`` argument-reduction roundoff."""
+    u = np.linspace(-1.0, 3.0, 24).astype(np.float32)
+    phi = np.linspace(-2.0, 2.0, 24).astype(np.float32)
+    U, P = np.meshgrid(u, phi, indexing="ij")
+    kw = {**_CURL_FLOW_KW, "fd_eps": 0.05, "flow_period": 6.0}
+    for t in (0.0, 1.7, 3.3):
+        u_a, phi_a = noise.curl_warp(U, P, t_disk=t, **kw)
+        u_b, phi_b = noise.curl_warp(U, (P + 2.0 * np.pi).astype(np.float32), t_disk=t, **kw)
+        assert np.allclose(u_a - U, u_b - U, atol=3e-5), t
+        assert np.allclose(phi_a - P, phi_b - (P + 2.0 * np.pi), atol=3e-5), t
+
+
+def test_curl_flow_is_c0_continuous_through_resets():
+    """``ω_k → 0`` exactly at each reset (``α_k = 0``), so the warp is continuous as the
+    potential reseeds (``γ_k`` steps) — the proven §2 property, now on the time axis.
+    With ``flow_period = 1`` the phases reset every ``Δs = 0.5`` (k=0 at integer t, k=1
+    at half-integer t); a fine ``t`` sweep across those boundaries must show NO jump —
+    the max adjacent step stays the same order at a reset as away from it (a seed swap
+    with O(1) weight would spike by O(amp))."""
+    u = np.linspace(-0.5, 2.5, 20).astype(np.float32)
+    phi = np.linspace(-np.pi, np.pi, 20, endpoint=False).astype(np.float32)
+    U, P = np.meshgrid(u, phi, indexing="ij")
+    ts = np.linspace(0.0, 2.0, 401)  # Δt = 0.005; crosses resets at 0.5,1.0,1.5,2.0
+    warps = np.stack([noise.curl_warp(U, P, t_disk=float(t), flow_period=1.0,
+                                      **_CURL_FLOW_KW)[0] for t in ts])
+    steps = np.abs(np.diff(warps, axis=0)).reshape(len(ts) - 1, -1).max(axis=1)
+    # Continuity is scale-free: NO adjacent-in-time step is an outlier vs the typical
+    # boil step. A reseed discontinuity (ω≠0 seed swap) would spike ONE step to O(amp)
+    # ≈ 0.15 ≈ 6× the median; a continuous reseed (ω→0 at the reset) keeps every step
+    # within a small factor. The observed max lands AWAY from the resets (the uniform
+    # boil rate), not on them.
+    assert steps.max() < 3.0 * np.median(steps), (
+        steps.max(), float(np.median(steps)), float(ts[steps.argmax()]))
+
+
+def test_curl_flow_evolves_and_is_deterministic():
+    """The warp boils: it changes between distinct ``t_disk`` (stays finite), and is a
+    pure function of ``(coords, seed, t_disk)`` — same ``t`` ⇒ identical (no global
+    RNG, constraint 7)."""
+    u, phi = _warp_grid()
+    U, P = np.meshgrid(u, phi, indexing="ij")
+    a = noise.curl_warp(U, P, t_disk=0.0, flow_period=5.0, **_CURL_FLOW_KW)
+    b = noise.curl_warp(U, P, t_disk=2.5, flow_period=5.0, **_CURL_FLOW_KW)
+    b2 = noise.curl_warp(U, P, t_disk=2.5, flow_period=5.0, **_CURL_FLOW_KW)
+    assert not np.array_equal(a[0], b[0])                  # evolves over time
+    assert np.isfinite(b[0]).all() and np.isfinite(b[1]).all()
+    assert np.array_equal(b[0], b2[0]) and np.array_equal(b[1], b2[1])  # deterministic

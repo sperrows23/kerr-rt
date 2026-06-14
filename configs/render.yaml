@@ -179,8 +179,15 @@ disk:
       octaves: 4
       lacunarity: 2
       gain: 0.5
-      seed: 1337           # fixed (NOT the per-cycle reseed) ⇒ V3.0 warp is static; only §2 animates
+      seed: 1337           # base seed; the V3.1 reset blend reseeds per cycle off this
       fd_eps: 0.001        # central finite-difference step for the curl gradient (in the u,φ chart)
+      flow_period_M: 0.0   # V3.1 (CKS-18 §2): curl-flow clock T_c (geometric M). > 0 ⇒ the eddies
+                           #   BOIL over t_disk via the §2 dual-phase reset blend (form/stretch/merge),
+                           #   on top of the §2 shear winding. ≤ 0 (default) ⇒ static V3.0 warp,
+                           #   bit-for-bit. Independent of disk.dynamics.shear_period_M (separate
+                           #   timescale, clock B1 — no CKS-13 resolver change). Try ~3–12 M.
+                           #   (No flow_dynamism gain: a reset-blend has no C0-safe separable
+                           #   boil-rate dial — see SKILL.md CKS-18 §2 flag.)
     layers:
       # L0 base streaks — fBm, features long along the orbit (freq_phi ≪ freq_u).
       base:  {enabled: true, amp: 0.6, octaves: 5, lacunarity: 2.0, gain: 0.5,

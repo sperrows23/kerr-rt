@@ -224,7 +224,11 @@ _NI_CURL_LAC = 48
 _NI_CURL_GAIN = 49
 _NI_CURL_SEED = 50
 _NI_CURL_EPS = 51   # central finite-difference step in the (u,φ) chart
-_NOISE_N = 52
+# V3.1 (CKS-18 §2) curl-flow advection — the curl clock T_c. > 0 ⇒ ψ becomes
+# time-dependent via the §2 dual-phase reset blend (the eddies boil over t_disk);
+# ≤ 0 ⇒ the static V3.0 warp bit-for-bit. Independent of the §2 shear clock (B1).
+_NI_CURL_FLOWP = 52
+_NOISE_N = 53
 
 # CKS-14 RTE source-function march: divide guard on dτ. Below this the source
 # function S = emission/dτ is numerically undefined AND physically the optically-
@@ -583,6 +587,8 @@ def _setup_disk_noise(cfg: dict) -> None:
     buf[_NI_CURL_GAIN] = float(curl.get("gain", 0.5))
     buf[_NI_CURL_SEED] = float(curl.get("seed", 0))
     buf[_NI_CURL_EPS] = float(curl.get("fd_eps", float(noise.CURL_FD_EPS)))
+    # V3.1 (CKS-18 §2) curl-flow clock; ≤ 0 (default / absent) ⇒ static V3.0 warp.
+    buf[_NI_CURL_FLOWP] = float(curl.get("flow_period_M", 0.0))
 
     disk_noise_params = ti.field(dtype=ti.f32, shape=_NOISE_N)
     disk_noise_params.from_numpy(buf)
@@ -992,10 +998,13 @@ def _pt_flux_sample(r):
 
 
 @ti.func
-def _disk_curl_warp(u, phi):
+def _disk_curl_warp(u, phi, t_disk):
     """In-plane CKS-18 curl warp of ``(u, φ)`` from the ``disk_noise_params`` dials;
     GPU wrapper over :func:`noise.curl_warp_ti`. Returns ``ti.Vector([u', φ'])``.
-    Only called when ``_NI_CURL_EN > 0.5`` (the disabled path never touches coords)."""
+    Only called when ``_NI_CURL_EN > 0.5`` (the disabled path never touches coords).
+
+    ``t_disk`` + ``_NI_CURL_FLOWP`` drive the CKS-18 §2 curl-flow advection (the warp
+    boils over time); ``_NI_CURL_FLOWP ≤ 0`` ⇒ the static V3.0 warp bit-for-bit."""
     return noise.curl_warp_ti(
         u, phi,
         disk_noise_params[_NI_CURL_AMP],
@@ -1006,11 +1015,13 @@ def _disk_curl_warp(u, phi):
         disk_noise_params[_NI_CURL_GAIN],
         ti.cast(disk_noise_params[_NI_CURL_SEED], ti.i32),
         disk_noise_params[_NI_CURL_EPS],
+        t_disk,
+        disk_noise_params[_NI_CURL_FLOWP],
     )
 
 
 @ti.func
-def _disk_noise_m(u, phi, zeta, seed):
+def _disk_noise_m(u, phi, zeta, seed, t_disk):
     """Unclamped log-density sum ``m = Σ amp·(layer − bias)`` (CKS-12 §3, spec §4);
     GPU twin of :func:`noise._noise_m_stack`. Reads the per-layer dials from
     ``disk_noise_params`` and evaluates the L0/L1/L2 stack at the disk-natural coords
@@ -1022,9 +1033,10 @@ def _disk_noise_m(u, phi, zeta, seed):
     The CKS-18 curl warp (when ``_NI_CURL_EN``) distorts ``(u, φ)`` HERE, on the
     already-sheared per-phase ``φ`` — the eddies freeze into the gas's material frame
     and the §2 shear winds them into filaments; ``ζ`` is untouched (V3.0 in-plane).
+    ``t_disk`` evolves the warp itself when ``_NI_CURL_FLOWP > 0`` (CKS-18 §2).
     """
     if disk_noise_params[_NI_CURL_EN] > 0.5:
-        w = _disk_curl_warp(u, phi)
+        w = _disk_curl_warp(u, phi, t_disk)
         u = w[0]
         phi = w[1]
     m = 0.0
@@ -1124,8 +1136,9 @@ def _disk_noise_density_mult(u, phi, zeta, t_disk, omega, seed):
     T = disk_noise_params[_NI_SHEAR_T]
     m = 0.0
     if T <= 0.0:
-        # Static (D2.2 / bit-identical default): no advection, sample at φ.
-        m = _disk_noise_m(u, phi, zeta, seed)
+        # Static (D2.2 / bit-identical default): no shear advection, sample at φ.
+        # t_disk still drives the CKS-18 §2 curl-flow (own clock, independent of T).
+        m = _disk_noise_m(u, phi, zeta, seed, t_disk)
     else:
         s = t_disk / T
         g = disk_noise_params[_NI_DYNAMISM]  # viz gain on the shear amount (1.0 = formula)
@@ -1135,7 +1148,7 @@ def _disk_noise_density_mult(u, phi, zeta, t_disk, omega, seed):
         a0 = s - c0
         w0 = 1.0 - ti.abs(2.0 * a0 - 1.0)
         seed0 = seed + ti.cast(c0, ti.i32) * _NCYC_CYCLE
-        m += w0 * _disk_noise_m(u, phi - g * omega * (a0 * T), zeta, seed0)
+        m += w0 * _disk_noise_m(u, phi - g * omega * (a0 * T), zeta, seed0, t_disk)
         wsq += w0 * w0
         # Phase k = 1 (half-period staggered reset).
         ar1 = s + 0.5
@@ -1143,7 +1156,7 @@ def _disk_noise_density_mult(u, phi, zeta, t_disk, omega, seed):
         a1 = ar1 - c1
         w1 = 1.0 - ti.abs(2.0 * a1 - 1.0)
         seed1 = seed + _NCYC_PHASE + ti.cast(c1, ti.i32) * _NCYC_CYCLE
-        m += w1 * _disk_noise_m(u, phi - g * omega * (a1 * T), zeta, seed1)
+        m += w1 * _disk_noise_m(u, phi - g * omega * (a1 * T), zeta, seed1, t_disk)
         wsq += w1 * w1
         if disk_noise_params[_NI_VAR_PRESERVE] > 0.5 and wsq > 0.0:
             m = m / ti.sqrt(wsq)
@@ -1166,7 +1179,7 @@ def _smoothstep_ti(e0, e1, x):
 
 
 @ti.func
-def _mod_fbm4(u, phi, seed):
+def _mod_fbm4(u, phi, seed, t_disk):
     """The four §3 modulation envelopes ``(n_T, n_e_in, n_e_out, n_h)`` at one
     (already-advected) phase — GPU twin of :func:`noise._mod_fbm_stack`. Each is a
     single ``fbm2`` in ``[0, 1]`` over ``(u·freq_u, φ/(2π)·freq_phi)`` with integer
@@ -1174,9 +1187,10 @@ def _mod_fbm4(u, phi, seed):
     four envelopes are mutually decorrelated. Returns a ``ti.Vector`` of 4 f32.
 
     Applies the SAME CKS-18 curl warp as :func:`_disk_noise_m` (when ``_NI_CURL_EN``)
-    so the §3 envelopes swirl coherently with the density."""
+    so the §3 envelopes swirl coherently with the density; ``t_disk`` evolves the warp
+    in lockstep when ``_NI_CURL_FLOWP > 0`` (CKS-18 §2)."""
     if disk_noise_params[_NI_CURL_EN] > 0.5:
-        w = _disk_curl_warp(u, phi)
+        w = _disk_curl_warp(u, phi, t_disk)
         u = w[0]
         phi = w[1]
     fpf = disk_noise_params[_NI_MOD_FP]
@@ -1207,7 +1221,8 @@ def _disk_noise_mod_fields(u, phi, t_disk, omega, seed):
     T = disk_noise_params[_NI_SHEAR_T]
     out = ti.Vector([0.5, 0.5, 0.5, 0.5])
     if T <= 0.0:
-        out = _mod_fbm4(u, phi, seed)
+        # Static shear; t_disk still drives the CKS-18 §2 curl-flow (own clock).
+        out = _mod_fbm4(u, phi, seed, t_disk)
     else:
         s = t_disk / T
         g = disk_noise_params[_NI_DYNAMISM]
@@ -1215,13 +1230,13 @@ def _disk_noise_mod_fields(u, phi, t_disk, omega, seed):
         a0 = s - c0
         w0 = 1.0 - ti.abs(2.0 * a0 - 1.0)
         seed0 = seed + ti.cast(c0, ti.i32) * _NCYC_CYCLE
-        v0 = _mod_fbm4(u, phi - g * omega * (a0 * T), seed0)
+        v0 = _mod_fbm4(u, phi - g * omega * (a0 * T), seed0, t_disk)
         ar1 = s + 0.5
         c1 = ti.floor(ar1)
         a1 = ar1 - c1
         w1 = 1.0 - ti.abs(2.0 * a1 - 1.0)
         seed1 = seed + _NCYC_PHASE + ti.cast(c1, ti.i32) * _NCYC_CYCLE
-        v1 = _mod_fbm4(u, phi - g * omega * (a1 * T), seed1)
+        v1 = _mod_fbm4(u, phi - g * omega * (a1 * T), seed1, t_disk)
         out = w0 * v0 + w1 * v1
     return out
 
