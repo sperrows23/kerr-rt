@@ -1295,53 +1295,86 @@ def bake_disk_shadow(
     t_disk: float,
     a: float,
 ):
-    """Bake the CKS-15 radial deep-shadow-map ``τ_shadow[NU,NPHI,NZ]`` (spec §2.1).
+    """Bake the CKS-17 3D inner-edge-ray deep-shadow-map ``τ_shadow[NU,NPHI,NZ]``.
 
-    For each ``(φ, ζ)`` column (parallelized), march ``u`` OUTWARD from ``u=0``
-    (``r=r_inner``) accumulating the SAME absorption the emission march uses —
-    ``κ·ρ·dr`` with ``κ=absb_c``, ``dr = r·du`` (since ``u=ln r/r_inner``) and ``ρ``
-    the shared ``_disk_density_cks`` at this ``(u,φ,ζ,t_disk)``. Each cell stores the
-    τ accumulated from gas STRICTLY INWARD of it (the running sum BEFORE adding the
-    cell's own dτ) so a cell never shadows itself; clamped to ``max_tau`` (caustic /
-    overflow safety). VISUALIZATION occlusion bookkeeping — a straight radial CKS
-    ray, NOT a geodesic (CKS-15 governance); it never touches p_μ/u^μ/g/g⁴/f_PT.
+    Generalises the CKS-15 radial column scan to a 3D shadow ray: for each target cell
+    ``(i_u, φ, i_z)`` (all three loops parallelized) the ray runs from the illuminator
+    at the inner edge IN THE MIDPLANE ``(u=0, ζ=0)`` to the sample ``(u_s, φ, ζ_s)`` at
+    fixed ``φ``, with ``ζ(u)=(u/u_s)·ζ_s``. March the STRICTLY-inner radial cells
+    ``j<i_u`` (a cell never shadows itself) accumulating the SAME absorption the
+    emission march uses — ``κ·ρ·ds`` with ``κ=absb_c`` — but ``ρ`` sampled at the
+    TILTED point ``ρ(u_j, φ, ζ_j)`` and ``ds`` the 3D arc length
+    ``√((r_j·du)² + ΔZ_j²)``, ``ΔZ_j`` the ray's physical-height change
+    ``Z(u)=r·ζ(u)·σ_θ(r)`` over the cell (CKS-16 flared ``σ_θ``). So an off-midplane
+    parcel is shadowed by the dense midplane gas between it and the hot inner edge —
+    the vertical self-shadow V2's 3D bulk makes physical. Clamped to ``max_tau``.
+
+    Exact CKS-15 reduction on the midplane: at ``ζ_s=0`` the ray is flat (``ζ_j≡0``,
+    ``ΔZ_j≡0``), so ``ds=r·du`` and ``ρ`` is the midplane density — term for term the
+    old radial column. The radial element keeps the ``dr=r·du`` convention (not an
+    endpoint ``ΔR``) precisely so this limit is bit-exact; the vertical leg is added in
+    quadrature (zero on the midplane). VISUALIZATION occlusion bookkeeping — a straight
+    CKS ray, NOT a geodesic, single inner-edge illuminator, single-scatter (CKS-17
+    governance); never touches p_μ/u^μ/g/g⁴/f_PT.
 
     Density reconstruction (must match ``_disk_emit_cks`` exactly at the same noise
     coords): ``_disk_density_cks`` reads ``(x, y)`` ONLY through ``atan2(y, x)=φ`` and
     otherwise uses the passed ``r`` / ``dz_ang`` / ``σ_θ``, so feeding ``x=cos φ``,
     ``y=sin φ``, ``r=r_inner·e^u`` and ``dz_ang=ζ·σ_θ`` reproduces the identical
     ``ρ(u, φ, ζ; t)`` — including its §2 shear advection and §3 modulation.
+
+    Cost: each target ζ_s tilts its own ray (no shared prefix), so this is O(NU) per
+    cell ⇒ O(NU²·NPHI·NZ) — ~NU/2× the CKS-15 evals, parallel over all cells.
     """
     NU = disk_shadow_tau.shape[0]
     NPHI = disk_shadow_tau.shape[1]
     NZ = disk_shadow_tau.shape[2]
     u_max = ti.log(r_outer / r_inner)
     du = u_max / NU
-    for i_phi, i_z in ti.ndrange(NPHI, NZ):
+    dzeta = 2.0 * zeta_max / NZ
+    for i_u, i_phi, i_z in ti.ndrange(NU, NPHI, NZ):
         phi = -math.pi + (i_phi + 0.5) * (_TWO_PI / NPHI)
-        zeta = -zeta_max + (i_z + 0.5) * (2.0 * zeta_max / NZ)
+        zeta_s = -zeta_max + (i_z + 0.5) * dzeta
+        u_s = (i_u + 0.5) * du
         x = ti.cos(phi)
         y = ti.sin(phi)
+        # 3D inner-edge ray: accumulate τ from gas STRICTLY inward of this cell along
+        # the tilted line to (u_s, ζ_s). i_u==0 ⇒ empty loop ⇒ τ=0 (inner edge unshadowed,
+        # matching CKS-15). ζ_s==0 ⇒ ΔZ≡0, ds≡r·du, ρ at midplane ⇒ exactly CKS-15.
         tau = 0.0
-        for i_u in range(NU):
-            # Store τ from STRICTLY inner gas (running sum before this cell's own
-            # contribution) ⇒ no self-shadow within a cell. Serial scan (nested
-            # range loop) over the parallel (φ, ζ) column.
-            disk_shadow_tau[i_u, i_phi, i_z] = ti.min(tau, max_tau)
-            u = (i_u + 0.5) * du
-            r = r_inner * ti.exp(u)
-            # CKS-16: the grid ζ is in LOCAL (flared) scale-height units, so the
-            # angular offset is ζ·σ_θ(r) recomputed per radius. β=0 ⇒ σ_eff ≡ σ0,
-            # dz_ang ≡ ζ·σ0 (constant) ⇒ bit-identical to the pre-V2 outer-loop form.
-            sigma_eff = sigma_theta0
+        for j in range(i_u):
+            u_c = (j + 0.5) * du
+            r_c = r_inner * ti.exp(u_c)
+            # Ray ζ at this radius (linear from the midplane illuminator to the sample).
+            zeta_c = (u_c / u_s) * zeta_s
+            # σ_θ(r) flared (CKS-16); β=0 ⇒ σ_eff ≡ σ0 (no ti.pow) ⇒ midplane bit-exact.
+            sigma_c = sigma_theta0
             if flare_beta != 0.0:
-                sigma_eff = sigma_theta0 * ti.pow(r / r_inner, flare_beta)
-            dz_ang = zeta * sigma_eff
+                sigma_c = sigma_theta0 * ti.pow(r_c / r_inner, flare_beta)
+            dz_ang = zeta_c * sigma_c
             dens = _disk_density_cks(
-                x, y, r, dz_ang, sigma_theta0, flare_beta, r_inner, r_outer, r_isco,
+                x, y, r_c, dz_ang, sigma_theta0, flare_beta, r_inner, r_outer, r_isco,
                 noise_enabled, noise_seed, t_disk, a,
             )[0]
-            tau += absb_c * dens * (r * du)
+            # 3D arc length over the cell: radial dr=r_c·du (CKS-15 convention, keeps the
+            # midplane reduction bit-exact) + the ray's physical-height change ΔZ in
+            # quadrature. Z(u)=r(u)·ζ(u)·σ_θ(r), endpoints at u_c±½du.
+            u_lo = u_c - 0.5 * du
+            u_hi = u_c + 0.5 * du
+            r_lo = r_inner * ti.exp(u_lo)
+            r_hi = r_inner * ti.exp(u_hi)
+            sig_lo = sigma_theta0
+            sig_hi = sigma_theta0
+            if flare_beta != 0.0:
+                sig_lo = sigma_theta0 * ti.pow(r_lo / r_inner, flare_beta)
+                sig_hi = sigma_theta0 * ti.pow(r_hi / r_inner, flare_beta)
+            z_lo = r_lo * ((u_lo / u_s) * zeta_s) * sig_lo
+            z_hi = r_hi * ((u_hi / u_s) * zeta_s) * sig_hi
+            d_z = z_hi - z_lo
+            dr = r_c * du
+            ds = ti.sqrt(dr * dr + d_z * d_z)
+            tau += absb_c * dens * ds
+        disk_shadow_tau[i_u, i_phi, i_z] = ti.min(tau, max_tau)
 
 
 @ti.func

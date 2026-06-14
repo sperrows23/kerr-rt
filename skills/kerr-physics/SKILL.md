@@ -15,6 +15,7 @@ Load this skill whenever the task involves:
 - Volumetric disk radiative transfer / source-function march (Formula CKS-14)
 - Disk radial self-shadow / deep-shadow-map (Formula CKS-15 — VISUALIZATION)
 - Flared 3D disk scale height σ_θ(r) (Formula CKS-16 — GEOMETRY/TEXTURE)
+- Disk 3D inner-edge-ray self-shadow (radial + vertical) (Formula CKS-17 — VISUALIZATION)
 - Any formula involving `r_isco`, `E_I`, `L_I`, `u^t`, `u^r`, `u^phi`, `g-factor`, `Carter Q`
 
 ---
@@ -1306,7 +1307,10 @@ The dominant illuminator of the disk is its own **hot inner edge** (peak
 shadowed by all the gas between it and the inner edge at the same `(φ, ζ)`. CKS-15
 captures this **in-plane (radial) self-shadowing** — clumps casting dark wakes
 *outward* — the dominant void mechanism for the 2.5D slab. (Vertical self-shadowing,
-top gas shadowing the midplane, needs the V2 3D bulk and is out of V1 scope.)
+top gas shadowing the midplane, needs the V2 3D bulk and is out of V1 scope — it is
+now provided by **Formula CKS-17**, which generalises this radial column scan to a
+3D inner-edge ray and *supersedes the bake below* when `self_shadow` is on. CKS-15
+remains the ζ=0 midplane limit of CKS-17.)
 
 **The deep-shadow-map (baked once per frame).** A 3-D cumulative absorption optical
 depth `τ_shadow[NU, NPHI, NZ]` on the CKS-12 noise coordinates
@@ -1444,6 +1448,94 @@ correct envelope + absorption, it is not tuned for brightness.)
 
 ---
 
+## Formula CKS-17 — 3D inner-edge-ray self-shadow (radial + vertical) (owner-approved 2026-06-14; VISUALIZATION, NOT a metric)
+
+> **Status:** the SAME VISUALIZATION occlusion class as CKS-15 — it multiplies the
+> emission *amplitude* only and never touches `p_μ`, `u^μ`, `g`, `g⁴`, `f_PT`, or the
+> chromaticity form. The shadow ray is a **straight line in CKS, not a geodesic**;
+> single illuminator (the hot inner edge), single-scatter, no emission along the
+> shadow march — occlusion bookkeeping, not a transport solve. It stays inside the
+> CKS-15 governance envelope (straight ray / single-scatter / amplitude-only), so it
+> is an *extension of CKS-15*, not the "physical shadow transport" that section says
+> to stop for. Gated by the SAME flag `disk.volumetric.self_shadow.enabled` (default
+> `false` ⇒ no bake, no lookup, golden frames bit-identical). Owner picked the 3D-ray
+> model over a separable top-down column on 2026-06-14. Spec:
+> `docs/specs/2026-06-14-V2-vertical-self-shadow.md`.
+
+CKS-15 shadows each sample along a **radial** ray at constant `(φ, ζ)` — it captures
+gas casting wakes *outward* but cannot capture the **vertical** occlusion the V2 3D
+bulk makes physical: an off-midplane parcel is shadowed by the dense midplane gas
+lying between it and the hot inner edge. CKS-17 unifies both by making the shadow ray
+**3D**: from the illuminator at the inner edge **in the midplane** `(u=0, ζ=0)` to the
+sample `(u_s, φ, ζ_s)`, at fixed `φ` (azimuthal bending ignored, as in CKS-15).
+
+**The ray (fixed `φ`, parameterised by `u ∈ [0, u_s]`).** The vertical coordinate
+interpolates linearly from the midplane illuminator to the sample:
+
+```
+ζ(u) = (u / u_s) · ζ_s          # ζ(0)=0 at the inner edge, ζ(u_s)=ζ_s at the sample
+r(u) = r_inner · e^u
+Z(u) = r(u) · ζ(u) · σ_θ(r(u))  # near-equator physical height; σ_θ = CKS-16 flared σ
+```
+
+**The baked optical depth** (still `τ_shadow[NU, NPHI, NZ]`, same field/grid/lookup as
+CKS-15). For target cell `(i_u, φ, i_z)` march the strictly-inner radial cells
+`j = 0 … i_u−1` (a cell never shadows itself — the inner-edge accumulation rule is
+unchanged) and accumulate the SAME absorption the emission march uses, `κ·ρ·ds`, but
+now along the tilted ray:
+
+```
+ζ_j   = (u_j / u_s) · ζ_s          u_j = (j+½)·du,  u_s = (i_u+½)·du
+ρ_j   = _disk_density_cks(φ, r_j, dz_ang = ζ_j·σ_θ(r_j))     # tilted sample, shared ρ
+ds_j  = sqrt( (r_j·du)² + (ΔZ_j)² )                          # 3D arc length
+ΔZ_j  = Z(u_j+½du) − Z(u_j−½du)                              # ray height change over the cell
+τ_shadow(i_u,φ,i_z) = min( Σ_{j<i_u} absb_c · ρ_j · ds_j , max_tau )
+```
+
+- **Exact CKS-15 reduction on the midplane.** At `ζ_s = 0` the ray is flat: `ζ_j ≡ 0`,
+  `ΔZ_j ≡ 0`, so `ds_j = r_j·du` and `ρ_j = ρ(u_j, φ, 0)` — the integrand becomes
+  CKS-15's radial column **term for term**. The radial element keeps the `dr = r·du`
+  convention (NOT an endpoint `ΔR`) precisely so this reduction is bit-exact, and the
+  vertical leg `ΔZ` is added in quadrature (zero on the midplane). CKS-15 is the
+  `ζ→0` limit of CKS-17, not a separate code path.
+- **Why off-midplane changes.** For `ζ_s ≠ 0` the ray tilts toward the midplane going
+  inward (`ζ_j < ζ_s`), so it traverses **denser** gas than CKS-15's constant-`ζ_s`
+  column — an off-plane parcel is now correctly shadowed by the bright midplane slab
+  between it and the inner edge. This is the entire point: vertical self-shadow.
+- **`σ_θ(r)` is the CKS-16 flared base** (`σ0·(r/r_inner)^β`, `β=0 ⇒ σ0` with no
+  `ti.pow`), so on a flared disk the ray height `Z` follows the real envelope.
+
+**The lookup and application are UNCHANGED from CKS-15.** Trilinear (φ-periodic) sample
+of `τ_shadow` at the primary sample's `(u, φ, ζ)`, then `emission *= exp(−shadow_strength
+· τ_s)` on the EMISSIVITY only (`κ`/`dτ` untouched; composes with CKS-14 so `S` inherits
+`e^{−τ_s}`). Only `bake_disk_shadow`'s *ray geometry* changed — the field shape,
+`_sample_shadow_tau`, and the `_disk_emit_cks` application are identical.
+
+**Cost.** The 3D ray is not a prefix sum (each target `ζ_s` tilts its own ray), so the
+bake is `O(NU)` per cell ⇒ `O(NU²·NPHI·NZ)` overall vs CKS-15's `O(NU·NPHI·NZ)` — ~`NU/2`×
+more density evals per frame, parallelised over all cells on the GPU. Accepted for the
+offline bake (owner chose the 3D ray knowing it is the heavier model).
+
+**Governance (why this is still a viz approximation, not GR).** Straight CKS shadow ray
+(not a geodesic — the inner-to-sample bending is small at close-up scale, accepted like
+`doppler_strength`); single illuminator (the inner edge, midplane); single-scatter; no
+re-emission along the shadow march. It multiplies the emission amplitude only (CKS-12
+constraint 1). If a *physical* shadow transport (geodesic shadow rays, multi-scatter,
+an anisotropic phase function) is ever wanted, STOP and extend this skill first
+(CLAUDE.md policy).
+
+**Implementation:** `bake_disk_shadow` in `taichi_renderer.py` rewritten from the radial
+column scan to the per-cell 3D ray march (same signature — it already takes `r_inner`,
+`r_outer`, `sigma_theta0`, `flare_beta`, `zeta_max`, `max_tau`, `absb_c`); no new config,
+no new field, no kernel-arg change in `render_beauty_physics`. Guards: the CKS-15
+`tests/test_disk_self_shadow.py` carries over — flag-off bit-identity, outward-steepening
+dimming, and noise-on contrast-rise are unchanged relational checks; only
+`test_bake_matches_analytic_gaussian_column` is re-derived to the 3D-ray line integral
+(the constant-`ζ` radial closed form was the CKS-15 model and is now superseded
+off-midplane). `test_gpu_regression.py` (default-off ⇒ goldens bit-identical) unchanged.
+
+---
+
 ## File locations (project conventions)
 
 ```
@@ -1454,7 +1546,7 @@ src/renderer/noise.py            ← (D2.1–D2.4, 2026-06-13) CKS-12 noise prim
 src/renderer/taichi_renderer.py  ← (D2.3+D2.4) _disk_noise_density_mult (§2 density advection) + _disk_noise_mod_fields (§3 vec4 envelopes) + _smoothstep_ti edge windows + _setup_disk_noise param buffer (_NOISE_N=43); _disk_emit_cks / render_beauty_physics gained r_isco; t_disk threaded through render_beauty_frame{,_mb}
 src/renderer/kerr_params.py      ← Formula CKS-13 config resolver (derived r_plus/r_isco/r_inner/T_0/dynamics; V2 CKS-16 derives flare_beta + theta_half_bound)
 src/renderer/taichi_renderer.py  ← (V2, CKS-16) flared σ_θ(r)=σ0·(r/r_inner)^β in the shared _disk_density_cks (skipped at β=0); sigma_theta0/flare_beta/theta_half_bound threaded through _disk_emit_cks / bake_disk_shadow / render_beauty_physics / render_beauty_frame; behind disk.volumetric.flare.enabled
-src/renderer/taichi_renderer.py  ← (V1.0) shared @ti.func _disk_density_cks (Gaussian×§3 noise×edge window — single source for the emit march AND the CKS-15 shadow bake); (V1.1, CKS-14) source-function march in render_beauty_physics behind disk.volumetric.source_function (_RTE_TAU_EPS divide guard); (V1.2, CKS-15) disk_shadow_tau field + bake_disk_shadow kernel + _sample_shadow_tau trilinear lookup behind disk.volumetric.self_shadow.enabled (_setup_disk_shadow allocates; _SHADOW_U_MAX/_SHADOW_ZETA_MAX baked extents)
+src/renderer/taichi_renderer.py  ← (V1.0) shared @ti.func _disk_density_cks (Gaussian×§3 noise×edge window — single source for the emit march AND the CKS-15 shadow bake); (V1.1, CKS-14) source-function march in render_beauty_physics behind disk.volumetric.source_function (_RTE_TAU_EPS divide guard); (V1.2, CKS-15) disk_shadow_tau field + bake_disk_shadow kernel + _sample_shadow_tau trilinear lookup behind disk.volumetric.self_shadow.enabled (_setup_disk_shadow allocates; _SHADOW_U_MAX/_SHADOW_ZETA_MAX baked extents); (V2, CKS-17) bake_disk_shadow rewritten to a 3D inner-edge-ray march (radial+vertical self-shadow; CKS-15 is its ζ=0 limit) — same field/lookup/application, same flag
 src/renderer/starmap.py          ← Formula 10
 src/renderer/taichi_renderer.py  ← Formulas 10, 13 (screen-space Jacobian, μ, star splat)
 scripts/ingest_stars.py          ← Formula 13 catalog pre-processing (HYG/ATHYG csv or BSC5 → {θ′, φ′, flux_rgb}.npy; I_base·chroma folded into flux)
@@ -1469,6 +1561,7 @@ configs/render.yaml              ← BASE params only: a, WIDTH, HEIGHT, step co
 | Version | Change |
 |---|---|
 | v1.0 | Initial release |
+| v1.25 | **Formula CKS-17 ADDED + WIRED — 3D inner-edge-ray self-shadow (radial + vertical), owner-approved 2026-06-14, V epoch vertical-self-shadow. NOT a physics revision — VISUALIZATION, same governance class as CKS-15.** Generalises the CKS-15 radial column scan to a 3D shadow ray from the inner edge **in the midplane** `(u=0, ζ=0)` to the sample `(u_s, φ, ζ_s)` at fixed φ, so an off-midplane parcel is shadowed by the dense midplane gas between it and the hot inner edge (the vertical self-shadow that V2's 3D bulk makes physical). Ray: `ζ(u)=(u/u_s)·ζ_s`, `Z(u)=r·ζ(u)·σ_θ(r)` (CKS-16 flared σ); bake accumulates `Σ_{j<i_u} absb_c·ρ_j·ds_j` with the **tilted** sample `ρ_j=ρ(u_j,φ,ζ_j)` and 3D arc length `ds_j=√((r_j·du)²+ΔZ_j²)`. **Exact CKS-15 reduction at ζ=0** (`ΔZ≡0 ⇒ ds=r·du`, `ρ` at the midplane) — the radial element keeps the `dr=r·du` convention precisely so the midplane limit is bit-exact; CKS-15 is the `ζ→0` limit, not a separate path. **Lookup + application UNCHANGED** (same `disk_shadow_tau` field, same `_sample_shadow_tau` trilinear lookup, same `emission *= exp(−strength·τ_s)` on emissivity only — κ/dτ untouched, composes with CKS-14). Only `bake_disk_shadow`'s ray geometry changed; same kernel signature, **no new config / field / flag** — still `disk.volumetric.self_shadow.enabled` (default `false` ⇒ no bake, golden frames bit-identical). Cost: `O(NU²·NPHI·NZ)` (each ζ_s tilts its own ray ⇒ no prefix sum), ~NU/2× the CKS-15 evals, parallelised over cells (owner chose the 3D ray knowing it is heavier). Straight CKS ray / single inner-edge illuminator / single-scatter / amplitude-only — never p_μ/u^μ/g/g⁴/f_PT/chroma-form; a physical transport (geodesic rays, multi-scatter) still STOPs for skill extension. Guards: `tests/test_disk_self_shadow.py` — flag-off bit-identity / outward-steepening dimming / noise-on contrast-rise carry over unchanged; `test_bake_matches_analytic_gaussian_column` re-derived to the 3D-ray line integral (the constant-ζ radial closed form was the CKS-15 model, superseded off-midplane); `test_gpu_regression.py` unchanged. Spec: `docs/specs/2026-06-14-V2-vertical-self-shadow.md`. |
 | v1.24 | **Formula CKS-16 ADDED + WIRED — flared 3D disk scale height (owner-approved 2026-06-14, V epoch V2). NOT a physics revision — GEOMETRY/TEXTURE, flagged like CKS-12 §3.** The constant angular scale height becomes radius-flared `σ_θ(r) = σ0·(r/r_inner)^β` (`σ0 ≡ theta_half_width·vertical_sigma_frac`, the r_inner width): `β=0` ⇒ today's constant-H/r slab bit-for-bit (the kernel skips `ti.pow` at `flare_beta==0`), `β>0` thickens the disk OUTWARD (H/r grows with radius); the §3 `(1+h_amp·(n_h−½))` lumpy term multiplies on top, order preserved. Genuine 3D for free: the `ridged3`/`fbm3` stack already consumes `ζ=dz_ang/σ_eff`, so a real radius-varying thickness un-squashes it — no new noise primitive (V1.5 simplex stays unwired). Single source of truth: the flare lives in the shared `@ti.func _disk_density_cks` (gained `flare_beta`, `r_inner`), so the emission march AND the CKS-15 shadow bake inherit it. Two knock-on fixes: (A) the CKS-13 resolver derives a SEPARATE `theta_half_bound ≥ band_sigma·σ_θ(r_outer)` (default `band_sigma=3.0`) as the photon trace band so the flared outer envelope is not hard-clipped, leaving `theta_half_width` as the un-mutated σ0 anchor (⇒ idempotent); (B) the Pipe-B vertical step cap is unchanged — flare only thickens outward so the thinnest slab is still the inner edge σ0 (`sigma_z=r·σ0`), verified (not assumed) by the flared-slab convergence test. Resolver also adds `flare_beta` and rejects `β<0` / `band_sigma≤0`. Gated by `disk.volumetric.flare.enabled` (default `false` ⇒ `theta_half_bound==theta_half_width`, `flare_beta==0`, golden frames bit-identical); `enabled:true,β=0` is also bit-identical. Amplitude/geometry-only — no p_μ/u^μ/g/g⁴/f_PT/chroma-form touched. New code: `kerr_params.resolve_config` CKS-16 block; `taichi_renderer.py` (`_disk_density_cks`/`_disk_emit_cks`/`bake_disk_shadow`/`render_beauty_physics`/`render_beauty_frame` signatures); `scripts/thumb.py` CPU twin. Guards: `tests/test_disk_flare.py` (7 resolver/CPU + 2 GPU) + unchanged `test_gpu_regression.py` / `test_disk_step_convergence.py`. Spec: `docs/specs/2026-06-14-V2-flared-3d-density.md`. |
 | v1.19 | **`disk.noise.dynamism` visualization dial ADDED (2026-06-13) — NOT a physics revision.** A non-physical gain on the CKS-12 §2 shear amount: `φ′_k = φ − dynamism·Ω(r)·(a_k·T)` in BOTH twins (`noise.noise_density_mult` reads `nz["dynamism"]`; GPU `_disk_noise_density_mult` reads param slot `_NI_DYNAMISM=31`, buffer grew 31→32). Motivation: in the first reset cycle the visible winding reduces to `Ω·t_disk` (T cancels), so per-frame swirl was only tunable via the *physical* `inner_lap_seconds` (which also speeds reseeding) — this dial emphasises the differential winding for a given frame without touching the reset cadence or C0-continuity (`w_k=0` at each reset regardless of gain). `dynamism=1.0` (and an omitted key) is **bit-identical** to v1.18 — guarded by `tests/test_noise.py::test_dynamism_unit_gain_is_bit_identical` + the unchanged advected agreement test; effect + GPU↔CPU agreement at gain≠1 by `test_dynamism_gain_emphasises_winding` (CPU) and `test_disk_noise.py::test_dynamism_gain_matches_cpu_and_changes_shear` (CUDA). Amplitude/φ-only, no GR/g/g⁴ touched. Same dial spirit as `disk.doppler_strength` (v1.12). |
 | v1.1 | **F6:** Corrected Carter constant to null geodesic form (−a²E², not a²(1−E²)). **F7:** Corrected lapse α to exact form using A = (r²+a²)²−a²Δsin²θ. **F9:** Documented that blackbody_rgb returns chromaticity only; clarified g⁴ is not double-counted, but will be if a physical Planck spectrum is substituted. |

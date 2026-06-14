@@ -1,18 +1,20 @@
-"""V1.2 — CKS-15 radial deep-shadow-map self-shadow guard (gpu-marked).
+"""V epoch — CKS-15/CKS-17 disk self-shadow guard (gpu-marked).
 
 Drives the production ``render_beauty_frame`` (same path as ``test_gpu_regression``)
-and checks the radial self-shadow gated by ``disk.volumetric.self_shadow.enabled``
-(SKILL.md Formula CKS-15):
+and checks the self-shadow gated by ``disk.volumetric.self_shadow.enabled`` (SKILL.md
+Formula CKS-15, generalised by CKS-17 to a 3D inner-edge ray — radial + vertical):
 
   * **flag off ⇒ bit-identical.** ``enabled: false`` renders byte-for-byte the same
     as a config with no ``self_shadow`` block at all — no bake, no lookup, so the
     legacy emission march is untouched (golden frames intact).
-  * **bake vs analytic column.** With noise OFF the density is the pure Gaussian
-    ``ρ(ζ) = exp(−½ζ²)`` (independent of u, φ), so the baked deep-shadow-map
-    ``τ_shadow[i_u, ·, i_z] = Σ_{j<i_u} absb_c · ρ(ζ) · r_j·du`` has a closed form.
-    The GPU bake must match it to f32 tolerance — pins the radial-scan quadrature,
-    the inner-edge accumulation (a cell stores τ from gas STRICTLY inward of it),
-    the ``dr = r·du`` element, and the ``max_tau`` clamp.
+  * **bake vs analytic 3D-ray integral.** With noise OFF ρ depends only on ζ
+    (``ρ(ζ)=exp(−½ζ²)``), but the CKS-17 shadow ray to a cell at ζ_s tilts toward the
+    midplane going inward (``ζ_j=(u_j/u_s)·ζ_s``), so the baked deep-shadow-map
+    integrates the denser inner gas the tilted ray crosses with the 3D arc length
+    ``ds_j=√((r_j·du)²+ΔZ_j²)`` — a closed form that reduces to the old radial column
+    only at ζ=0. The GPU bake must match it to f32 tolerance — pins the tilted-ray
+    quadrature, the inner-edge accumulation (a cell stores τ from gas STRICTLY inward
+    of it), and the ``max_tau`` clamp.
   * **self-shadow dims the disk, more outward.** Turning the lookup on only ever
     multiplies emissivity by ``e^{−strength·τ_s} ≤ 1`` and τ_s GROWS outward, so the
     rendered disk gets dimmer overall AND the outer disk is dimmed more than the
@@ -128,13 +130,19 @@ def test_self_shadow_off_is_bit_identical_to_no_block():
     assert np.array_equal(off, none)
 
 
-def test_bake_matches_analytic_gaussian_column():
-    """The GPU bake equals the closed-form Gaussian column when noise is off.
+def test_bake_matches_analytic_3d_ray_integral():
+    """The GPU bake equals the closed-form CKS-17 3D inner-edge-ray integral (noise off).
 
-    ρ(ζ)=exp(−½ζ²) is independent of (u, φ), so every φ column of the deep-shadow-
-    map is the same radial cumulative ``τ[i_u]=Σ_{j<i_u} absb_c·ρ·r_j·du`` (clamped
-    to ``max_tau``). Bake directly (the same call ``render_beauty_frame`` makes) and
-    compare ``tr.disk_shadow_tau`` to the analytic field to f32 tolerance.
+    With noise off ρ depends only on ζ (``ρ(ζ)=exp(−½ζ²)``), but CKS-17's shadow ray to
+    a cell at ``ζ_s`` TILTS toward the midplane going inward (``ζ_j=(u_j/u_s)·ζ_s``), so
+    the column is no longer the constant-ζ radial sum: it integrates the denser inner
+    gas the tilted ray actually crosses, with the 3D arc length
+    ``ds_j=√((r_j·du)²+ΔZ_j²)`` (``ΔZ_j`` from ``Z(u)=r·ζ(u)·σ0``). This reproduces the
+    bake term for term and reduces to the old radial column only at ``ζ_s=0``. Every φ
+    column is still identical (noise off, fixed-φ ray ⇒ axisymmetric). Bake directly
+    (the same call ``render_beauty_frame`` makes) and compare to f32 tolerance — this
+    pins the tilted-ray quadrature, the inner-edge accumulation (τ from gas STRICTLY
+    inward of a cell), and the ``max_tau`` clamp.
     """
     _ensure_cuda()
     cfg = copy.deepcopy(tr.load_config())
@@ -164,19 +172,33 @@ def test_bake_matches_analytic_gaussian_column():
     got = tr.disk_shadow_tau.to_numpy()  # (NU, NPHI, NZ)
     nu, nphi, nz = got.shape
 
-    # ζ is already the σ_θ-normalized vertical coord, so the analytic density is just
-    # exp(−½ζ²) — σ_θ does not enter the column quadrature (only u and ζ do).
+    # CKS-17 3D inner-edge-ray integral. β=0 here ⇒ σ_θ(r) ≡ σ0 (constant); the
+    # vertical leg ΔZ uses Z(u)=r·ζ(u)·σ0 so σ0 DOES enter (unlike the old radial
+    # column). Mirrors bake_disk_shadow term for term (same dr=r·du radial element,
+    # same endpoint ΔZ over u_c±½du, same strictly-inner accumulation + clamp).
+    sigma0 = theta_half * sigma_frac                     # β=0 (flare off)
     u_max = math.log(r_outer / r_inner)
     du = u_max / nu
     expected = np.zeros((nu, nz), dtype=np.float64)
     for iz in range(nz):
-        zeta = -zeta_max + (iz + 0.5) * (2.0 * zeta_max / nz)
-        g = math.exp(-0.5 * zeta * zeta)
-        tau = 0.0
+        zeta_s = -zeta_max + (iz + 0.5) * (2.0 * zeta_max / nz)
         for iu in range(nu):
+            u_s = (iu + 0.5) * du
+            tau = 0.0
+            for j in range(iu):                          # strictly inner cells
+                u_c = (j + 0.5) * du
+                r_c = r_inner * math.exp(u_c)
+                zeta_c = (u_c / u_s) * zeta_s            # ray tilts toward midplane inward
+                g = math.exp(-0.5 * zeta_c * zeta_c)
+                u_lo = u_c - 0.5 * du
+                u_hi = u_c + 0.5 * du
+                z_lo = r_inner * math.exp(u_lo) * ((u_lo / u_s) * zeta_s) * sigma0
+                z_hi = r_inner * math.exp(u_hi) * ((u_hi / u_s) * zeta_s) * sigma0
+                d_z = z_hi - z_lo
+                dr = r_c * du
+                ds = math.sqrt(dr * dr + d_z * d_z)       # 3D arc length
+                tau += absb_c * g * ds
             expected[iu, iz] = min(tau, max_tau)         # τ from strictly inner gas
-            r = r_inner * math.exp((iu + 0.5) * du)
-            tau += absb_c * g * (r * du)                 # dr = r·du
 
     # τ is nonzero somewhere (sanity the bake actually integrated something).
     assert expected.max() > 0.0
