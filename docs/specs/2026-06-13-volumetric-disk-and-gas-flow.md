@@ -104,13 +104,22 @@ The lighting change that turns flat haze into gas-with-holes.
      `doppler_strength` / `dynamism`; new SKILL.md **CKS-15** marked *visualization
      approximation, not a metric*. Never touches the primary geodesic / `g` / `g⁴` / `f_PT`.
 
-### V2 — 3D volumetric density (thick, flared disk)
-3. Generalize the slab: density = `vertical_envelope(z; σ(r)) · noise3D_mult`, with a
-   radius-flared scale height `σ(r) = σ0·(r/r_in)^β` and a real 3D noise multiplier
-   (full `fbm3`/`ridged3`/`worley3` with genuine `z` variation, not the 2.5D clump-only z).
-   Thin-disk = the `β→0`, small-`σ0` limit (golden-frame default preserved behind a flag).
-4. Widen the Pipe-B slab early-out + the `max_step_vfrac` cap to the new vertical extent
-   (it already keys off `theta_half_width`·`vertical_sigma_frac`; extend to `σ(r)`).
+### V2 — 3D volumetric density (thick, flared disk)  *(✅ SHIPPED 2026-06-14, default OFF)*
+3. ✅ Generalize the slab: radius-flared scale height `σ_θ(r) = σ0·(r/r_inner)^β` in the
+   shared `_disk_density_cks` (SKILL.md Formula **CKS-16**, rev v1.24). The existing
+   `ridged3`/`fbm3` stack already consumes `ζ = dz_ang/σ_eff`, so giving `σ_θ` real
+   radius-varying thickness un-squashes that `z` variation — **genuine 3D for free, no
+   new noise primitive** (V1.5 simplex stays parked for V3). Thin-disk = the `β=0` limit,
+   preserved bit-for-bit behind `disk.volumetric.flare.enabled` (default `false`).
+   Spec `docs/specs/2026-06-14-V2-flared-3d-density.md`; guard `tests/test_disk_flare.py`.
+4. ✅ θ-band + step-cap knock-ons handled: the CKS-13 resolver derives a separate
+   `theta_half_bound ≥ band_sigma·σ_θ(r_outer)` (so the flared outer envelope isn't
+   hard-clipped) while keeping `theta_half_width` as the σ0 anchor; the `max_step_vfrac`
+   cap is **unchanged** — flare thickens *outward* so the inner edge σ0 stays the thinnest
+   (worst-case) slab, *verified* by `test_disk_step_convergence.py`.
+
+   **Deferred from V2** (one-variable-at-a-time): vertical self-shadow (CKS-15 extension —
+   now unblocked by this bulk, its own commit) and a dedicated V2 volumetric golden (V5).
 
 ### V3 — Curl-noise flow advection  *(the gas-flow look; owner's ask)*
 5. **Curl noise primitive** in `noise.py` (CPU source of truth + `@ti.func` twin, same

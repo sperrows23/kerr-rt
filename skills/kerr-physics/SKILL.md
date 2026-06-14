@@ -14,6 +14,7 @@ Load this skill whenever the task involves:
 - Derived config parameters — r_plus/r_isco/r_inner/T_0/orbital periods from base spin etc. (Formula CKS-13)
 - Volumetric disk radiative transfer / source-function march (Formula CKS-14)
 - Disk radial self-shadow / deep-shadow-map (Formula CKS-15 — VISUALIZATION)
+- Flared 3D disk scale height σ_θ(r) (Formula CKS-16 — GEOMETRY/TEXTURE)
 - Any formula involving `r_isco`, `E_I`, `L_I`, `u^t`, `u^r`, `u^phi`, `g-factor`, `Carter Q`
 
 ---
@@ -1195,6 +1196,29 @@ precomputed LUT (Formula CKS-11, `disk_flux.build_flux_lut`).
 idempotent on re-resolve. `black_hole.r_isco` / `black_hole.r_plus` are ALWAYS
 overwritten and must not be stored in the YAML.
 
+**Addendum (V2, 2026-06-14) — flared θ-band coverage `theta_half_bound`.** When the
+CKS-16 flare is on, the disk envelope is thicker at `r_outer`, so the photon trace
+band must widen to avoid hard-clipping the outer Gaussian. The resolver derives a
+SEPARATE key `theta_half_bound` (the *bounding* half-angle the kernels test
+`|θ−π/2|` against) and `flare_beta`, leaving the base `theta_half_width` untouched:
+
+```
+σ0           = theta_half_width · vertical_sigma_frac      # r=r_inner angular width
+flare_beta   = β  if flare.enabled else 0                  # CKS-16 exponent
+theta_half_bound = max(theta_half_width,                   # ≥ band_sigma·σ_θ(r_outer)
+                       band_sigma · σ0 · (r_outer/r_inner)^β)   if (enabled and β>0)
+                 = theta_half_width                            otherwise
+```
+
+`band_sigma` (`disk.volumetric.flare.band_sigma`, default 3.0 ≈ ±3σ) is the coverage
+factor. **`theta_half_width` is the σ0 anchor and is NEVER mutated** — deriving a
+separate `theta_half_bound` is what keeps `σ0` pinned to the base and makes the
+resolver idempotent for free (re-resolving recomputes the same bound). `flare.enabled
+false` OR `β=0` ⇒ `theta_half_bound == theta_half_width` and `flare_beta == 0`
+(bit-identical, no widening). Validation: `β < 0` and `band_sigma ≤ 0` are rejected
+(disks flare OUTWARD; the band factor is positive). Patch BOTH loaders
+(`taichi_renderer`, `thumb.py`) per the dual-loader rule.
+
 ---
 
 ## Formula CKS-14 — Volumetric RTE source-function march (owner-approved 2026-06-13; NO new GR)
@@ -1336,6 +1360,90 @@ unchanged `test_gpu_regression.py` (flag-off ⇒ goldens bit-identical).
 
 ---
 
+## Formula CKS-16 — Flared disk scale height σ_θ(r) (owner-approved 2026-06-14; GEOMETRY/TEXTURE, NOT GR)
+
+> **Status:** a GEOMETRY/TEXTURE shape, NOT a metric, geodesic, or emission-physics
+> change — it sets *where the gas is*, exactly like the CKS-12 §3 scale-height term it
+> extends. It modulates the density **envelope** only and never touches `p_μ`, `u^μ`,
+> `g`, `g⁴`, `f_PT`, or the chromaticity form. Gated behind `disk.volumetric.flare.
+> enabled` (default `false` ⇒ constant-σ slab, golden frames bit-identical). Spec:
+> `docs/specs/2026-06-14-V2-flared-3d-density.md`. If review finds this implies a new
+> GR derivation, STOP and ask the human (CLAUDE.md policy).
+
+The V1 disk uses a **constant** angular scale height `σ_θ = theta_half_width ·
+vertical_sigma_frac`, which squashes the noise stack's `ζ = Δθ/σ_θ` coordinate into a
+thin sheet. CKS-16 gives the slab radius-varying vertical bulk:
+
+```
+σ_θ(r) = σ0 · (r / r_inner)^β          σ0 ≡ theta_half_width · vertical_sigma_frac
+```
+
+- `β = 0` ⇒ `σ_θ(r) ≡ σ0` ⇒ **exactly the V1 constant slab, bit-for-bit** (the
+  implementation skips `ti.pow` when `flare_beta == 0`, so it is the same instruction
+  stream, not just numerically close).
+- `σ0` is the `r = r_inner` value — the **inner edge keeps today's thickness**; `β > 0`
+  thickens the disk **outward** (astrophysical flare, H/r growing with radius). `β < 0`
+  is rejected at config-resolve (disks flare outward).
+- **Why the angular envelope is the right object to flare:** near the equator
+  `z = r cosθ ≈ −r·dz_ang`, so a *constant* angular `σ_θ` already means a *constant
+  H/r* (physical height ∝ r) disk; `β > 0` makes H/r itself grow outward.
+
+**Composition with CKS-12 §3 (order preserved).** The §3 lumpy-scale-height envelope
+multiplies on top of the flared base — `σ_θ(r)` replaces the constant `σ0` as the base
+that the `(1 + h_amp·(n_h−½))` factor perturbs:
+
+```
+σ_eff = σ_θ(r) · (1 + h_amp·(n_h − ½))          # §3 constraint 4, unchanged form
+```
+
+The Gaussian density `exp(−½(dz_ang/σ_eff)²)` and the noise coordinate `ζ = dz_ang/σ_eff`
+both use `σ_eff`, so **genuine 3D falls out for free**: the existing `ridged3`/`fbm3`
+stack already consumes `ζ`, and a real radius-varying thickness simply un-squashes it.
+No new noise primitive is added (the V1.5 simplex basis stays unwired, reserved for V3
+curl-flow).
+
+**Single source of truth.** The flare lives once in the shared `@ti.func
+_disk_density_cks` (signature gained `flare_beta`, `r_inner`); the emission march
+(`_disk_emit_cks`) and the CKS-15 shadow bake (`bake_disk_shadow`) both call it, so they
+inherit the same `σ_θ(r)` automatically — the V1.0 "extract shared density" refactor is
+what makes this a one-point change.
+
+**Two knock-on fixes.**
+
+1. **θ bounding band** — a flared envelope is thicker at `r_outer` and would be
+   hard-clipped by the V1 `theta_half_width` cutoff. Handled by the CKS-13 resolver
+   addendum above: a separate derived `theta_half_bound ≥ band_sigma·σ_θ(r_outer)` is
+   what the kernels test `|θ−π/2|` against, while `theta_half_width` stays the σ0 anchor.
+2. **Pipe-B vertical step cap** (`max_step_vfrac`) — flare only thickens *outward*, so
+   the thinnest slab is the inner edge `σ0`, today's worst case, which the existing cap
+   already sizes for (`sigma_z = r·σ0`). **No cap change**; verified (not assumed) by the
+   flared-slab convergence test.
+
+**Implementation:** `flare_beta` + `theta_half_bound` + `sigma_theta0` threaded through
+`render_beauty_physics` / `render_beauty_frame` (host computes `σ0` and reads the derived
+keys); `_disk_density_cks` applies `σ_eff = σ_θ·ti.pow(r/r_inner, flare_beta)` (skipped at
+β=0); bound checks use `theta_half_bound`, the step cap uses `σ0`. CPU twin in
+`scripts/thumb.py::_march_disk`. Gated by `disk.volumetric.flare.enabled` (default
+`false`). Guards: `tests/test_disk_flare.py` (resolver no-op/widen/monotone/idempotent/
+validation + GPU flag-off bit-identity vs the no-flare march + a β>0 disk that is
+NaN-free, differs, and thickens — a *wider emitting silhouette*, NOT higher total
+luminance: see the note below) + the unchanged `test_gpu_regression.py` /
+`test_disk_step_convergence.py` (default-off ⇒ goldens bit-identical).
+
+**Flare is geometry, not a brightness boost (verified 2026-06-14).** The GPU test
+measured a flared disk reading marginally *dimmer* in total (~1.6% on the inclined
+showcase view), not brighter. This is physically correct and worth recording: the hot
+inner edge — where peak emission lives — sits at `r_inner`, whose σ is the *anchored*
+σ0 and **does not change** under flare; flare only adds **cold** outer gas at larger
+`|z|`. Under the absorbing march (`transm *= e^{−dτ}`) that extra bulk self-absorbs the
+bright inner edge slightly more than the dim cold gas it contributes. So the honest,
+inclination-robust signature of the added vertical bulk is a **larger emitting
+silhouette** (gas spreading into previously-dark off-plane pixels), which is what the
+test asserts — not integrated luminance. (Trust-the-math: the look emerges from the
+correct envelope + absorption, it is not tuned for brightness.)
+
+---
+
 ## File locations (project conventions)
 
 ```
@@ -1344,7 +1452,8 @@ src/renderer/geodesic.py         ← Formulas 1, 6, 7
 src/renderer/disk.py             ← Formulas 2, 3, 4, 5, 8, 9
 src/renderer/noise.py            ← (D2.1–D2.4, 2026-06-13) CKS-12 noise primitives + noise_density_mult stack (§2 shear advection) + noise_modulation_fields (§3 T/edge/height envelopes) — CPU source of truth + @ti.func twins; (V1.5) §3.6 isotropic simplex basis snoise2/3 + sfbm2/3 (Perlin/Gustavson; non-periodic; for the V3 curl potential, NOT wired into the φ-periodic disk stack)
 src/renderer/taichi_renderer.py  ← (D2.3+D2.4) _disk_noise_density_mult (§2 density advection) + _disk_noise_mod_fields (§3 vec4 envelopes) + _smoothstep_ti edge windows + _setup_disk_noise param buffer (_NOISE_N=43); _disk_emit_cks / render_beauty_physics gained r_isco; t_disk threaded through render_beauty_frame{,_mb}
-src/renderer/kerr_params.py      ← Formula CKS-13 config resolver (derived r_plus/r_isco/r_inner/T_0/dynamics)
+src/renderer/kerr_params.py      ← Formula CKS-13 config resolver (derived r_plus/r_isco/r_inner/T_0/dynamics; V2 CKS-16 derives flare_beta + theta_half_bound)
+src/renderer/taichi_renderer.py  ← (V2, CKS-16) flared σ_θ(r)=σ0·(r/r_inner)^β in the shared _disk_density_cks (skipped at β=0); sigma_theta0/flare_beta/theta_half_bound threaded through _disk_emit_cks / bake_disk_shadow / render_beauty_physics / render_beauty_frame; behind disk.volumetric.flare.enabled
 src/renderer/taichi_renderer.py  ← (V1.0) shared @ti.func _disk_density_cks (Gaussian×§3 noise×edge window — single source for the emit march AND the CKS-15 shadow bake); (V1.1, CKS-14) source-function march in render_beauty_physics behind disk.volumetric.source_function (_RTE_TAU_EPS divide guard); (V1.2, CKS-15) disk_shadow_tau field + bake_disk_shadow kernel + _sample_shadow_tau trilinear lookup behind disk.volumetric.self_shadow.enabled (_setup_disk_shadow allocates; _SHADOW_U_MAX/_SHADOW_ZETA_MAX baked extents)
 src/renderer/starmap.py          ← Formula 10
 src/renderer/taichi_renderer.py  ← Formulas 10, 13 (screen-space Jacobian, μ, star splat)
@@ -1360,6 +1469,7 @@ configs/render.yaml              ← BASE params only: a, WIDTH, HEIGHT, step co
 | Version | Change |
 |---|---|
 | v1.0 | Initial release |
+| v1.24 | **Formula CKS-16 ADDED + WIRED — flared 3D disk scale height (owner-approved 2026-06-14, V epoch V2). NOT a physics revision — GEOMETRY/TEXTURE, flagged like CKS-12 §3.** The constant angular scale height becomes radius-flared `σ_θ(r) = σ0·(r/r_inner)^β` (`σ0 ≡ theta_half_width·vertical_sigma_frac`, the r_inner width): `β=0` ⇒ today's constant-H/r slab bit-for-bit (the kernel skips `ti.pow` at `flare_beta==0`), `β>0` thickens the disk OUTWARD (H/r grows with radius); the §3 `(1+h_amp·(n_h−½))` lumpy term multiplies on top, order preserved. Genuine 3D for free: the `ridged3`/`fbm3` stack already consumes `ζ=dz_ang/σ_eff`, so a real radius-varying thickness un-squashes it — no new noise primitive (V1.5 simplex stays unwired). Single source of truth: the flare lives in the shared `@ti.func _disk_density_cks` (gained `flare_beta`, `r_inner`), so the emission march AND the CKS-15 shadow bake inherit it. Two knock-on fixes: (A) the CKS-13 resolver derives a SEPARATE `theta_half_bound ≥ band_sigma·σ_θ(r_outer)` (default `band_sigma=3.0`) as the photon trace band so the flared outer envelope is not hard-clipped, leaving `theta_half_width` as the un-mutated σ0 anchor (⇒ idempotent); (B) the Pipe-B vertical step cap is unchanged — flare only thickens outward so the thinnest slab is still the inner edge σ0 (`sigma_z=r·σ0`), verified (not assumed) by the flared-slab convergence test. Resolver also adds `flare_beta` and rejects `β<0` / `band_sigma≤0`. Gated by `disk.volumetric.flare.enabled` (default `false` ⇒ `theta_half_bound==theta_half_width`, `flare_beta==0`, golden frames bit-identical); `enabled:true,β=0` is also bit-identical. Amplitude/geometry-only — no p_μ/u^μ/g/g⁴/f_PT/chroma-form touched. New code: `kerr_params.resolve_config` CKS-16 block; `taichi_renderer.py` (`_disk_density_cks`/`_disk_emit_cks`/`bake_disk_shadow`/`render_beauty_physics`/`render_beauty_frame` signatures); `scripts/thumb.py` CPU twin. Guards: `tests/test_disk_flare.py` (7 resolver/CPU + 2 GPU) + unchanged `test_gpu_regression.py` / `test_disk_step_convergence.py`. Spec: `docs/specs/2026-06-14-V2-flared-3d-density.md`. |
 | v1.19 | **`disk.noise.dynamism` visualization dial ADDED (2026-06-13) — NOT a physics revision.** A non-physical gain on the CKS-12 §2 shear amount: `φ′_k = φ − dynamism·Ω(r)·(a_k·T)` in BOTH twins (`noise.noise_density_mult` reads `nz["dynamism"]`; GPU `_disk_noise_density_mult` reads param slot `_NI_DYNAMISM=31`, buffer grew 31→32). Motivation: in the first reset cycle the visible winding reduces to `Ω·t_disk` (T cancels), so per-frame swirl was only tunable via the *physical* `inner_lap_seconds` (which also speeds reseeding) — this dial emphasises the differential winding for a given frame without touching the reset cadence or C0-continuity (`w_k=0` at each reset regardless of gain). `dynamism=1.0` (and an omitted key) is **bit-identical** to v1.18 — guarded by `tests/test_noise.py::test_dynamism_unit_gain_is_bit_identical` + the unchanged advected agreement test; effect + GPU↔CPU agreement at gain≠1 by `test_dynamism_gain_emphasises_winding` (CPU) and `test_disk_noise.py::test_dynamism_gain_matches_cpu_and_changes_shear` (CUDA). Amplitude/φ-only, no GR/g/g⁴ touched. Same dial spirit as `disk.doppler_strength` (v1.12). |
 | v1.1 | **F6:** Corrected Carter constant to null geodesic form (−a²E², not a²(1−E²)). **F7:** Corrected lapse α to exact form using A = (r²+a²)²−a²Δsin²θ. **F9:** Documented that blackbody_rgb returns chromaticity only; clarified g⁴ is not double-counted, but will be if a physical Planck spectrum is substituted. |
 | v1.2 | **F6:** Removed the leftover massive-particle `μ²r²` term from the radial potential `R(r)`; the null (μ=0) form drops it. The previous form gave `g^{μν}p_μp_ν = −r²/Σ`, breaking the null-condition conservation test. |

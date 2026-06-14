@@ -145,6 +145,41 @@ def resolve_config(cfg: dict) -> dict:
     if r_outer <= r_inner:
         raise ValueError(f"disk.r_outer ({r_outer}) must exceed disk.r_inner ({r_inner})")
 
+    # CKS-16 — flared scale height + θ-band coverage (V2 volumetric density).
+    # The vertical Gaussian envelope flares as σ_θ(r) = σ0·(r/r_inner)^β with
+    # σ0 = theta_half_width·vertical_sigma_frac (the inner-edge width). A flared
+    # disk is thicker at r_outer, so the bounding half-angle must cover
+    # ≥ band_sigma·σ_θ(r_outer) or the hard θ cutoff clips the outer disk. Two
+    # derived keys, both ALWAYS recomputed from BASE keys (idempotent, no feedback
+    # — theta_half_width itself is never mutated, so σ0 stays anchored to the base):
+    #   - flare_beta       : β when flare is enabled, else 0.0 (renderer reads this)
+    #   - theta_half_bound : the widened bounding half-angle (= theta_half_width
+    #                        when flare off / β=0 ⇒ bit-identical to pre-V2)
+    # Geometry/texture only (NOT GR) — same governance as the CKS-12 §3 σ_θ line it
+    # extends. Skipped entirely if the slab keys are absent (minimal test configs).
+    if "theta_half_width" in d and "vertical_sigma_frac" in d:
+        theta_half = float(d["theta_half_width"])
+        vsf = float(d["vertical_sigma_frac"])
+        flare = ((d.get("volumetric", {}) or {}).get("flare", {}) or {})
+        flare_on = bool(flare.get("enabled", False))
+        beta = float(flare.get("beta", 0.0))
+        band_sigma = float(flare.get("band_sigma", 3.0))
+        if beta < 0.0:
+            raise ValueError(
+                f"disk.volumetric.flare.beta must be ≥ 0 (disks flare OUTWARD), got {beta}"
+            )
+        if band_sigma <= 0.0:
+            raise ValueError(
+                f"disk.volumetric.flare.band_sigma must be > 0, got {band_sigma}"
+            )
+        d["flare_beta"] = beta if flare_on else 0.0
+        if flare_on and beta > 0.0:
+            sigma0 = theta_half * vsf
+            sigma_outer = sigma0 * (r_outer / r_inner) ** beta
+            d["theta_half_bound"] = max(theta_half, band_sigma * sigma_outer)
+        else:
+            d["theta_half_bound"] = theta_half
+
     if "T_0" not in d:
         t_peak = float(d["target_peak_temperature"])
         if t_peak <= 0.0:

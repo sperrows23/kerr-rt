@@ -1,6 +1,7 @@
 # V2 — Flared 3D Volumetric Density — Design Spec
 
-**Status:** APPROVED 2026-06-14 (owner). Implementation pending.
+**Status:** ✅ IMPLEMENTED 2026-06-14 (default OFF — bit-identical to V1). SKILL.md
+Formula CKS-16 + CKS-13 θ-band addendum (rev v1.24); guard `tests/test_disk_flare.py`.
 **Epoch:** V (volumetric). Builds on V1 (CKS-14 source function + CKS-15 radial
 self-shadow, shipped fabae31) and the D2 noise stack (CKS-12).
 **Parent plan:** `2026-06-13-volumetric-disk-and-gas-flow.md` §3 "V2 — 3D

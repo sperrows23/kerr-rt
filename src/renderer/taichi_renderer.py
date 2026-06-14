@@ -1166,7 +1166,7 @@ def _disk_noise_mod_fields(u, phi, t_disk, omega, seed):
 
 @ti.func
 def _disk_density_cks(
-    x, y, r, dz_ang, sigma_theta, r_inner, r_outer, r_isco,
+    x, y, r, dz_ang, sigma_theta, flare_beta, r_inner, r_outer, r_isco,
     noise_enabled, noise_seed, t_disk, a,
 ):
     """Volumetric mass density ρ at a CKS equatorial-slab point (CKS-12 §3 stack).
@@ -1183,10 +1183,19 @@ def _disk_density_cks(
       downstream, BEFORE the g shift — constraint 2). 1.0 unless §3 modulation
       (``_NI_MOD_EN``) is on, so the non-modulated path is unaffected.
 
-    Caller supplies ``sigma_theta = theta_half · sigma_frac`` and the slab
+    Caller supplies ``sigma_theta = σ0 = theta_half_width · sigma_frac`` (the BASE
+    inner-edge width, NOT the widened bounding angle) and the slab
     ``dz_ang = θ − π/2`` so the bake can reuse them off its grid coordinates.
+
+    ``flare_beta`` (CKS-16, V2): radial flare of the scale height,
+    ``σ_θ(r) = σ0·(r/r_inner)^β``. ``β = 0`` skips the ``ti.pow`` ⇒ ``σ_eff ≡ σ0``,
+    bit-identical to the pre-V2 constant slab (the resolver sets it to 0 unless
+    ``disk.volumetric.flare.enabled``). ``β > 0`` thickens the disk outward.
     """
-    density = ti.exp(-0.5 * (dz_ang / sigma_theta) ** 2)
+    sigma_eff = sigma_theta
+    if flare_beta != 0.0:
+        sigma_eff = sigma_theta * ti.pow(r / r_inner, flare_beta)
+    density = ti.exp(-0.5 * (dz_ang / sigma_eff) ** 2)
     temp_factor = 1.0
     # D2.2 procedural turbulence (SKILL.md CKS-12 §3): multiply the Gaussian
     # density by the noise field (amplitude only — feeds BOTH emission and
@@ -1195,7 +1204,7 @@ def _disk_density_cks(
     if noise_enabled == 1:
         u_n = ti.log(r / r_inner)
         phi_n = ti.atan2(y, x)
-        zeta_n = dz_ang / sigma_theta
+        zeta_n = dz_ang / sigma_eff
         # Ω(r) = 1/(r^{3/2}+a) — Formula 3 (prograde), the shear-advection rate
         # (CKS-12 §2). d/dt atan2(y,x) = Ω co-moves with the CKS-8 gas.
         omega = 1.0 / (r * ti.sqrt(r) + a)
@@ -1211,7 +1220,7 @@ def _disk_density_cks(
             # (the worst-case-thin σ is what the trace step cap guards,
             # constraint 4). n_h = mf[3].
             h_amp = disk_noise_params[_NI_MOD_HEIGHT_AMP]
-            sigma_m = sigma_theta * (1.0 + h_amp * (mf[3] - 0.5))
+            sigma_m = sigma_eff * (1.0 + h_amp * (mf[3] - 0.5))
             gauss = ti.exp(-0.5 * (dz_ang / sigma_m) ** 2)
             # Ragged edges: smoothstep windows replace the hard radial cutoffs.
             # r_in_eff ≥ r_isco (zero-torque BC, constraint 3).
@@ -1276,8 +1285,8 @@ def bake_disk_shadow(
     r_inner: float,
     r_outer: float,
     r_isco: float,
-    theta_half: float,
-    sigma_frac: float,
+    sigma_theta0: float,
+    flare_beta: float,
     zeta_max: float,
     max_tau: float,
     absb_c: float,
@@ -1308,13 +1317,11 @@ def bake_disk_shadow(
     NZ = disk_shadow_tau.shape[2]
     u_max = ti.log(r_outer / r_inner)
     du = u_max / NU
-    sigma_theta = theta_half * sigma_frac
     for i_phi, i_z in ti.ndrange(NPHI, NZ):
         phi = -math.pi + (i_phi + 0.5) * (_TWO_PI / NPHI)
         zeta = -zeta_max + (i_z + 0.5) * (2.0 * zeta_max / NZ)
         x = ti.cos(phi)
         y = ti.sin(phi)
-        dz_ang = zeta * sigma_theta
         tau = 0.0
         for i_u in range(NU):
             # Store τ from STRICTLY inner gas (running sum before this cell's own
@@ -1323,8 +1330,15 @@ def bake_disk_shadow(
             disk_shadow_tau[i_u, i_phi, i_z] = ti.min(tau, max_tau)
             u = (i_u + 0.5) * du
             r = r_inner * ti.exp(u)
+            # CKS-16: the grid ζ is in LOCAL (flared) scale-height units, so the
+            # angular offset is ζ·σ_θ(r) recomputed per radius. β=0 ⇒ σ_eff ≡ σ0,
+            # dz_ang ≡ ζ·σ0 (constant) ⇒ bit-identical to the pre-V2 outer-loop form.
+            sigma_eff = sigma_theta0
+            if flare_beta != 0.0:
+                sigma_eff = sigma_theta0 * ti.pow(r / r_inner, flare_beta)
+            dz_ang = zeta * sigma_eff
             dens = _disk_density_cks(
-                x, y, r, dz_ang, sigma_theta, r_inner, r_outer, r_isco,
+                x, y, r, dz_ang, sigma_theta0, flare_beta, r_inner, r_outer, r_isco,
                 noise_enabled, noise_seed, t_disk, a,
             )[0]
             tau += absb_c * dens * (r * du)
@@ -1332,7 +1346,8 @@ def bake_disk_shadow(
 
 @ti.func
 def _disk_emit_cks(
-    x, y, z, p_cov, a, r_inner, r_outer, r_isco, theta_half, sigma_frac, T_0, emis_c, absb_c, ds,
+    x, y, z, p_cov, a, r_inner, r_outer, r_isco, theta_half_bound, sigma_theta0, flare_beta,
+    T_0, emis_c, absb_c, ds,
     disk_model, doppler_strength, noise_enabled, noise_seed, t_disk, self_shadow, shadow_strength,
 ):
     """One volumetric disk sample at a CKS geodesic point → (emission RGB, dτ).
@@ -1374,7 +1389,7 @@ def _disk_emit_cks(
     cos_th = ti.min(ti.max(z / r, -1.0), 1.0)
     th = ti.acos(cos_th)
     dz_ang = th - 0.5 * math.pi
-    if (ti.abs(dz_ang) < theta_half) and (r >= r_inner) and (r <= r_outer):
+    if (ti.abs(dz_ang) < theta_half_bound) and (r >= r_inner) and (r <= r_outer):
         u4 = _gas_four_velocity_cks(x, y, z, a)
         E = -p_cov[0]
         denom = p_cov[0] * u4[0] + p_cov[1] * u4[1] + p_cov[2] * u4[2] + p_cov[3] * u4[3]
@@ -1386,14 +1401,20 @@ def _disk_emit_cks(
                 g_eff = g
                 if doppler_strength != 1.0:
                     g_eff = ti.pow(g, doppler_strength)
-                sigma_theta = theta_half * sigma_frac
+                # CKS-16 flared scale height: σ_eff = σ0·(r/r_inner)^β (β=0 ⇒ σ0,
+                # bit-identical). σ_eff is only needed locally for the CKS-15 shadow
+                # ζ lookup below; the density func recomputes the same σ_eff from
+                # (σ0, β) internally, so the Gaussian/noise stack stays single-source.
+                sigma_eff = sigma_theta0
+                if flare_beta != 0.0:
+                    sigma_eff = sigma_theta0 * ti.pow(r / r_inner, flare_beta)
                 # Density (Gaussian × §3 noise × ragged-edge window) and the §3
                 # temperature lump come from the shared CKS-12 stack so the
                 # emission march and the CKS-15 shadow bake can't drift. The
                 # noise/modulation gating lives inside; enabled==0 ⇒ bare
                 # Gaussian (legacy bit-identical).
                 dens_tf = _disk_density_cks(
-                    x, y, r, dz_ang, sigma_theta, r_inner, r_outer, r_isco,
+                    x, y, r, dz_ang, sigma_theta0, flare_beta, r_inner, r_outer, r_isco,
                     noise_enabled, noise_seed, t_disk, a,
                 )
                 density = dens_tf[0]
@@ -1416,7 +1437,7 @@ def _disk_emit_cks(
                 if self_shadow == 1:
                     u_n = ti.log(r / r_inner)
                     phi_n = ti.atan2(y, x)
-                    zeta_n = dz_ang / sigma_theta
+                    zeta_n = dz_ang / sigma_eff
                     tau_s = _sample_shadow_tau(u_n, phi_n, zeta_n)
                     shadow_atten = ti.exp(-shadow_strength * tau_s)
 
@@ -1584,9 +1605,10 @@ def render_beauty_physics(
     r_inner: float,
     r_outer: float,
     r_isco: float,
-    theta_half: float,
+    theta_half_bound: float,
     bound_sin_half: float,
-    sigma_frac: float,
+    sigma_theta0: float,
+    flare_beta: float,
     T_0: float,
     emis_c: float,
     absb_c: float,
@@ -1702,11 +1724,14 @@ def render_beauty_physics(
                     # thin emitting layer — under-sampling the Gaussian density
                     # (Formula 9) into a moiré band on the disk face. Limit the per-
                     # step VERTICAL displacement |dz/dλ|·h to a fraction of the local
-                    # scale height σ_z = r·θ_half·σ_frac so the slab is resolved. Only
+                    # scale height σ_z = r·σ0 so the slab is resolved. Only
                     # bites for steep crossings (large |dz/dλ|); near-in-plane / edge-
                     # on grazers (dz/dλ→0) keep the full radial step, so the cap adds
                     # no steps there and cannot push those rays into the max_steps cap.
-                    sigma_z = r * theta_half * sigma_frac
+                    # CKS-16: σ0 (NOT the flared σ_θ(r)) is intentional — flare only
+                    # THICKENS the slab outward, so the inner edge σ0 is the thinnest
+                    # (worst) case; capping on it is conservative at every radius.
+                    sigma_z = r * sigma_theta0
                     # §3 lumpy scale height: the cap must resolve the WORST-CASE (thinnest)
                     # modulated σ, σ_z·(1 − h_amp/2), or the face-on moiré returns where a
                     # lump thins below the step (CKS-12 constraint 4). h_amp=0 ⇒ unchanged.
@@ -1730,8 +1755,9 @@ def render_beauty_physics(
                         r_inner,
                         r_outer,
                         r_isco,
-                        theta_half,
-                        sigma_frac,
+                        theta_half_bound,
+                        sigma_theta0,
+                        flare_beta,
                         T_0,
                         emis_c,
                         absb_c,
@@ -2240,10 +2266,17 @@ def render_beauty_frame(
     adaptive_floor = float(rcfg["adaptive_step_floor"])
     depth_infinity = float(rcfg["depth_infinity"])
     projection_mode = 1 if str(rcfg.get("projection_mode", "perspective")) == "equirect" else 0
-    # Disk-slab |cosθ| early-out bound, DERIVED from its source parameter (single
-    # source of truth): |θ−π/2| < θ_half ⇔ |cosθ| < sin(θ_half), exactly the slab
-    # test re-checked inside ``_disk_emit_cks``.
-    bound_sin_half = math.sin(float(d["theta_half_width"]))
+    # CKS-16 (V2) flared scale height. σ0 = theta_half_width·vertical_sigma_frac is
+    # the BASE inner-edge width (anchor); ``flare_beta`` and the widened bounding
+    # half-angle ``theta_half_bound`` are CKS-13-derived (resolve_config) — both fall
+    # back to the no-flare values so an unresolved/legacy config is bit-identical.
+    sigma_theta0 = float(d["theta_half_width"]) * float(d["vertical_sigma_frac"])
+    flare_beta = float(d.get("flare_beta", 0.0))
+    theta_half_bound = float(d.get("theta_half_bound", d["theta_half_width"]))
+    # Disk-slab |cosθ| early-out bound, DERIVED from the (possibly flare-widened)
+    # bounding half-angle: |θ−π/2| < θ_bound ⇔ |cosθ| < sin(θ_bound), exactly the
+    # slab test re-checked inside ``_disk_emit_cks``.
+    bound_sin_half = math.sin(theta_half_bound)
     # D1 disk radial-profile selector: 0 = simple T₀·(6/r)^0.75 (Decision-B default,
     # golden frames); 1 = Page-Thorne f_PT(r) LUT (SKILL.md CKS-11). The _PT_LUT_*
     # index scalars are baked at JIT from _setup_disk_flux (always run by
@@ -2291,8 +2324,8 @@ def render_beauty_frame(
             float(d["r_inner"]),
             float(d["r_outer"]),
             r_isco_cfg,
-            float(d["theta_half_width"]),
-            float(d["vertical_sigma_frac"]),
+            sigma_theta0,
+            flare_beta,
             float(ss.get("zeta_max", 3.0)),
             float(ss.get("max_tau", 8.0)),
             float(d["absorption_coeff"]),
@@ -2336,9 +2369,10 @@ def render_beauty_frame(
         # r_isco (CKS-13-derived) — the zero-torque floor the §3 ragged inner edge
         # may recede to but never below (constraint 3). Falls back to r_inner.
         float(cfg.get("black_hole", {}).get("r_isco", d["r_inner"])),
-        float(d["theta_half_width"]),
+        theta_half_bound,
         bound_sin_half,
-        float(d["vertical_sigma_frac"]),
+        sigma_theta0,
+        flare_beta,
         float(d["T_0"]),
         float(d["emission_coeff"]),
         float(d["absorption_coeff"]),

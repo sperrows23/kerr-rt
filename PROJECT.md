@@ -703,6 +703,22 @@ work below predates and is **superseded by** the CKS migration above):
   `tests/test_disk_self_shadow.py` (4, incl. the GPU bake vs an analytic Gaussian column)
   green; `test_gpu_regression.py` unchanged. (V1.3 showcase flags / V1.4 golden + this
   §-rewrite / V1.5 Simplex follow — spec `docs/specs/2026-06-13-V1-self-shadow-source-function.md`.)
+- **V epoch — V2 flared 3D density (2026-06-14, Formula CKS-16):** the constant angular
+  scale height becomes radius-flared `σ_θ(r)=σ0·(r/r_inner)^β` (`σ0=theta_half_width·
+  vertical_sigma_frac`), giving the slab real vertical bulk so the `ridged3`/`fbm3` stack's
+  `ζ=dz_ang/σ_eff` coordinate stops being squashed — **genuine 3D with no new noise
+  primitive**. Lives once in the shared `_disk_density_cks` (so the emit march AND the
+  CKS-15 shadow bake inherit it); `β=0` skips `ti.pow` ⇒ the V1 slab bit-for-bit. Two
+  knock-on fixes: (A) the CKS-13 resolver derives a separate `theta_half_bound ≥
+  band_sigma·σ_θ(r_outer)` (default 3σ) so the flared outer envelope isn't hard-clipped,
+  with `theta_half_width` left as the un-mutated σ0 anchor (idempotent); (B) the Pipe-B
+  vertical step cap is unchanged — flare thickens *outward* so the inner edge σ0 is still
+  the worst case, *verified* by the convergence test. Gated by `disk.volumetric.flare`
+  (default `enabled:false`; `enabled:true,β=0` also bit-identical) ⇒ all V1/D2 goldens stay
+  green. GEOMETRY/TEXTURE only — no `p_μ`/`u^μ`/`g`/`g⁴`/`f_PT` touched. *Verified:*
+  `tests/test_disk_flare.py` (7 resolver/CPU + 2 GPU) green; `test_gpu_regression.py` /
+  `test_disk_step_convergence.py` unchanged. Spec
+  `docs/specs/2026-06-14-V2-flared-3d-density.md`; SKILL.md rev v1.24.
 
 *Note — `render_pipe_a`* (the 256² dev LOD kernel for `_gate2_lod_test`) was
 migrated to `[y,u,…]` but **intentionally keeps its offset ray** as the offset-ray
@@ -728,6 +744,7 @@ re-derive. **`disk.py`, `geodesic.py`/`metric.py` CPU references, and any
 | **T3** | Moving-camera observer model (camera peculiar velocity, not just ZAMO) | **Roadmap, gated** — needs a new `SKILL.md` tetrad-boost formula approved (human review) before any code; high risk if rushed (sign/normalization) | Physics (gated) |
 | **D1** | Decision-B physical disk: Page-Thorne flux profile (replaces simple `(6/r)^0.75`) | ✅ **Resolved (2026-06-12)** — wired behind `disk.temperature_model: page_thorne` (default `simple`); LUT in `src/renderer/disk_flux.py`; GPU guard in `test_gpu_regression.py`. Closed form is `SKILL.md` Formula **CKS-11** (numerically reproduces the conservation-law flux integral; guard `tests/test_disk_flux.py`; SKILL.md rev v1.11). The "wire the LUT" path: CPU-precompute `f_PT(r)` shape LUT → `T_eff=T₀·f_PT^{1/4}`, amplitude ×f_PT → sampled in the disk kernel **behind the config flag** (`T₀` stays the amplitude knob; g⁴-not-g⁸ respected, Formula 9 / CKS-11 Piece 3). Default disk stays Decision-B-simple, so golden frames / pinned GPU regression are unchanged. | Physics |
 | **D2** | Disk procedural turbulence: layered noise (Interstellar-base fBm + MRI clump/tear ridged-MF/Voronoi accents) with full Keplerian shear advection, modulating density, temperature, edges, and scale height | **D2.1–D2.4 SHIPPED 2026-06-13; noise ON by default.** Spec: `docs/specs/2026-06-13-disk-noise-turbulence.md`; math: SKILL.md Formula **CKS-12** (rev v1.20; Ω = Formula 3 verbatim, all noise amplitude-only). Wired: noise lib + static density (D2.2) + Keplerian shear advection (D2.3) + T/edge/scale-height modulation (D2.4) — `disk.noise` block (`enabled: true`, `modulation.enabled: true`), `_setup_disk_noise` buffer (`_NOISE_N=43`), GPU `_disk_noise_density_mult`/`_disk_noise_mod_fields` + CPU twins, `thumb.py` look-dev. `disk.noise.enabled: false` is a verified bit-identical branch; GR/calibration guards force noise off so goldens are unshifted. **Remaining: D2.5** (MB `t_disk` jitter, perf pass, noise-on golden, owner sign-off) | Visualization |
+| **V2** | Flared 3D volumetric density: radius-varying scale height so the noise stack gets real vertical bulk | ✅ **Resolved (2026-06-14)** — `σ_θ(r)=σ0·(r/r_inner)^β` in the shared `_disk_density_cks` (SKILL.md Formula **CKS-16**, rev v1.24); CKS-13 resolver derives `flare_beta` + `theta_half_bound`; gated by `disk.volumetric.flare.enabled` (default `false` ⇒ bit-identical). GEOMETRY/TEXTURE only. Guard `tests/test_disk_flare.py` (7 CPU + 2 GPU); `test_gpu_regression.py`/`test_disk_step_convergence.py` unchanged. Spec `docs/specs/2026-06-14-V2-flared-3d-density.md`. **Next V-epoch increment: vertical self-shadow** (extend CKS-15 — now unblocked by this bulk) | Visualization |
 | **D3** | Dynamic derived parameters: editing base config (spin, target temperature, disk extent) must rescale every dependent quantity automatically | ✅ **Resolved (2026-06-13)** — `src/renderer/kerr_params.resolve_config` (SKILL.md Formula **CKS-13**, rev v1.14) runs inside every config loader (`taichi_renderer.load_config`, `thumb.py`); derives `r_plus`/`r_isco`/`disk.r_inner`/`disk.T_0` (from new base `disk.target_peak_temperature`) + `disk.dynamics` time mapping (`time_scale`, `shear_period_M` for D2). Desync-prone YAML literals removed. Closed forms (BPT 1972 — exact, beats any LUT; only CKS-11 f_PT needs tabulation), literature anchors pinned in `tests/test_kerr_params.py` (11 tests). Render impact: r_inner 1.182→1.181765 (exact ISCO). ⚠️ The original "GPU regression bit-identical except Doppler Δ5e-6" claim was wrong: re-keying `T_0`→`target_peak_temperature` dropped the simple-model peak T_eff 18,600→5,500 K, moving the disk peak 6.17→14.45 and Doppler ratio 4.32→5.15 — the `test_gpu_regression.py` goldens were re-anchored + made dynamic in `doppler_strength` 2026-06-13 (see the test entry above + SKILL.md v1.16) | Config |
 
 ### Code-review findings (verified against current code)
@@ -1184,7 +1201,41 @@ roadmap `2026-06-13-volumetric-disk-and-gas-flow.md`).
 | V1.4 | Docs sync (SKILL CKS-14/15, this §, render.yaml, memory) + combined golden | ✅ done 2026-06-13 — `test_combined_source_function_and_self_shadow_golden` (relational: composition active, NaN-free, dimmer than source-fn-only) |
 | V1.5 | Isotropic **simplex** basis `snoise2/3` + `sfbm2/3` (+ GPU twins) for the V3 curl potential | ✅ done 2026-06-14 — Perlin/Gustavson skewed-simplex (SKILL §3.6 / v1.23); library addition only, NOT wired (classic simplex isn't φ-periodic), so all goldens bit-identical; `test_noise.py` (8 CPU incl. the m=4 isotropy guard: ~12× less axis bias than Perlin) + `test_noise_gpu.py` (4 CUDA twin-parity) |
 
-**Out of V1 scope (the V2–V5 roadmap):** ~~V1.5 Simplex noise~~ ✅ shipped 2026-06-14
-(above); V2 3D flared density; V3 curl-flow advection + domain warp (consumes the V1.5
-simplex basis); V4 free camera. Vertical self-shadowing (top gas shadowing the midplane)
-needs the V2 3D bulk — V1's deep-shadow-map is in-plane (radial) only.
+**Out of V1 scope (the V2–V5 roadmap):** ~~V1.5 Simplex noise~~ ✅ shipped 2026-06-14;
+~~V2 3D flared density~~ ✅ shipped 2026-06-14 (below); V3 curl-flow advection + domain
+warp (consumes the V1.5 simplex basis); V4 free camera. Vertical self-shadowing (top gas
+shadowing the midplane) needs the V2 3D bulk — V1's deep-shadow-map is in-plane (radial)
+only, and is the next increment now that V2 supplies the bulk.
+
+### V2 — flared 3D volumetric density (shipped 2026-06-14)
+
+**Status: shipped 2026-06-14, default OFF (bit-identical to V1).** Gives the disk real
+vertical bulk so the noise stack's `ζ` coordinate stops being squashed by the constant
+thin slab. **Math of record:** SKILL.md **Formula CKS-16** (flared scale height
+`σ_θ(r) = σ0·(r/r_inner)^β`, GEOMETRY/TEXTURE — amplitude/geometry only, no GR) + the
+**CKS-13 θ-band addendum** (derived `theta_half_bound`). **Spec of record:**
+`docs/specs/2026-06-14-V2-flared-3d-density.md`.
+
+- **One-point change.** The flare lives in the shared `_disk_density_cks`, so the
+  emission march and the CKS-15 shadow bake inherit `σ_θ(r)` automatically; `β=0` skips
+  `ti.pow` ⇒ the V1 constant slab bit-for-bit.
+- **Genuine 3D for free.** The existing `ridged3`/`fbm3` stack already consumes
+  `ζ=dz_ang/σ_eff`; a real radius-varying thickness un-squashes it — no new noise
+  primitive (V1.5 simplex stays parked for V3).
+- **Knock-on A — θ band.** The CKS-13 resolver derives a separate
+  `theta_half_bound ≥ band_sigma·σ_θ(r_outer)` (default `band_sigma=3.0`) as the photon
+  trace band, leaving `theta_half_width` as the un-mutated σ0 anchor (⇒ idempotent).
+- **Knock-on B — step cap.** Unchanged: flare thickens *outward*, so the thinnest slab is
+  still the inner edge σ0, the existing worst case — verified by the convergence test, not
+  assumed.
+- **Gating.** `disk.volumetric.flare.{enabled,beta,band_sigma}`; default `enabled:false`
+  (and `enabled:true,β=0`) are both bit-identical, so every V1/D2 golden stays green.
+- **Guards.** `tests/test_disk_flare.py` (7 resolver/CPU no-op/widen/monotone/idempotent/
+  validation + 2 GPU flag-off bit-identity & β>0 thickens the silhouette — flare is
+  geometry, *not* a brightness boost: it read ~1.6% dimmer in total because the added
+  cold outer bulk self-absorbs the unchanged hot inner edge more than it emits) + the unchanged
+  `test_gpu_regression.py` / `test_disk_step_convergence.py`.
+
+**Out of V2 scope (one-variable-at-a-time):** vertical self-shadow (CKS-15 extension —
+its own commit, now unblocked by this bulk); a dedicated V2 volumetric golden (deferred to
+V5 sign-off); V3 curl-flow.

@@ -154,8 +154,11 @@ def test_bake_matches_analytic_gaussian_column():
     max_tau = float(ss.get("max_tau", 8.0))
     absb_c = float(d["absorption_coeff"])
 
+    # CKS-16 (V2): bake now takes σ0 + flare_beta (was theta_half, sigma_frac).
+    # β=0 ⇒ σ_eff ≡ σ0, so the analytic ζ-column below is unchanged.
+    sigma_theta0 = theta_half * sigma_frac
     tr.bake_disk_shadow(
-        r_inner, r_outer, r_isco, theta_half, sigma_frac,
+        r_inner, r_outer, r_isco, sigma_theta0, 0.0,
         zeta_max, max_tau, absb_c, 0, 1234, 0.0, float(cfg["black_hole"]["spin"]),
     )
     got = tr.disk_shadow_tau.to_numpy()  # (NU, NPHI, NZ)

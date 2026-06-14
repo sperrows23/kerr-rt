@@ -110,6 +110,18 @@ disk:
       lod_max_camera_radius: 0.0  # V1.3 LOD gate (M). 0 ⇒ off (always honor enabled). >0 ⇒
                            # skip the bake + lookup when |camera| exceeds it (wide/mid shots
                            # ride the cheap legacy march; close-ups keep the voids).
+    flare:                 # V2 flared 3D density (SKILL.md CKS-16; spec docs/specs/
+                           # 2026-06-14-V2-flared-3d-density.md). Gives the disk real vertical
+                           # bulk so the noise's ζ-variation stops being squashed flat by the
+                           # constant thin slab. Default OFF ⇒ bit-identical to the V1 goldens.
+      enabled: false       # false ⇒ constant σ_θ slab (today, bit-identical). true ⇒ flared.
+      beta: 0.0            # radial flare exponent: σ_θ(r) = σ0·(r/r_inner)^β with
+                           # σ0 = theta_half_width·vertical_sigma_frac (the r_inner width).
+                           # β=0 ⇒ constant-H/r slab (today); β>0 thickens the disk OUTWARD
+                           # (H/r grows with radius — astrophysical flare). ~0.2–0.5 = visible.
+      band_sigma: 3.0      # θ-band coverage factor. The CKS-13 resolver widens the bounding
+                           # half-angle (theta_half_bound) to ≥ band_sigma·σ_θ(r_outer) so the
+                           # flared outer envelope is not hard-clipped by the θ cutoff. 3 ≈ ±3σ.
   noise:                   # D2 procedural turbulence (SKILL.md CKS-12, spec docs/specs/
                            # 2026-06-13-disk-noise-turbulence.md). D2.2 = static DENSITY
                            # structure; D2.3 = Keplerian SHEAR ADVECTION (the field wraps
