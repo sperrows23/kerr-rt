@@ -1360,3 +1360,40 @@ is *in-plane `(u,φ)`* only (ζ untouched).
 - **Deferred:** V3.1 curl-flow advection (animate ψ + dual-phase reset, composed with the §2
   shear); 3D curl (vector potential, churn ζ); analytic simplex gradient; a curl-on golden
   (V5 sign-off).
+
+### Look pipeline — warm-amber color grade + render-path ergonomics (shipped 2026-06-14)
+
+**Status: shipped 2026-06-14, identity-default (bit-identical to before).** Two
+look-development additions in service of the *Interstellar* reference look
+(`whatiwant1/2.png`, `wantblackhole.png`) — a warm-amber gas with organic color and
+switchable structure cost. Neither touches GR/physics.
+
+- **Non-physical color grade (the amber).** `renderer.tonemap` gained optional
+  `saturation` + `tint` (per-channel linear gain), applied in **linear HDR before** the
+  Reinhard compressor. This is a **VISUALIZATION-class dial, same governance as
+  `disk.doppler_strength`** — it reaches the warm amber the **Formula 9** blackbody
+  chromaticity (deliberately desaturated: `1−exp(−T/{3500,5500,9500})` keeps a strong blue
+  channel ⇒ trends sepia) cannot reach on its own. Config: `render.color_grade.{saturation,
+  tint}` (identity `1.0` / `[1,1,1]` ⇒ tonemap bit-for-bit the ungraded result, guarded).
+  `scripts/showcase_disk.py`: `--saturation`, `--tint r,g,b`, and the `--amber` preset
+  (`saturation 1.6`, `tint 1.18,1.0,0.74`). **Why a grade, not a chroma change:** the owner
+  chose the viz dial over revising Formula 9 (which would shift goldens) — color is
+  art-directed downstream, the rendered radiance is untouched.
+- **`--peak-temp` look dial.** `showcase_disk.py --peak-temp K` re-anchors disk hue by
+  overriding `disk.target_peak_temperature` and **re-running the CKS-13 resolver** (drops the
+  derived `T_0` first — never edits a derived literal). Lower ⇒ the working band sits in the
+  saturated-amber part of the chromaticity curve.
+- **`--quality` render-path preset (fast↔volumetric switch + self-shadow cost knob).**
+  `showcase_disk.py --quality {fast,balanced,hero}`. `fast` = noise+bloom only (~12s/4K, the
+  **video path**). `balanced`/`hero` = volumetric void-carving (CKS-14 source function +
+  CKS-17 3D self-shadow) at deep-shadow-map grid `64,192,12` / `128,512,24`. **The cost/
+  accuracy knob is the grid resolution itself** — the CKS-17 bake is `O(NU²·NPHI·NZ)` and
+  `grid_nu` is simultaneously the shadow-map detail *and* the radial march step count
+  (`du=u_max/NU`), so there is no separate "step size" to add: `--shadow-grid NU,NPHI,NZ`
+  (and the preset) *is* the manual time/quality balance. Explicit
+  `--source-function`/`--self-shadow`/`--shadow-grid` override the preset; the existing
+  `self_shadow.lod_max_camera_radius` auto-disables the bake on wide shots.
+- **Constraint honored:** the fast path stays the video path (efficient); the volumetric
+  richness is opt-in per shot via `--quality`.
+- **Deferred / next:** V3.1 curl-flow advection (formula CKS-18 §2 drafted, owner-approved
+  mechanism = §2 dual-phase reset blend + independent `flow_period_M` clock).

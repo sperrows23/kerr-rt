@@ -2576,9 +2576,36 @@ def render_beauty_frame_mb(
     return hdr_mean
 
 
-def tonemap(hdr: np.ndarray, exposure: float, gamma: float) -> np.ndarray:
-    """Reinhard tonemap + gamma, → uint8 (matches scripts/thumb.py)."""
+def tonemap(
+    hdr: np.ndarray,
+    exposure: float,
+    gamma: float,
+    saturation: float = 1.0,
+    tint=(1.0, 1.0, 1.0),
+) -> np.ndarray:
+    """Reinhard tonemap + gamma, → uint8 (matches scripts/thumb.py).
+
+    ``saturation`` / ``tint`` are a NON-PHYSICAL color grade (VISUALIZATION class,
+    like ``disk.doppler_strength``) applied in linear HDR *before* the Reinhard
+    compressor — they push the art-directed warm-amber look that the Formula 9
+    blackbody chromaticity (intentionally desaturated) cannot reach on its own.
+    They NEVER touch the rendered radiance / physics; ``saturation == 1.0`` and
+    ``tint == (1,1,1)`` reproduce the ungraded tonemap bit-for-bit.
+
+    - ``saturation``: ``rgb' = luma + saturation·(rgb − luma)`` about the Rec.709
+      luminance (1 = unchanged, >1 richer, 0 = grayscale).
+    - ``tint``: per-channel linear gain ``(r,g,b)`` (warm amber ≈ ``(1.15,1.0,0.8)``).
+    """
     img = hdr * exposure
+    # --- VISUALIZATION color grade (identity at defaults ⇒ bit-identical) ---
+    if saturation != 1.0:
+        luma = (img * np.array([0.2126, 0.7152, 0.0722])).sum(axis=-1, keepdims=True)
+        img = luma + saturation * (img - luma)
+        img = np.maximum(img, 0.0)  # saturation<1 can't create negatives, >1 can on edges
+    tint = np.asarray(tint, dtype=img.dtype)
+    if not np.array_equal(tint, (1.0, 1.0, 1.0)):
+        img = img * tint
+    # ----------------------------------------------------------------------
     img = img / (1.0 + img)
     img = np.clip(img, 0.0, 1.0)
     img = np.power(img, 1.0 / gamma)

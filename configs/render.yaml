@@ -284,6 +284,15 @@ thumb:
   ring_r_sigma: 0.6               # width (M) of the ring glow falloff
   exposure: 1.0                   # linear pre-tonemap exposure multiplier
   gamma: 2.2                      # display gamma for sRGB-ish output
+  color_grade:                    # NON-PHYSICAL art-direction grade (VISUALIZATION class,
+                                  # like disk.doppler_strength). Applied in linear HDR BEFORE
+                                  # the Reinhard compressor in renderer.tonemap. Reaches the
+                                  # warm-amber reference look the Formula 9 blackbody
+                                  # chromaticity (deliberately desaturated) can't on its own.
+                                  # NEVER touches rendered radiance/physics. Identity defaults
+                                  # below ⇒ tonemap is bit-for-bit the ungraded result.
+    saturation: 1.0               # rgb' = luma + saturation·(rgb − luma); 1=unchanged, >1 richer
+    tint: [1.0, 1.0, 1.0]         # per-channel linear gain; warm amber ≈ [1.15, 1.0, 0.8]
 
 output:
   blackhole_dir: render_blackhole/
