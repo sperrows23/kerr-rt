@@ -170,6 +170,12 @@ def main(argv: list[str] | None = None) -> None:
         help="override disk.noise.curl.amp (displacement amplitude; 0 ⇒ identity). "
         "Try ~0.05-0.2. Implies --curl.",
     )
+    p.add_argument(
+        "--flow-period", type=float, default=None, metavar="T_C",
+        help="override disk.noise.curl.flow_period_M (CKS-18 sec.2 curl-flow advection): "
+        "the eddies BOIL in time with clock T_c (geometric M). >0 animates the warp "
+        "across frames; <=0 (default) is the static V3.0 warp. Implies --curl. Try ~3-12.",
+    )
     # --- NON-PHYSICAL color grade (VISUALIZATION, like doppler_strength) — the warm-amber
     #     reference look. Overrides render.color_grade; identity defaults ⇒ ungraded. ---
     p.add_argument("--saturation", type=float, default=None,
@@ -235,10 +241,13 @@ def main(argv: list[str] | None = None) -> None:
         sscfg["grid_nu"], sscfg["grid_nphi"], sscfg["grid_nz"] = gnu, gnphi, gnz
     # V3.0 curl warp (CKS-18). Default OFF in the YAML; --curl / --curl-amp turn it on
     # for look-dev. enabled:false (or amp:0) is bit-identical to V2, so we set both.
-    if args.curl or args.curl_amp is not None:
+    if args.curl or args.curl_amp is not None or args.flow_period is not None:
         curl = nz.setdefault("curl", {})
         curl["enabled"] = True
         curl["amp"] = float(args.curl_amp) if args.curl_amp is not None else 0.12
+        # V3.1 (CKS-18 sec.2): >0 ⇒ eddies boil; <=0 ⇒ static V3.0 warp (bit-for-bit).
+        if args.flow_period is not None:
+            curl["flow_period_M"] = float(args.flow_period)
     if args.noise_boost != 1.0:
         # Scale only the AMPLITUDE dials (how far the [0,1] envelopes swing), never the
         # frequencies/seed/geometry — pure look-dev re-upload through _setup_disk_noise.
@@ -283,7 +292,12 @@ def main(argv: list[str] | None = None) -> None:
     curl_on = bool(curl_cfg.get("enabled", False)) and float(curl_cfg.get("amp", 0.0)) != 0.0
     sf_on = bool(vol.get("source_function", False))
     ssh_on = bool(vol.get("self_shadow", {}).get("enabled", False))
-    curl_status = f"on(amp={curl_cfg.get('amp')})" if curl_on else "off"
+    curl_flow = float(curl_cfg.get("flow_period_M", 0.0))
+    curl_status = (
+        f"on(amp={curl_cfg.get('amp')}"
+        + (f",flow_T={curl_flow}" if curl_on and curl_flow > 0.0 else "")
+        + ")"
+    ) if curl_on else "off"
     if ssh_on and not sf_on:
         print("note: --self-shadow without --source-function only dims emission; the "
               "deep voids need both (CKS-14 materialises S, CKS-15 carves it).")
