@@ -402,3 +402,22 @@ def test_mod_fields_match_cpu_reference():
         )
     # Sanity: the advected envelopes stay in [0,1] (convex triangle-weight blend).
     assert gpu.min() >= -1e-4 and gpu.max() <= 1.0 + 1e-4
+
+
+# --------------------------------------------------------------------------- #
+# CKS-19 multi-phase media — GPU param buffer + ρ_cold twin.
+# --------------------------------------------------------------------------- #
+def test_multiphase_params_uploaded():
+    """disk.multiphase populates the _NI_MP_* slots; absent block ⇒ disabled defaults."""
+    _ensure_cuda()
+    cfg_on = {"disk": {"multiphase": {"enabled": True, "dust_correlation": -0.6,
+                                      "dust_amp": 1.0, "dust_sigma_frac": 0.8}}}
+    tr._setup_disk_noise(cfg_on)
+    buf = tr.disk_noise_params.to_numpy()
+    assert buf[tr._NI_MP_EN] == 1.0
+    assert abs(buf[tr._NI_MP_CHI] - (-0.6)) < 1e-6
+    assert abs(buf[tr._NI_MP_SIGFRAC] - 0.8) < 1e-6
+    tr._setup_disk_noise({"disk": {}})
+    buf0 = tr.disk_noise_params.to_numpy()
+    assert buf0[tr._NI_MP_EN] == 0.0
+    assert buf0[tr._NI_MP_SIGFRAC] == 1.0  # ratio defaults to 1 (σ_cold=σ_hot)

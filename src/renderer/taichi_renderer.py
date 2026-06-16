@@ -228,7 +228,13 @@ _NI_CURL_EPS = 51   # central finite-difference step in the (u,φ) chart
 # time-dependent via the §2 dual-phase reset blend (the eddies boil over t_disk);
 # ≤ 0 ⇒ the static V3.0 warp bit-for-bit. Independent of the §2 shear clock (B1).
 _NI_CURL_FLOWP = 52
-_NOISE_N = 53
+# CKS-19 multi-phase media (decoupled ρ_cold absorption). _NI_MP_EN gates it:
+# 0 ⇒ ρ_cold ≡ ρ_hot, grey κ ⇒ single-phase march bit-identical (constraint 6).
+_NI_MP_EN = 53
+_NI_MP_CHI = 54       # χ ∈ [−1,1] dust↔plasma correlation
+_NI_MP_AMP = 55       # a_cold — dust log-density gain
+_NI_MP_SIGFRAC = 56   # σ_cold / σ_hot — dust slab thickness ratio
+_NOISE_N = 57
 
 # CKS-14 RTE source-function march: divide guard on dτ. Below this the source
 # function S = emission/dτ is numerically undefined AND physically the optically-
@@ -260,6 +266,7 @@ _NSEED_L1_RIDGE = noise.NSEED_L1_RIDGE
 _NSEED_L1_VORO = noise.NSEED_L1_VORO
 _NSEED_L1_MASK = noise.NSEED_L1_MASK
 _NSEED_L2 = noise.NSEED_L2
+_NSEED_DUST = noise.NSEED_DUST  # CKS-19: GPU twin of noise.NSEED_DUST
 _NOISE_RIDGE_FEEDBACK = noise.RIDGE_FEEDBACK
 _NOISE_MASK_SOFT = noise.MASK_SOFT
 _NCYC_PHASE = noise.NCYC_PHASE  # dual-phase reseed offsets (CKS-12 §2, D2.3)
@@ -589,6 +596,15 @@ def _setup_disk_noise(cfg: dict) -> None:
     buf[_NI_CURL_EPS] = float(curl.get("fd_eps", float(noise.CURL_FD_EPS)))
     # V3.1 (CKS-18 §2) curl-flow clock; ≤ 0 (default / absent) ⇒ static V3.0 warp.
     buf[_NI_CURL_FLOWP] = float(curl.get("flow_period_M", 0.0))
+
+    # CKS-19 multi-phase media. Absent block ⇒ disabled, σ_cold=σ_hot, grey κ ⇒
+    # ρ_cold≡ρ_hot ⇒ single-phase march bit-identical (constraint 6). `multiphase`
+    # is a sibling of `noise` under `disk` (d), NOT derived ⇒ no CKS-13 change.
+    mp = d.get("multiphase", {}) or {}
+    buf[_NI_MP_EN] = 1.0 if mp.get("enabled", False) else 0.0
+    buf[_NI_MP_CHI] = float(mp.get("dust_correlation", -0.6))
+    buf[_NI_MP_AMP] = float(mp.get("dust_amp", 1.0))
+    buf[_NI_MP_SIGFRAC] = float(mp.get("dust_sigma_frac", 1.0))
 
     disk_noise_params = ti.field(dtype=ti.f32, shape=_NOISE_N)
     disk_noise_params.from_numpy(buf)
