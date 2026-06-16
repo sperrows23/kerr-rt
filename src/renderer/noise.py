@@ -833,6 +833,37 @@ def noise_density_mult(u, phi, zeta, nz, seed: int = 1234,
     return np.exp(m).astype(np.float32)
 
 
+def dust_density_mult(u, phi, zeta, nz, mp, seed: int = 1234, t_disk: float = 0.0,
+                      omega=0.0, shear_period: float = 0.0) -> np.ndarray:
+    """CKS-19 cold (dust) density multiplier — **CPU source of truth** (GPU twin
+    ``taichi_renderer._disk_density_cks`` index [1]). Returns
+    ``exp(clamp(a_cold·m_cold, ±m_max))`` where the cold modulator is the
+    variance-preserving Pearson mix of the hot modulator and an independent
+    re-seeded copy of the SAME layer stack:
+
+        m_hot  = _advected_m(..., seed)
+        m_dust = _advected_m(..., seed + NSEED_DUST)   # equal variance, decorrelated
+        m_cold = χ·m_hot + √(1−χ²)·m_dust
+
+    χ = ``mp['dust_correlation'] ∈ [−1,1]``, a_cold = ``mp['dust_amp']``. Because the
+    dust stack is the hot stack reseeded, Var(m_dust)=Var(m_hot), so the sampled
+    Pearson correlation between m_hot and m_cold equals χ and Var(m_cold) is
+    χ-invariant (CKS-19 variance preservation). This is ONLY the modulator; the
+    caller multiplies by the cold Gaussian gauss(ζ;σ_cold) and the edge window.
+    """
+    mmax = np.float32(nz.get("m_max", 2.5))
+    chi = np.float32(mp.get("dust_correlation", -0.6))
+    a_cold = np.float32(mp.get("dust_amp", 1.0))
+    m_hot = _advected_m(u, phi, zeta, nz, int(seed), t_disk=t_disk,
+                        omega=omega, shear_period=shear_period)
+    m_dust = _advected_m(u, phi, zeta, nz, int(seed) + NSEED_DUST, t_disk=t_disk,
+                         omega=omega, shear_period=shear_period)
+    s = np.sqrt(np.float32(1.0) - chi * chi)
+    m_cold = chi * m_hot + s * m_dust
+    m_cold = np.clip(a_cold * m_cold, -mmax, mmax)
+    return np.exp(m_cold).astype(np.float32)
+
+
 def _mod_fbm_stack(u, phi, mod, seed_offsets, seed_base, curl=None, t_disk=0.0):
     """Evaluate the four §3 modulation envelopes at one (already-advected) phase.
 
