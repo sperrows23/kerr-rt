@@ -665,6 +665,7 @@ NSEED_L1_RIDGE = 101
 NSEED_L1_VORO = 211
 NSEED_L1_MASK = 307
 NSEED_L2 = 401
+NSEED_DUST = 911  # CKS-19: ρ_cold's independent modulator (own decorrelated stack)
 RIDGE_FEEDBACK = 2.0  # ridged-MF spectral feedback (spec §3.4; not a §5 look dial)
 MASK_SOFT = 0.15  # coverage-mask smoothstep half-width around the 1−coverage threshold
 _INV_TWO_PI = np.float32(1.0 / (2.0 * np.pi))
@@ -755,6 +756,43 @@ def _noise_m_stack(u, phi, zeta, nz, seed: int, t_disk: float = 0.0) -> np.ndarr
     return m
 
 
+def _advected_m(u, phi, zeta, nz, seed: int, t_disk: float = 0.0,
+                omega=0.0, shear_period: float = 0.0) -> np.ndarray:
+    """Pre-clamp blended log-density modulator m (CKS-12 §2 dual-phase shear
+    advection + §4 layer stack), BEFORE the ±m_max clamp and exp. Factored out of
+    :func:`noise_density_mult` so CKS-19 can evaluate it twice (hot seed + dust
+    seed) for the ρ_cold correlation construction. Returns m; the density
+    multiplier is exp(clamp(m, ±m_max))."""
+    u = _f32(u)
+    phi = _f32(phi)
+    zeta = _f32(zeta)
+    T = np.float32(shear_period)
+    if T <= np.float32(0.0):
+        # Static (D2.2 / backward-compatible default): no advection, sample at φ.
+        # t_disk still drives the CKS-18 §2 curl-flow (independent of the shear clock).
+        return _noise_m_stack(u, phi, zeta, nz, int(seed), t_disk=t_disk)
+    omega = _f32(omega)
+    s = np.float32(t_disk) / T
+    var_preserve = bool(nz.get("variance_preserve", True))
+    g = np.float32(nz.get("dynamism", 1.0))  # viz gain on the shear amount
+    m = None
+    wsq = np.float32(0.0)
+    # Two staggered reset phases, crossfaded (Neyret-style advected texture).
+    for k in (0, 1):
+        ar = s + np.float32(0.5 * k)
+        ck = int(np.floor(ar))           # reset-cycle index (≥ 0 for t_disk ≥ 0)
+        ak = ar - np.float32(ck)         # age fraction ∈ [0, 1)
+        wk = np.float32(1.0) - np.abs(np.float32(2.0) * ak - np.float32(1.0))
+        seed_k = int(seed) + k * NCYC_PHASE + ck * NCYC_CYCLE
+        phi_k = phi - g * omega * (ak * T)   # CKS-12 §2: φ sheared for ≤ T (×gain)
+        mk = wk * _noise_m_stack(u, phi_k, zeta, nz, seed_k, t_disk=t_disk)
+        m = mk if m is None else m + mk
+        wsq = wsq + wk * wk
+    if var_preserve and wsq > np.float32(0.0):
+        m = m / np.sqrt(wsq)
+    return m.astype(np.float32)
+
+
 def noise_density_mult(u, phi, zeta, nz, seed: int = 1234,
                        t_disk: float = 0.0, omega=0.0, shear_period: float = 0.0) -> np.ndarray:
     """Combined L0/L1/L2 procedural-density multiplier (SKILL.md CKS-12 §2–3, spec §4).
@@ -788,37 +826,9 @@ def noise_density_mult(u, phi, zeta, nz, seed: int = 1234,
     D2.2 path, so existing static callers/tests are unchanged. ``nz`` disabled layers
     (or an ``enabled: false`` block) give an identically-1.0 multiplier either way.
     """
-    u = _f32(u)
-    phi = _f32(phi)
-    zeta = _f32(zeta)
     mmax = np.float32(nz.get("m_max", 2.5))
-    T = np.float32(shear_period)
-
-    if T <= np.float32(0.0):
-        # Static (D2.2 / backward-compatible default): no advection, sample at φ.
-        # t_disk still drives the CKS-18 §2 curl-flow (independent of the shear clock).
-        m = _noise_m_stack(u, phi, zeta, nz, int(seed), t_disk=t_disk)
-    else:
-        omega = _f32(omega)
-        s = np.float32(t_disk) / T
-        var_preserve = bool(nz.get("variance_preserve", True))
-        g = np.float32(nz.get("dynamism", 1.0))  # viz gain on the shear amount
-        m = None
-        wsq = np.float32(0.0)
-        # Two staggered reset phases, crossfaded (Neyret-style advected texture).
-        for k in (0, 1):
-            ar = s + np.float32(0.5 * k)
-            ck = int(np.floor(ar))           # reset-cycle index (≥ 0 for t_disk ≥ 0)
-            ak = ar - np.float32(ck)         # age fraction ∈ [0, 1)
-            wk = np.float32(1.0) - np.abs(np.float32(2.0) * ak - np.float32(1.0))
-            seed_k = int(seed) + k * NCYC_PHASE + ck * NCYC_CYCLE
-            phi_k = phi - g * omega * (ak * T)   # CKS-12 §2: φ sheared for ≤ T (×gain)
-            mk = wk * _noise_m_stack(u, phi_k, zeta, nz, seed_k, t_disk=t_disk)
-            m = mk if m is None else m + mk
-            wsq = wsq + wk * wk
-        if var_preserve and wsq > np.float32(0.0):
-            m = m / np.sqrt(wsq)
-
+    m = _advected_m(u, phi, zeta, nz, seed, t_disk=t_disk,
+                    omega=omega, shear_period=shear_period)
     m = np.clip(m, -mmax, mmax)
     return np.exp(m).astype(np.float32)
 

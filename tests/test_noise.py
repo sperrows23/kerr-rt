@@ -757,3 +757,24 @@ def test_curl_flow_evolves_and_is_deterministic():
     assert not np.array_equal(a[0], b[0])                  # evolves over time
     assert np.isfinite(b[0]).all() and np.isfinite(b[1]).all()
     assert np.array_equal(b[0], b2[0]) and np.array_equal(b[1], b2[1])  # deterministic
+
+
+# --------------------------------------------------------------------------- #
+# CKS-19 multi-phase media — _advected_m refactor parity + dust modulator.
+# --------------------------------------------------------------------------- #
+def test_advected_m_reconstructs_density_mult():
+    """noise_density_mult == exp(clamp(_advected_m, ±m_max)) — refactor parity."""
+    from renderer import noise as N
+    nz = {
+        "m_max": 2.5,
+        "layers": {"base": {"enabled": True, "amp": 0.6, "octaves": 5,
+                            "lacunarity": 2, "gain": 0.5, "freq_u": 6.0, "freq_phi": 24}},
+    }
+    u = np.linspace(0.0, 2.0, 64).astype(np.float32)
+    phi = np.linspace(-np.pi, np.pi, 64).astype(np.float32)
+    zeta = np.zeros(64, dtype=np.float32)
+    m = N._advected_m(u, phi, zeta, nz, seed=7, t_disk=0.0, omega=0.0, shear_period=0.0)
+    expect = np.exp(np.clip(m, -2.5, 2.5)).astype(np.float32)
+    got = N.noise_density_mult(u, phi, zeta, nz, seed=7, t_disk=0.0,
+                               omega=0.0, shear_period=0.0)
+    np.testing.assert_allclose(got, expect, rtol=0, atol=0)
