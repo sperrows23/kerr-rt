@@ -62,13 +62,19 @@ def _cam():
         return json.load(fh)[_FRAME_INDEX]
 
 
-def _render(noise_cfg, *, seed=None, temperature_model="simple", doppler_strength=1.0):
+def _render(noise_cfg, *, seed=None, temperature_model="simple", doppler_strength=1.0,
+            multiphase=None):
     """Render frame 0 with ``disk.noise`` replaced by ``noise_cfg`` (a dict, or the
-    sentinel ``"DELETE"`` to drop the block entirely). Returns (hdr, disk_rgb)."""
+    sentinel ``"DELETE"`` to drop the block entirely). ``multiphase`` (dict or None)
+    sets/omits the ``disk.multiphase`` (CKS-19) block. Returns (hdr, disk_rgb)."""
     _ensure_cuda()
     cfg = copy.deepcopy(tr.load_config())
     cfg["disk"]["temperature_model"] = temperature_model
     cfg["disk"]["doppler_strength"] = doppler_strength
+    if multiphase is None:
+        cfg["disk"].pop("multiphase", None)
+    else:
+        cfg["disk"]["multiphase"] = copy.deepcopy(multiphase)
     if noise_cfg == "DELETE":
         cfg["disk"].pop("noise", None)
     else:
@@ -477,3 +483,15 @@ def test_rho_cold_gpu_matches_cpu():
 
     assert np.allclose(gpu[:, :, 0], rho_hot, atol=_SATOL), float(np.abs(gpu[:, :, 0] - rho_hot).max())
     assert np.allclose(gpu[:, :, 1], rho_cold, atol=_SATOL), float(np.abs(gpu[:, :, 1] - rho_cold).max())
+
+
+def test_multiphase_off_bit_identical():
+    """``multiphase.enabled: false`` ⇒ beauty frame byte-identical to no multiphase
+    block at all. Strict guard: a NON-default ``dust_sigma_frac`` (0.5) is supplied so
+    that if the disabled branch ever read the cold slab params (step cap, absorption),
+    the frames would diverge — proving the OFF path never touches them (CKS-19
+    constraint 6: ρ_cold≡ρ_hot, single-phase march bit-identical)."""
+    hdr_none, _ = _render(_NOISE_ON)
+    hdr_off, _ = _render(_NOISE_ON, multiphase={"enabled": False, "dust_correlation": -0.6,
+                                                "dust_amp": 1.0, "dust_sigma_frac": 0.5})
+    assert np.array_equal(hdr_none, hdr_off)

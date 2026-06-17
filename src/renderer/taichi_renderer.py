@@ -1531,7 +1531,7 @@ def bake_disk_shadow(
             dens = _disk_density_cks(
                 x, y, r_c, dz_ang, sigma_theta0, flare_beta, r_inner, r_outer, r_isco,
                 noise_enabled, noise_seed, t_disk, a,
-            )[0]
+            )[1]   # CKS-19: τ ≡ ∫κ·ρ_cold (OFF ⇒ [1]==[0] ⇒ shadow map unchanged)
             # 3D arc length over the cell: radial dr=r_c·du (CKS-15 convention, keeps the
             # midplane reduction bit-exact) + the ray's physical-height change ΔZ in
             # quadrature. Z(u)=r(u)·ζ(u)·σ_θ(r), endpoints at u_c±½du.
@@ -1626,10 +1626,12 @@ def _disk_emit_cks(
                     x, y, r, dz_ang, sigma_theta0, flare_beta, r_inner, r_outer, r_isco,
                     noise_enabled, noise_seed, t_disk, a,
                 )
-                density = dens_tf[0]
+                density = dens_tf[0]          # ρ_hot — drives emission (CKS-19)
+                density_cold = dens_tf[1]     # ρ_cold — drives absorption/dτ (CKS-19)
                 # temp_factor carries the §3 emitted-temperature modulation forward
                 # to T_emit below (BEFORE the g shift — constraint 2). 1.0 = identity.
-                temp_factor = dens_tf[1]
+                # Index [2]: the vec3 middle slot [1] now carries ρ_cold (CKS-19).
+                temp_factor = dens_tf[2]
                 g4 = g_eff * g_eff * g_eff * g_eff  # Formula 9 (3D volume: g⁴)
 
                 # CKS-15 radial self-shadow (VISUALIZATION). Dim the EMISSIVITY j by
@@ -1684,7 +1686,7 @@ def _disk_emit_cks(
                         emission * chroma[0],
                         emission * chroma[1],
                         emission * chroma[2],
-                        absb_c * density * ds,
+                        absb_c * density_cold * ds,   # CKS-19: κ·ρ_cold (grey κ)
                     )
     return out
 
@@ -1946,6 +1948,13 @@ def render_beauty_physics(
                     # lump thins below the step (CKS-12 constraint 4). h_amp=0 ⇒ unchanged.
                     if disk_noise_params[_NI_MOD_EN] > 0.5:
                         sigma_z = sigma_z * (1.0 - 0.5 * disk_noise_params[_NI_MOD_HEIGHT_AMP])
+                    # CKS-19 constraint 3: the cold slab can be thinner (σ_cold = σ_hot·sigfrac).
+                    # Cap on the thinnest of the two so absorption lanes are resolved too.
+                    # OFF (sigfrac defaults 1.0) ⇒ no narrowing ⇒ bit-identical.
+                    if disk_noise_params[_NI_MP_EN] > 0.5:
+                        sf = disk_noise_params[_NI_MP_SIGFRAC]
+                        if sf < 1.0:
+                            sigma_z = sigma_z * sf
                     vz = ti.abs(k1[3])
                     h_cap = max_step_vfrac * sigma_z / ti.max(vz, _DISK_STEP_V_EPS)
                     local_h = ti.min(local_h, h_cap)
