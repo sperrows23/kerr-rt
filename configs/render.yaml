@@ -199,6 +199,23 @@ disk:
       # L2 patchiness — subtle large-scale fBm breaking the ring symmetry.
       patch: {enabled: true, amp: 0.35, octaves: 2, lacunarity: 2.0, gain: 0.5,
               freq_u: 1.5, freq_phi: 4}
+  multiphase:                # CKS-19 — decoupled hot/cold media: emission tracks ρ_hot,
+                             # absorption (dτ + the CKS-15 shadow bake) tracks an independent
+                             # ρ_cold, so cold dust carves dark SILHOUETTES into the glow
+                             # rather than merely dimming it. ρ_cold = exp(clamp(m_cold)),
+                             # m_cold = χ·m_hot + √(1−χ²)·m_dust (variance-preserving Pearson
+                             # mix of the hot log-density with an independent dust field at
+                             # seed+NSEED_DUST). enabled:false ⇒ ρ_cold≡ρ_hot, grey κ ⇒ the
+                             # legacy single-phase scalar march, BIT-IDENTICAL (constraint 6).
+                             # NOTE: toggling `enabled` changes the compiled kernel
+                             # (ti.static _MP_COMPILE gate) ⇒ a one-time recompile; the
+                             # OFF default keeps the original fast JIT untouched.
+    enabled: false           # master switch. false ⇒ single-phase (golden frames intact).
+    dust_correlation: -0.6   # χ ∈ [−1,1]: −1 anti-correlated lanes (dust in the cool gaps),
+                             #   0 independent dust, +1 dust tracks the plasma exactly.
+    dust_amp: 1.0            # a_cold — dust log-density gain (clamped by noise.m_max).
+    dust_sigma_frac: 1.0     # σ_cold / σ_hot — dust slab thickness vs the emitting slab.
+                             #   <1 ⇒ thinner cold lane (tightens the Pipe-B vertical step cap).
   # NOTE: the Phase-3.3 |u|=|cosθ| disk-slab early-out bound is now DERIVED in code
   # as sin(theta_half_width) (renderer.render_beauty_frame) — the old hardcoded
   # `bounding_sin_theta_half: 0.14944` literal duplicated it and desynced whenever

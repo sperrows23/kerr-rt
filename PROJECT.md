@@ -764,6 +764,35 @@ work below predates and is **superseded by** the CKS migration above):
   2026-06-14:* noise_gpu 15, disk_noise + gpu_regression pass, noise 44 (CPU). Spec
   `docs/specs/2026-06-14-V3-curl-domain-warp.md`; SKILL.md rev v1.26.
 
+**Multi-phase disk media — emission/absorption density split (P2, shipped 2026-06-16,
+  GPU-verified 2026-06-18, Formula CKS-19).** Decouples disk **emission** density
+  (`ρ_hot`) from **absorption** density (`ρ_cold`) so a cold dust phase carves dark
+  **silhouettes** into the glow instead of only dimming it. `_disk_density_cks` now
+  returns `vec3(ρ_hot, ρ_cold, temp_factor)`: emission integrates `ρ_hot`, while the
+  optical-depth `dτ` *and* the CKS-15/17 self-shadow bake read `ρ_cold` (grey scalar
+  κ today; per-channel chromatic `dτ⃗` is DEFERRED — plan Task 7). `ρ_cold =
+  exp(clamp(m_cold))` with the **variance-preserving Pearson mix** `m_cold = χ·m_hot
+  + √(1−χ²)·m_dust` (χ = `dust_correlation`; dust field drawn at `seed+NSEED_DUST`,
+  `NSEED_DUST=911`) so the cold modulator keeps `m_hot`'s variance for any χ; χ=−1
+  anti-correlates fully (dust fills the hot voids). The Pipe-B vertical step cap
+  tightens to the thinner cold slab (`σ_cold = σ_hot·dust_sigma_frac`). VISUALIZATION
+  / texturing — never touches `p_μ`/`u^μ`/`g`/`g⁴`/`f_PT`. New code: `noise.py`
+  `dust_density_mult` + `_advected_m` (CPU twin); `taichi_renderer.py`
+  `_disk_blended_m`/`_disk_cold_mult_from_hot` + the `vec3` `_disk_density_cks` +
+  `disk.multiphase` dials through `_setup_disk_noise` (`_NI_MP_{EN,CHI,AMP,SIGFRAC}`,
+  `_NOISE_N` 53→57). **JIT:** the dust branch is emitted only when enabled
+  (`ti.static(_MP_COMPILE)` gate set at setup) — toggling `disk.multiphase.enabled`
+  forces a one-time recompile, but the OFF default keeps the original fast JIT (a
+  *runtime* `if` blew the mega-kernel compile past 2 h). Gated by
+  `disk.multiphase.enabled` (default `false` ⇒ `ρ_cold ≡ ρ_hot` ⇒ legacy march
+  bit-identical). *Verified:* `tests/test_noise.py` (CPU correlation/variance/χ=+1
+  parity), `tests/test_disk_noise.py::test_rho_cold_gpu_matches_cpu` (GPU↔CPU `ρ_cold`
+  parity) + `::test_multiphase_off_bit_identical` (strict OFF bit-identity with
+  non-default cold params), `tests/test_disk_multiphase.py::test_dust_carves_silhouette`
+  (MP-on darkens >2% of disk pixels and lowers the floor); `test_gpu_regression.py`
+  6/6 goldens unshifted. Plan `docs/plans/2026-06-16-pillar2-multiphase-implementation.md`;
+  SKILL.md Formula CKS-19 (DESIGN→ACTIVE, rev v1.30).
+
 *Note — `render_pipe_a`* (the 256² dev LOD kernel for `_gate2_lod_test`) was
 migrated to `[y,u,…]` but **intentionally keeps its offset ray** as the offset-ray
 LOD reference; it is not on the 4K production path.
@@ -792,6 +821,7 @@ re-derive. **`disk.py`, `geodesic.py`/`metric.py` CPU references, and any
 | **V2b** | Vertical self-shadow: top/inner gas shadows the midplane (the V1 deep-shadow-map was in-plane/radial only) | ✅ **Resolved (2026-06-14)** — `bake_disk_shadow` generalised from the CKS-15 radial column scan to a **3D inner-edge ray** (SKILL.md Formula **CKS-17**, rev v1.25): ray from the inner edge in the midplane `(u=0,ζ=0)` to the sample `(u_s,φ,ζ_s)`, tilted ρ sample + 3D arc length `ds=√((r·du)²+ΔZ²)`. CKS-15 is the ζ=0 limit (bit-exact). **No new config/field/flag** — same `disk.volumetric.self_shadow.enabled` (default `false` ⇒ goldens bit-identical); only the bake's ray geometry changed. VISUALIZATION/amplitude-only. Guard `tests/test_disk_self_shadow.py` (relational checks carry over; `test_bake_matches_analytic_3d_ray_integral` re-derived to the tilted-ray line integral); `test_gpu_regression.py` unchanged. Spec `docs/specs/2026-06-14-V2-vertical-self-shadow.md`. | Visualization |
 | **V3.0** | Curl-flow **domain warp**: divergence-free turbulent eddies the laminar §2 shear can't make (the static half of V3; advection is V3.1) | ✅ **Resolved (2026-06-14)** — in-plane curl warp of the noise coord `(u,φ)` = 2-D curl of an `sfbm3` scalar potential on the `(cosφ,sinφ,u)` cylinder embedding (SKILL.md Formula **CKS-18**, rev v1.26): `δu=+∂ψ/∂φ`, `δφ=−∂ψ/∂u` (central FD); divergence-free + seamless across φ=0 (embedding, not lattice period ⇒ freqs may be any real). Applied at `_disk_noise_m`/`_mod_fbm4` entry on the already-sheared `φ′_k` (material-frame; fixed `curl.seed` ⇒ static, only §2 animates). Consumes the parked V1.5 simplex basis. `noise.py` `curl_warp`/`curl_warp_ti`; `disk.noise.curl` dials through `_setup_disk_noise` (`_NOISE_N` 43→52); **no CKS-13 change**. Gated by `disk.noise.curl.enabled` (default `false`, `amp=0` ⇒ identity ⇒ bit-identical). VISUALIZATION/texturing-only. Guards `tests/test_noise.py` (divergence-free / seamless / determinism / identity / moves-density) + `tests/test_noise_gpu.py` (twin parity); `test_gpu_regression.py` unchanged. Spec `docs/specs/2026-06-14-V3-curl-domain-warp.md`. **Next V-epoch increment: V3.1 curl-flow advection** (animate ψ + dual-phase reset), then 3D-curl / V4 free cam. | Visualization |
 | **D3** | Dynamic derived parameters: editing base config (spin, target temperature, disk extent) must rescale every dependent quantity automatically | ✅ **Resolved (2026-06-13)** — `src/renderer/kerr_params.resolve_config` (SKILL.md Formula **CKS-13**, rev v1.14) runs inside every config loader (`taichi_renderer.load_config`, `thumb.py`); derives `r_plus`/`r_isco`/`disk.r_inner`/`disk.T_0` (from new base `disk.target_peak_temperature`) + `disk.dynamics` time mapping (`time_scale`, `shear_period_M` for D2). Desync-prone YAML literals removed. Closed forms (BPT 1972 — exact, beats any LUT; only CKS-11 f_PT needs tabulation), literature anchors pinned in `tests/test_kerr_params.py` (11 tests). Render impact: r_inner 1.182→1.181765 (exact ISCO). ⚠️ The original "GPU regression bit-identical except Doppler Δ5e-6" claim was wrong: re-keying `T_0`→`target_peak_temperature` dropped the simple-model peak T_eff 18,600→5,500 K, moving the disk peak 6.17→14.45 and Doppler ratio 4.32→5.15 — the `test_gpu_regression.py` goldens were re-anchored + made dynamic in `doppler_strength` 2026-06-13 (see the test entry above + SKILL.md v1.16) | Config |
+| **P2** | Multi-phase disk media: decouple emission density (`ρ_hot`) from absorption density (`ρ_cold`) so cold dust carves dark **silhouettes** into the glow rather than only dimming it | ✅ **Resolved (2026-06-16; GPU-verified 2026-06-18)** — `_disk_density_cks` returns `vec3(ρ_hot, ρ_cold, temp_factor)`; emission←`ρ_hot`, absorption (`dτ`) + the CKS-15 self-shadow bake←`ρ_cold`; step cap resolves the thinner cold slab (`σ_cold=σ_hot·dust_sigma_frac`). `ρ_cold=exp(clamp(m_cold))`, `m_cold=χ·m_hot+√(1−χ²)·m_dust` (variance-preserving Pearson mix; dust field at `seed+NSEED_DUST=911`). SKILL.md Formula **CKS-19** (DESIGN→ACTIVE, rev v1.30); **grey scalar κ** today, per-channel `dτ⃗` chromatic extension DEFERRED (Task 7). Config `disk.multiphase` (sibling of `disk.noise`, default `enabled:false` ⇒ `ρ_cold≡ρ_hot` ⇒ legacy march bit-identical). **JIT:** dust branch emitted only when enabled (`ti.static` `_MP_COMPILE` gate) ⇒ toggling `enabled` forces a one-time recompile; OFF default keeps the original fast JIT (a runtime `if` blew compile past 2 h). New slots `_NI_MP_{EN,CHI,AMP,SIGFRAC}` (`_NOISE_N` 53→57). Guards: `test_noise.py` (CPU correlation/variance parity), `test_disk_noise.py::{test_rho_cold_gpu_matches_cpu,test_multiphase_off_bit_identical}`, `test_disk_multiphase.py::test_dust_carves_silhouette`, unchanged `test_gpu_regression.py`. Plan `docs/plans/2026-06-16-pillar2-multiphase-implementation.md`. | Visualization/Physics |
 
 ### Code-review findings (verified against current code)
 
