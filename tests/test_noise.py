@@ -789,7 +789,7 @@ _DUST_NZ = {
                         "lacunarity": 2, "gain": 0.5, "freq_u": 6.0, "freq_phi": 24}},
 }
 
-def _grid():
+def _dust_grid():
     uu, pp = np.meshgrid(np.linspace(0.05, 3.0, 96, dtype=np.float32),
                          np.linspace(-np.pi, np.pi, 96, dtype=np.float32), indexing="ij")
     return uu.ravel(), pp.ravel(), np.zeros(uu.size, dtype=np.float32)
@@ -797,8 +797,7 @@ def _grid():
 @pytest.mark.parametrize("chi", [-1.0, -0.6, 0.0, 0.6, 1.0])
 def test_dust_correlation_matches_chi(chi):
     from renderer import noise as N
-    u, phi, zeta = _grid()
-    mmax = _DUST_NZ["m_max"]
+    u, phi, zeta = _dust_grid()
     m_hot = N._advected_m(u, phi, zeta, _DUST_NZ, seed=7)
     rho_cold = N.dust_density_mult(u, phi, zeta, _DUST_NZ, _dust_mp(chi), seed=7)
     m_cold = np.log(rho_cold)            # a_cold=1 ⇒ log ρ_cold == clamp(m_cold)
@@ -807,14 +806,14 @@ def test_dust_correlation_matches_chi(chi):
 
 def test_dust_variance_is_chi_invariant():
     from renderer import noise as N
-    u, phi, zeta = _grid()
+    u, phi, zeta = _dust_grid()
     var = [np.var(np.log(N.dust_density_mult(u, phi, zeta, _DUST_NZ, _dust_mp(c), seed=7)))
            for c in (-1.0, -0.6, 0.0, 0.6, 1.0)]
     assert max(var) / min(var) < 1.15, f"variance breathes across chi: {var}"
 
 def test_dust_chi_plus_one_is_hot_modulator():
     from renderer import noise as N
-    u, phi, zeta = _grid()
+    u, phi, zeta = _dust_grid()
     rho_hot = N.noise_density_mult(u, phi, zeta, _DUST_NZ, seed=7)
     rho_cold = N.dust_density_mult(u, phi, zeta, _DUST_NZ, _dust_mp(1.0), seed=7)
     np.testing.assert_allclose(rho_cold, rho_hot, rtol=1e-5, atol=1e-6)

@@ -421,3 +421,59 @@ def test_multiphase_params_uploaded():
     buf0 = tr.disk_noise_params.to_numpy()
     assert buf0[tr._NI_MP_EN] == 0.0
     assert buf0[tr._NI_MP_SIGFRAC] == 1.0  # ratio defaults to 1 (σ_cold=σ_hot)
+
+
+_SATOL = 1e-5  # same scalar-twin tolerance as test_noise_gpu.py
+
+
+def test_rho_cold_gpu_matches_cpu():
+    """GPU _disk_density_cks[1] (ρ_cold) == CPU dust_density_mult × gauss, within _SATOL.
+
+    Sampled at the midplane (ζ=0 ⇒ gauss=gauss_cold=1) so the index [1] reference is
+    exactly ``dust_density_mult`` and index [0] is ``noise_density_mult`` (the hot
+    multiplier). t_disk=0 with no dynamics block ⇒ the static stack (omega unused).
+    """
+    _ensure_cuda()
+    import taichi as ti
+    from renderer import noise as N
+
+    nz = {"m_max": 2.5,
+          "layers": {"base": {"enabled": True, "amp": 0.6, "octaves": 5,
+                              "lacunarity": 2, "gain": 0.5, "freq_u": 6.0, "freq_phi": 24}}}
+    mp = {"enabled": True, "dust_correlation": -0.6, "dust_amp": 1.0, "dust_sigma_frac": 0.8}
+    cfg = {"disk": {"noise": nz, "multiphase": mp}}
+    tr._setup_disk_noise(cfg)
+
+    r_inner, sigma0, beta, seed = 4.0, 0.1, 0.0, 7
+    us = np.linspace(0.1, 2.0, 16).astype(np.float32)
+    phis = np.linspace(-2.5, 2.5, 16).astype(np.float32)
+    uf = ti.field(ti.f32, us.size); uf.from_numpy(us)
+    pf = ti.field(ti.f32, phis.size); pf.from_numpy(phis)
+    out = ti.field(ti.f32, shape=(us.size, phis.size, 3))
+
+    @ti.kernel
+    def probe(r_inner: ti.f32, sigma0: ti.f32, beta: ti.f32, s: ti.i32):
+        for i, j in ti.ndrange(us.shape[0], phis.shape[0]):
+            u = uf[i]
+            phi = pf[j]
+            r = r_inner * ti.exp(u)
+            dz = 0.0 * sigma0          # ζ=0 midplane ⇒ gauss=1
+            d = tr._disk_density_cks(ti.cos(phi) * 1.0, ti.sin(phi) * 1.0, r, dz,
+                                     sigma0, beta, r_inner, 1e9, r_inner,
+                                     1, s, 0.0, 0.999)
+            out[i, j, 0] = d[0]
+            out[i, j, 1] = d[1]
+            out[i, j, 2] = d[2]
+
+    probe(r_inner, sigma0, beta, seed)
+    gpu = out.to_numpy()
+
+    # CPU reference on the same (u, φ) grid, ζ=0.
+    uu, pp = np.meshgrid(us, phis, indexing="ij")
+    u_flat = uu.ravel(); p_flat = pp.ravel()
+    z_flat = np.zeros_like(u_flat)
+    rho_hot = N.noise_density_mult(u_flat, p_flat, z_flat, nz, seed=seed).reshape(uu.shape)
+    rho_cold = N.dust_density_mult(u_flat, p_flat, z_flat, nz, mp, seed=seed).reshape(uu.shape)
+
+    assert np.allclose(gpu[:, :, 0], rho_hot, atol=_SATOL), float(np.abs(gpu[:, :, 0] - rho_hot).max())
+    assert np.allclose(gpu[:, :, 1], rho_cold, atol=_SATOL), float(np.abs(gpu[:, :, 1] - rho_cold).max())

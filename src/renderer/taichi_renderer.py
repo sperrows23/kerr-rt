@@ -172,6 +172,20 @@ _PT_LUT_INV_DR = 0.0
 # _NI_* scalars are plain Python ints baked at JIT (same pattern as _PT_LUT_N).
 disk_noise_params: ti.Field = None  # type: ignore[assignment]  (_NOISE_N,) f32
 
+# CKS-19 compile-time gate. The ρ_cold (dust) path roughly triples the inlined
+# `_disk_noise_m` tree (the hot blended modulator + a reseeded dust one, each a
+# dual-phase pair); because the curl/flow sub-tree compiles unconditionally
+# (its enables are runtime field reads), a *runtime* `if _NI_MP_EN` would compile
+# that tripled body into EVERY render — LLVM's superlinear inliner then turns it
+# into a multi-hour JIT even with multiphase OFF. So multiphase is gated by this
+# module bool via `ti.static(...)` instead of the param buffer: OFF ⇒ the dust
+# branch is not emitted at all ⇒ the default path compiles exactly as before and
+# golden frames are bit-identical. `_setup_disk_noise` sets it from the config;
+# setup_renderer re-runs `ti.init` (clearing the kernel cache) so the new value
+# takes effect on the next compile. TRADE-OFF (deliberate): toggling
+# `disk.multiphase.enabled` requires a recompile, unlike the other noise dials.
+_MP_COMPILE: bool = False
+
 # global
 _NI_M_MAX = 0
 # L0 base streaks (fbm2 on density)
@@ -601,10 +615,15 @@ def _setup_disk_noise(cfg: dict) -> None:
     # ρ_cold≡ρ_hot ⇒ single-phase march bit-identical (constraint 6). `multiphase`
     # is a sibling of `noise` under `disk` (d), NOT derived ⇒ no CKS-13 change.
     mp = d.get("multiphase", {}) or {}
-    buf[_NI_MP_EN] = 1.0 if mp.get("enabled", False) else 0.0
+    mp_enabled = bool(mp.get("enabled", False))
+    buf[_NI_MP_EN] = 1.0 if mp_enabled else 0.0
     buf[_NI_MP_CHI] = float(mp.get("dust_correlation", -0.6))
     buf[_NI_MP_AMP] = float(mp.get("dust_amp", 1.0))
     buf[_NI_MP_SIGFRAC] = float(mp.get("dust_sigma_frac", 1.0))
+    # Compile-time gate (see _MP_COMPILE): OFF ⇒ the dust branch is not emitted, so
+    # the default path keeps its original (bit-identical) JIT. Read via ti.static.
+    global _MP_COMPILE
+    _MP_COMPILE = mp_enabled
 
     disk_noise_params = ti.field(dtype=ti.f32, shape=_NOISE_N)
     disk_noise_params.from_numpy(buf)
@@ -1128,27 +1147,10 @@ def _disk_noise_m(u, phi, zeta, seed, t_disk):
 
 
 @ti.func
-def _disk_noise_density_mult(u, phi, zeta, t_disk, omega, seed):
-    """Procedural-noise density multiplier (D2.3; SKILL.md CKS-12 §2–3, spec §4).
-
-    GPU twin of :func:`noise.noise_density_mult`. Evaluates the L0/L1/L2 layer stack
-    (:func:`_disk_noise_m`) and returns ``exp(clamp(m, ±m_max)) > 0`` — the multiplier
-    on the Gaussian vertical density (feeds BOTH emission and absorption, so clumps
-    self-shadow). Only called when ``noise_enabled == 1``; the disabled path never
-    touches density (constraint 6, bit-identical golden frames).
-
-    **Keplerian shear advection (CKS-12 §2).** With ``T = disk_noise_params[_NI_SHEAR_T]``
-    (= ``disk.dynamics.shear_period_M``) > 0 the whole stack is evaluated at two
-    staggered reset phases ``φ′_k = φ − Ω(r)·a_k·T`` (``a_k = frac(s + k/2)``,
-    ``s = t_disk/T``) and crossfaded with triangle weights ``w_k = 1 − |2a_k − 1|``;
-    each phase draws a per-cycle reseed (``c_k = floor(s + k/2)``) so the loop does not
-    repeat with period T. ``_NI_VAR_PRESERVE`` divides the blend by ``√(w_0² + w_1²)``
-    to kill the mid-crossfade contrast breathing. ``omega`` = Ω(r) (Formula 3) is
-    supplied by the caller. ``_NI_DYNAMISM`` is a non-physical viz gain on the shear
-    amount (``φ′ = φ − dynamism·Ω·a·T``; 1.0 reproduces the formula bit-for-bit, >1
-    exaggerates the differential winding). With ``T ≤ 0`` (no ``disk.dynamics`` block)
-    the field is static — sampled directly at ``φ`` — i.e. exactly the D2.2 path.
-    """
+def _disk_blended_m(u, phi, zeta, t_disk, omega, seed):
+    """Pre-clamp blended modulator m (CKS-12 §2 dual-phase shear + §4 stack),
+    BEFORE the ±m_max clamp and exp. GPU twin of noise._advected_m. CKS-19 calls
+    it twice (hot seed, dust seed) for the ρ_cold correlation mix."""
     T = disk_noise_params[_NI_SHEAR_T]
     m = 0.0
     if T <= 0.0:
@@ -1176,7 +1178,63 @@ def _disk_noise_density_mult(u, phi, zeta, t_disk, omega, seed):
         wsq += w1 * w1
         if disk_noise_params[_NI_VAR_PRESERVE] > 0.5 and wsq > 0.0:
             m = m / ti.sqrt(wsq)
+    return m
 
+
+@ti.func
+def _disk_cold_mult_from_hot(m_hot, u, phi, zeta, t_disk, omega, seed):
+    """CKS-19 cold (dust) modulator given the ALREADY-computed hot modulator
+    ``m_hot`` (pre-clamp). ``m_cold = a_cold·(χ·m_hot + √(1−χ²)·m_dust)``, where
+    ``m_dust`` is the same dual-phase stack reseeded by ``_NSEED_DUST`` (equal
+    variance ⇒ sampled Pearson r = χ). Returns ``exp(clamp(m_cold, ±m_max))``.
+
+    Taking ``m_hot`` as a parameter lets the production caller
+    (:func:`_disk_density_cks`) reuse the hot modulator it already evaluated for
+    ρ_hot, so the dust path adds only ONE more ``_disk_blended_m`` (the dust seed)
+    rather than recomputing the hot one — halving the extra inlined noise tree
+    (the JIT-blowup fix; see ``_MP_COMPILE``)."""
+    chi = disk_noise_params[_NI_MP_CHI]
+    a_cold = disk_noise_params[_NI_MP_AMP]
+    m_dust = _disk_blended_m(u, phi, zeta, t_disk, omega, seed + _NSEED_DUST)
+    s = ti.sqrt(1.0 - chi * chi)
+    m_cold = a_cold * (chi * m_hot + s * m_dust)
+    mmax = disk_noise_params[_NI_M_MAX]
+    m_cold = ti.min(ti.max(m_cold, -mmax), mmax)
+    return ti.exp(m_cold)
+
+
+@ti.func
+def _disk_dust_density_mult(u, phi, zeta, t_disk, omega, seed):
+    """CKS-19 cold modulator exp(clamp(a_cold·m_cold)) — self-contained GPU twin of
+    noise.dust_density_mult (computes its own m_hot, then mixes). Used by the parity
+    test; the production path uses :func:`_disk_cold_mult_from_hot` to share m_hot."""
+    m_hot = _disk_blended_m(u, phi, zeta, t_disk, omega, seed)
+    return _disk_cold_mult_from_hot(m_hot, u, phi, zeta, t_disk, omega, seed)
+
+
+@ti.func
+def _disk_noise_density_mult(u, phi, zeta, t_disk, omega, seed):
+    """Procedural-noise density multiplier (D2.3; SKILL.md CKS-12 §2–3, spec §4).
+
+    GPU twin of :func:`noise.noise_density_mult`. Evaluates the L0/L1/L2 layer stack
+    (:func:`_disk_noise_m`) and returns ``exp(clamp(m, ±m_max)) > 0`` — the multiplier
+    on the Gaussian vertical density (feeds BOTH emission and absorption, so clumps
+    self-shadow). Only called when ``noise_enabled == 1``; the disabled path never
+    touches density (constraint 6, bit-identical golden frames).
+
+    **Keplerian shear advection (CKS-12 §2).** With ``T = disk_noise_params[_NI_SHEAR_T]``
+    (= ``disk.dynamics.shear_period_M``) > 0 the whole stack is evaluated at two
+    staggered reset phases ``φ′_k = φ − Ω(r)·a_k·T`` (``a_k = frac(s + k/2)``,
+    ``s = t_disk/T``) and crossfaded with triangle weights ``w_k = 1 − |2a_k − 1|``;
+    each phase draws a per-cycle reseed (``c_k = floor(s + k/2)``) so the loop does not
+    repeat with period T. ``_NI_VAR_PRESERVE`` divides the blend by ``√(w_0² + w_1²)``
+    to kill the mid-crossfade contrast breathing. ``omega`` = Ω(r) (Formula 3) is
+    supplied by the caller. ``_NI_DYNAMISM`` is a non-physical viz gain on the shear
+    amount (``φ′ = φ − dynamism·Ω·a·T``; 1.0 reproduces the formula bit-for-bit, >1
+    exaggerates the differential winding). With ``T ≤ 0`` (no ``disk.dynamics`` block)
+    the field is static — sampled directly at ``φ`` — i.e. exactly the D2.2 path.
+    """
+    m = _disk_blended_m(u, phi, zeta, t_disk, omega, seed)
     mmax = disk_noise_params[_NI_M_MAX]
     m = ti.min(ti.max(m, -mmax), mmax)
     return ti.exp(m)
@@ -1267,11 +1325,16 @@ def _disk_density_cks(
     Single source of truth for the density used by BOTH the emission march
     (``_disk_emit_cks``) and the CKS-15 radial deep-shadow bake — extracting it
     here is what keeps the two from drifting. Returns
-    ``vec2(density, temp_factor)``:
+    ``vec3(density, density_cold, temp_factor)``:
 
-    - ``density`` — Gaussian envelope × §3 noise multiplier × ragged-edge window.
-      Feeds emission, dτ, and the shadow optical depth. enabled==0 ⇒ the bare
-      Gaussian (legacy path bit-identical, constraint 6).
+    - ``density`` (= ρ_hot) — Gaussian envelope × §3 noise multiplier × ragged-edge
+      window. Feeds EMISSION. enabled==0 ⇒ the bare Gaussian (legacy path
+      bit-identical, constraint 6).
+    - ``density_cold`` (= ρ_cold, CKS-19) — the decoupled ABSORPTION density: the
+      variance-preserving Pearson mix of the hot modulator and a reseeded dust
+      stack, on a (possibly thinner) σ_cold = σ_hot·sigfrac slab. Feeds dτ and the
+      shadow optical depth. ``_NI_MP_EN==0`` (or noise off) ⇒ ρ_cold ≡ ρ_hot, so
+      the grey-κ single-phase march is bit-identical (constraint 6).
     - ``temp_factor`` — the §3 emitted-temperature lump (applied to ``T_emit``
       downstream, BEFORE the g shift — constraint 2). 1.0 unless §3 modulation
       (``_NI_MOD_EN``) is on, so the non-modulated path is unaffected.
@@ -1289,6 +1352,9 @@ def _disk_density_cks(
     if flare_beta != 0.0:
         sigma_eff = sigma_theta * ti.pow(r / r_inner, flare_beta)
     density = ti.exp(-0.5 * (dz_ang / sigma_eff) ** 2)
+    # CKS-19: cold absorbing phase. Default ρ_cold ≡ ρ_hot (the bare Gaussian when
+    # noise is off, the hot density when MP is off) ⇒ grey-κ march bit-identical.
+    density_cold = density
     temp_factor = 1.0
     # D2.2 procedural turbulence (SKILL.md CKS-12 §3): multiply the Gaussian
     # density by the noise field (amplitude only — feeds BOTH emission and
@@ -1301,7 +1367,12 @@ def _disk_density_cks(
         # Ω(r) = 1/(r^{3/2}+a) — Formula 3 (prograde), the shear-advection rate
         # (CKS-12 §2). d/dt atan2(y,x) = Ω co-moves with the CKS-8 gas.
         omega = 1.0 / (r * ti.sqrt(r) + a)
-        dmult = _disk_noise_density_mult(u_n, phi_n, zeta_n, t_disk, omega, noise_seed)
+        # Hot modulator, kept pre-clamp so the CKS-19 dust path can reuse it (the
+        # JIT-blowup fix; see _MP_COMPILE). exp(clamp(m_hot)) IS _disk_noise_density_mult
+        # bit-for-bit, so ρ_hot — and every golden frame — is unchanged.
+        m_hot = _disk_blended_m(u_n, phi_n, zeta_n, t_disk, omega, noise_seed)
+        mmax = disk_noise_params[_NI_M_MAX]
+        dmult = ti.exp(ti.min(ti.max(m_hot, -mmax), mmax))
         gauss = density  # base Gaussian (unmodulated σ); reassigned below
         win = 1.0        # edge window (1.0 = hard cutoff already enforced)
         # D2.4 §3 modulation (temperature / ragged edges / lumpy scale height).
@@ -1329,7 +1400,19 @@ def _disk_density_cks(
             t_amp = disk_noise_params[_NI_MOD_TEMP_AMP]
             temp_factor = 1.0 + t_amp * (mf[0] - 0.5)
         density = gauss * dmult * win
-    return vec2(density, temp_factor)
+        # CKS-19: cold absorbing phase. ti.static gate (NOT a runtime _NI_MP_EN
+        # branch) so the dust noise tree is emitted ONLY when multiphase is on —
+        # otherwise it would compile into every render and blow up the JIT (see
+        # _MP_COMPILE). OFF ⇒ this block vanishes ⇒ ρ_cold ≡ ρ_hot, bit-identical.
+        density_cold = density
+        if ti.static(_MP_COMPILE):
+            # Reuse the hot modulator (only the dust seed re-evaluates the stack).
+            dmult_cold = _disk_cold_mult_from_hot(
+                m_hot, u_n, phi_n, zeta_n, t_disk, omega, noise_seed)
+            sigma_cold = sigma_eff * disk_noise_params[_NI_MP_SIGFRAC]
+            gauss_cold = ti.exp(-0.5 * (dz_ang / sigma_cold) ** 2)
+            density_cold = gauss_cold * dmult_cold * win
+    return vec3(density, density_cold, temp_factor)
 
 
 @ti.func
