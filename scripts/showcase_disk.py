@@ -105,14 +105,14 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument(
         "--noise-boost", type=float, default=1.0,
         help="showcase-only contrast multiplier on the noise AMPLITUDE dials (layer amps, "
-        "m_max, temp/edge/height amps) so the §3 structure reads strongly. 1.0 = the "
+        "m_max, temp/edge/height amps) so the sec.3 structure reads strongly. 1.0 = the "
         "committed production look; the geometry/g/g4 path is untouched.",
     )
     p.add_argument("--dynamism", type=float, default=None, help="override disk.noise.dynamism")
     p.add_argument("--doppler", type=float, default=None, help="override disk.doppler_strength (0=symmetric Interstellar look)")
     p.add_argument(
         "--peak-temp", type=float, default=None,
-        help="override disk.target_peak_temperature (K). LOWER → the blackbody chromaticity "
+        help="override disk.target_peak_temperature (K). LOWER -> the blackbody chromaticity "
         "(Formula 9) sits in the saturated-amber band (~2500-3200) instead of pale cream "
         "(5500). Re-derives T_0 through the CKS-13 resolver. Look-dev hue dial; pure chroma.",
     )
@@ -125,16 +125,16 @@ def main(argv: list[str] | None = None) -> None:
     # --- volumetric / close-up look-dev overrides (disk geometry + opacity) ---
     p.add_argument("--thickness", type=float, default=None, help="override disk.theta_half_width (puffier slab)")
     p.add_argument("--sigma-frac", type=float, default=None, help="override disk.vertical_sigma_frac")
-    p.add_argument("--absorption", type=float, default=None, help="override disk.absorption_coeff (optical depth → dark voids)")
+    p.add_argument("--absorption", type=float, default=None, help="override disk.absorption_coeff (optical depth -> dark voids)")
     p.add_argument("--emission", type=float, default=None, help="override disk.emission_coeff")
-    p.add_argument("--m-max", type=float, default=None, help="override disk.noise.m_max (density swing → deeper holes)")
+    p.add_argument("--m-max", type=float, default=None, help="override disk.noise.m_max (density swing -> deeper holes)")
     # --- Ergonomic fast↔volumetric switch + self-shadow cost/accuracy preset ---
     p.add_argument(
         "--quality", choices=("fast", "balanced", "hero"), default="fast",
         help="render path preset. fast = noise+bloom only (~12s/4K, the video path). "
         "balanced/hero = volumetric void-carving (CKS-14 source fn + CKS-17 3D self-shadow) "
         "at a moderate / high deep-shadow-map grid (the cost knob is the grid resolution: "
-        "bake is O(NU²·NPHI·NZ)). Explicit --source-function/--self-shadow/--shadow-grid "
+        "bake is O(NU^2*NPHI*NZ)). Explicit --source-function/--self-shadow/--shadow-grid "
         "override the preset. Use this to switch paths and balance render time per shot.",
     )
     # --- V1 volumetric: CKS-14 source function + CKS-15 self-shadow (the voids) ---
@@ -162,12 +162,12 @@ def main(argv: list[str] | None = None) -> None:
         "--curl", action="store_true",
         help="enable disk.noise.curl (CKS-18 in-plane divergence-free domain warp): "
         "warps the noise coords by the 2-D curl of an sfbm3 potential so the laminar "
-        "§2 shear winds turbulent eddies into filaments. If --curl-amp is not given, a "
+        "sec.2 shear winds turbulent eddies into filaments. If --curl-amp is not given, a "
         "visible default amp (0.12) is applied.",
     )
     p.add_argument(
         "--curl-amp", type=float, default=None,
-        help="override disk.noise.curl.amp (displacement amplitude; 0 ⇒ identity). "
+        help="override disk.noise.curl.amp (displacement amplitude; 0 -> identity). "
         "Try ~0.05-0.2. Implies --curl.",
     )
     p.add_argument(
@@ -176,12 +176,36 @@ def main(argv: list[str] | None = None) -> None:
         "the eddies BOIL in time with clock T_c (geometric M). >0 animates the warp "
         "across frames; <=0 (default) is the static V3.0 warp. Implies --curl. Try ~3-12.",
     )
+    # --- P2 multi-phase media: CKS-19 emission rho_hot vs absorption rho_cold split (the silhouettes) ---
+    p.add_argument(
+        "--multiphase", action="store_true",
+        help="enable disk.multiphase (CKS-19): decouple absorption density rho_cold from "
+        "emission rho_hot so a cold dust phase carves dark SILHOUETTES into the glow. "
+        "Pair with --absorption ~2 so the cold dust has optical depth. Toggling this "
+        "forces a one-time kernel recompile (the _MP_COMPILE ti.static gate).",
+    )
+    p.add_argument(
+        "--dust-correlation", type=float, default=None, metavar="CHI",
+        help="override disk.multiphase.dust_correlation chi in [-1,1] (implies --multiphase). "
+        "chi<0 anti-correlates: cold dust fills the hot voids -> darkest lanes. chi=-1 is "
+        "full anti-correlation; chi=+1 makes rho_cold==rho_hot (pure dimming). Default -0.6.",
+    )
+    p.add_argument(
+        "--dust-amp", type=float, default=None, metavar="A",
+        help="override disk.multiphase.dust_amp (implies --multiphase): density swing of "
+        "the cold modulator -> deeper silhouettes. Try ~1-2.5.",
+    )
+    p.add_argument(
+        "--dust-sigma-frac", type=float, default=None, metavar="F",
+        help="override disk.multiphase.dust_sigma_frac (implies --multiphase): cold-slab "
+        "scale height as a fraction of the hot slab (thinner dust -> sharper lanes). Try ~0.5-1.",
+    )
     # --- NON-PHYSICAL color grade (VISUALIZATION, like doppler_strength) — the warm-amber
     #     reference look. Overrides render.color_grade; identity defaults ⇒ ungraded. ---
     p.add_argument("--saturation", type=float, default=None,
                    help="override render.color_grade.saturation (1=unchanged, >1 richer amber)")
     p.add_argument("--tint", default=None,
-                   help="override render.color_grade.tint as 'r,g,b' linear gain (warm amber ≈ '1.15,1.0,0.8')")
+                   help="override render.color_grade.tint as 'r,g,b' linear gain (warm amber ~ '1.15,1.0,0.8')")
     p.add_argument("--amber", action="store_true",
                    help="convenience preset: saturation 1.6 + warm tint 1.18,1.0,0.74 (the Interstellar amber grade)")
     p.add_argument("--save-hdr", default=None, help="also dump the raw HDR buffer to this .npy")
@@ -248,6 +272,18 @@ def main(argv: list[str] | None = None) -> None:
         # V3.1 (CKS-18 sec.2): >0 ⇒ eddies boil; <=0 ⇒ static V3.0 warp (bit-for-bit).
         if args.flow_period is not None:
             curl["flow_period_M"] = float(args.flow_period)
+    # P2 multi-phase (CKS-19). Default OFF in the YAML; --multiphase / any --dust-* turn it
+    # on for look-dev. enabled:false ⇒ ρ_cold≡ρ_hot ⇒ bit-identical to single-phase.
+    if args.multiphase or args.dust_correlation is not None or args.dust_amp is not None \
+            or args.dust_sigma_frac is not None:
+        mp = cfg["disk"].setdefault("multiphase", {})
+        mp["enabled"] = True
+        if args.dust_correlation is not None:
+            mp["dust_correlation"] = float(args.dust_correlation)
+        if args.dust_amp is not None:
+            mp["dust_amp"] = float(args.dust_amp)
+        if args.dust_sigma_frac is not None:
+            mp["dust_sigma_frac"] = float(args.dust_sigma_frac)
     if args.noise_boost != 1.0:
         # Scale only the AMPLITUDE dials (how far the [0,1] envelopes swing), never the
         # frequencies/seed/geometry — pure look-dev re-upload through _setup_disk_noise.
@@ -292,6 +328,9 @@ def main(argv: list[str] | None = None) -> None:
     curl_on = bool(curl_cfg.get("enabled", False)) and float(curl_cfg.get("amp", 0.0)) != 0.0
     sf_on = bool(vol.get("source_function", False))
     ssh_on = bool(vol.get("self_shadow", {}).get("enabled", False))
+    mp_cfg = cfg["disk"].get("multiphase", {})
+    mp_on = bool(mp_cfg.get("enabled", False))
+    mp_status = f"on(chi={mp_cfg.get('dust_correlation', -0.6)})" if mp_on else "off"
     curl_flow = float(curl_cfg.get("flow_period_M", 0.0))
     curl_status = (
         f"on(amp={curl_cfg.get('amp')}"
@@ -307,7 +346,7 @@ def main(argv: list[str] | None = None) -> None:
         f"rendering {args.width}x{args.height}  incl={args.elevation}°  r={args.radius}M  "
         f"fov={args.fov_deg}°  noise={'on' if noise_on else 'off'}  curl={curl_status}  "
         f"source_fn={'on' if sf_on else 'off'}  self_shadow={'on' if ssh_on else 'off'}  "
-        f"t_disk={t_disk:.3f} ..."
+        f"multiphase={mp_status}  t_disk={t_disk:.3f} ..."
     )
     t0 = time.time()
     beauty = tr.render_beauty_frame(
