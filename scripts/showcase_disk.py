@@ -200,6 +200,13 @@ def main(argv: list[str] | None = None) -> None:
         help="override disk.multiphase.dust_sigma_frac (implies --multiphase): cold-slab "
         "scale height as a fraction of the hot slab (thinner dust -> sharper lanes). Try ~0.5-1.",
     )
+    p.add_argument(
+        "--extinction", default=None, metavar="R,G,B",
+        help="override disk.extinction_rgb (CKS-19 Task 7): per-channel kappa multiplier on "
+        "absorption_coeff as 'r,g,b'. Grey '1,1,1' = neutral darkening. kB>kR (e.g. "
+        "'0.6,1.0,1.6') reddens cold-dust lanes (astrophysical reddening). Pair with "
+        "--absorption / --multiphase so there is optical depth to redden.",
+    )
     # --- NON-PHYSICAL color grade (VISUALIZATION, like doppler_strength) — the warm-amber
     #     reference look. Overrides render.color_grade; identity defaults ⇒ ungraded. ---
     p.add_argument("--saturation", type=float, default=None,
@@ -284,6 +291,16 @@ def main(argv: list[str] | None = None) -> None:
             mp["dust_amp"] = float(args.dust_amp)
         if args.dust_sigma_frac is not None:
             mp["dust_sigma_frac"] = float(args.dust_sigma_frac)
+    # CKS-19 Task 7 chromatic extinction. Applies to the disk dtau regardless of
+    # multiphase; grey '1,1,1' is bit-identical to the scalar march.
+    if args.extinction is not None:
+        try:
+            ext = [float(v) for v in args.extinction.split(",")]
+            if len(ext) != 3:
+                raise ValueError
+        except ValueError:
+            p.error("--extinction must be three comma-separated floats, e.g. 0.6,1.0,1.6")
+        cfg["disk"]["extinction_rgb"] = ext
     if args.noise_boost != 1.0:
         # Scale only the AMPLITUDE dials (how far the [0,1] envelopes swing), never the
         # frequencies/seed/geometry — pure look-dev re-upload through _setup_disk_noise.
@@ -331,6 +348,8 @@ def main(argv: list[str] | None = None) -> None:
     mp_cfg = cfg["disk"].get("multiphase", {})
     mp_on = bool(mp_cfg.get("enabled", False))
     mp_status = f"on(chi={mp_cfg.get('dust_correlation', -0.6)})" if mp_on else "off"
+    ext_rgb = cfg["disk"].get("extinction_rgb", [1.0, 1.0, 1.0])
+    ext_status = "grey" if list(ext_rgb) == [1.0, 1.0, 1.0] else str(list(ext_rgb))
     curl_flow = float(curl_cfg.get("flow_period_M", 0.0))
     curl_status = (
         f"on(amp={curl_cfg.get('amp')}"
@@ -346,7 +365,7 @@ def main(argv: list[str] | None = None) -> None:
         f"rendering {args.width}x{args.height}  incl={args.elevation}°  r={args.radius}M  "
         f"fov={args.fov_deg}°  noise={'on' if noise_on else 'off'}  curl={curl_status}  "
         f"source_fn={'on' if sf_on else 'off'}  self_shadow={'on' if ssh_on else 'off'}  "
-        f"multiphase={mp_status}  t_disk={t_disk:.3f} ..."
+        f"multiphase={mp_status}  extinction={ext_status}  t_disk={t_disk:.3f} ..."
     )
     t0 = time.time()
     beauty = tr.render_beauty_frame(

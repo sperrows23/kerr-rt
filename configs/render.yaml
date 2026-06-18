@@ -52,6 +52,10 @@ disk:
                            # disk is optically thin and the g⁴-beamed inner edge is not washed out.
   absorption_coeff: 0.8   # volumetric absorption scale (visualization). RECALIBRATED for CKS ds
                            # (2026-06-07; was 1.5) — same ~1/30 BL-Mino→CKS-affine rescale.
+  extinction_rgb: [1.0, 1.0, 1.0]  # CKS-19 Task 7: per-channel κ⃗ multiplier on absorption_coeff.
+                           # Grey [1,1,1] = neutral darkening (bit-identical to the scalar march).
+                           # κ_B>κ_R (e.g. [0.6,1.0,1.6]) reddens cold-dust lanes — astrophysical
+                           # dust reddening. Most visible with disk.multiphase on (a ρ_cold absorber).
   vertical_sigma_frac: 0.2 # gaussian scale height as fraction of theta_half_width
   max_step_vfrac: 0.5      # disk-thickness adaptive-step cap (Pipe B). While a ray is inside the
                            # slab its geodesic step is shrunk so the VERTICAL displacement |dz/dλ|·h

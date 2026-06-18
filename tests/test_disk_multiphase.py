@@ -102,3 +102,45 @@ def test_dust_carves_silhouette():
     darkened = lum_on < lum_off - 1e-4
     assert darkened.mean() > 0.02, "dust did not darken any appreciable region"
     assert lum_on.min() < lum_off.min(), "dust did not create a new darkest pixel"
+
+
+def _absorbing_scene():
+    """A bright, turbulent, optically-THICK single-phase disk (multiphase OFF).
+
+    Task 7's chromatic extinction κ⃗ applies in the march regardless of the
+    emission/absorption density split, so it is exercised here on the single-phase
+    (MP-off) path — the same kernel as ``test_gpu_regression`` — to avoid the
+    separate MP-on cold compile. High absorption gives the disk real optical depth
+    so per-channel extinction visibly reddens the light transmitted through it."""
+    cfg = copy.deepcopy(tr.load_config())
+    cfg["disk"]["temperature_model"] = "simple"
+    cfg["disk"]["doppler_strength"] = 1.0
+    cfg["disk"]["absorption_coeff"] = 3.0   # thick enough that κ⃗ reddening is visible
+    cfg["disk"].setdefault("noise", {})["enabled"] = True
+    cfg["disk"].setdefault("multiphase", {})["enabled"] = False
+    return cfg
+
+
+def test_chromatic_extinction_reddens():
+    """CKS-19 Task 7: per-channel κ⃗ = absb_c·extinction_rgb. With κ_B > κ_R the cold
+    medium absorbs blue more than red, so light surviving through it is WARMER
+    (reddened) than under grey extinction — astrophysical dust reddening.
+
+    Compared to a grey [1,1,1] reference (same scene), a strongly blue-weighted
+    extinction [0.3, 1.0, 3.0] must let proportionally MORE red than blue survive:
+    red retention dr = ΣR_red/ΣR_grey > blue retention db = ΣB_red/ΣB_grey.
+    On the pre-Task-7 march (scalar transmittance, extinction_rgb ignored) the two
+    renders are identical ⇒ dr == db ⇒ this fails, which is the missing feature."""
+    base = _absorbing_scene()
+    cfg_grey = copy.deepcopy(base); cfg_grey["disk"]["extinction_rgb"] = [1.0, 1.0, 1.0]
+    cfg_red = copy.deepcopy(base);  cfg_red["disk"]["extinction_rgb"] = [0.3, 1.0, 3.0]
+
+    img_grey = _render(cfg_grey)
+    img_red = _render(cfg_red)
+
+    dr = img_red[..., 0].sum() / max(img_grey[..., 0].sum(), 1e-6)
+    db = img_red[..., 2].sum() / max(img_grey[..., 2].sum(), 1e-6)
+    assert dr > db * 1.01, (
+        f"chromatic extinction did not redden the disk: red retention {dr:.4f} "
+        f"not > blue retention {db:.4f}"
+    )

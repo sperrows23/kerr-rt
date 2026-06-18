@@ -144,7 +144,7 @@ _RES = 0
 frame_pixels: ti.Field = None  # type: ignore[assignment]
 # Kernel-split hand-off buffers (Phase 2.4): physics kernel writes, shading reads.
 exit_buf: ti.Field = None  # type: ignore[assignment]  (H,W,3): cosθ′, φ′, outcome
-disk_buf: ti.Field = None  # type: ignore[assignment]  (H,W,4): disk_rgb + transmittance
+disk_buf: ti.Field = None  # type: ignore[assignment]  (H,W,6): disk_rgb + vec3 transmittance (CKS-19 Task 7)
 depth_pixels: ti.Field = None  # type: ignore[assignment]  (H,W): transmittance-weighted Z (3.4)
 _FW = 0
 _FH = 0
@@ -684,7 +684,7 @@ def _alloc_frame(width: int, height: int) -> None:
     if frame_pixels is None or width != _FW or height != _FH:
         frame_pixels = ti.field(dtype=ti.f32, shape=(height, width, 3))
         exit_buf = ti.field(dtype=ti.f32, shape=(height, width, 3))
-        disk_buf = ti.field(dtype=ti.f32, shape=(height, width, 4))
+        disk_buf = ti.field(dtype=ti.f32, shape=(height, width, 6))
         depth_pixels = ti.field(dtype=ti.f32, shape=(height, width))
         _FW = width
         _FH = height
@@ -1823,6 +1823,9 @@ def render_beauty_physics(
     T_0: float,
     emis_c: float,
     absb_c: float,
+    ext_r: float,
+    ext_g: float,
+    ext_b: float,
     disk_model: int,
     doppler_strength: float,
     max_step_vfrac: float,
@@ -1882,7 +1885,11 @@ def render_beauty_physics(
         phi_exit = 0.0
 
         disk_col = vec3(0.0, 0.0, 0.0)
-        transm = 1.0
+        # CKS-19 Task 7: per-channel transmittance T⃗. dτ⃗ = κ⃗·ρ_cold·ds with
+        # κ⃗ = absb_c·extinction_rgb; κ_B>κ_R reddens light surviving through dust.
+        # Grey extinction (1,1,1) ⇒ all three components stay equal at every step ⇒
+        # the scalar single-phase march is reproduced bit-for-bit (constraint 6).
+        transm = vec3(1.0, 1.0, 1.0)
         ray_length = 0.0  # accumulated affine path length (depth proxy)
         weighted_depth = 0.0  # Σ ray_length·contribution  (optimization Phase 3.4)
         total_emission = 0.0  # Σ contribution
@@ -2002,18 +2009,31 @@ def render_beauty_physics(
                     # limit w→dτ ⇒ w·S→emission (→ legacy to O(dτ²)). Its real payoff
                     # is materialising S so CKS-15 self-shadow can dim it (S·e^{−τ_s}).
                     # g-bookkeeping unchanged: S carries g_eff⁴·chroma exactly once.
+                    # CKS-19 Task 7: ev[3] is the GREY base dτ = absb_c·ρ_cold·ds; the
+                    # per-channel optical depth is dτ⃗ = base·extinction_rgb. The CKS-14
+                    # source-function factor f = (1−e^{−dτ})/dτ becomes per-channel (S⃗
+                    # differs by channel only through dτ⃗; the emission j is unchanged).
+                    # Grey extinction ⇒ dtau_v ≡ base ⇒ f⃗ ≡ scalar w ⇒ bit-identical.
                     dtau = ev[3]
+                    dtau_v = vec3(dtau * ext_r, dtau * ext_g, dtau * ext_b)
                     added = vec3(ev[0], ev[1], ev[2])
                     if source_function == 1 and dtau > _RTE_TAU_EPS:
-                        w = (1.0 - ti.exp(-dtau)) / dtau     # = w·(1/dτ); ·emission = w·S
-                        added = vec3(ev[0] * w, ev[1] * w, ev[2] * w)
-                    disk_col += transm * added
+                        f = vec3(1.0, 1.0, 1.0)
+                        for c in ti.static(range(3)):
+                            if dtau_v[c] > _RTE_TAU_EPS:
+                                f[c] = (1.0 - ti.exp(-dtau_v[c])) / dtau_v[c]
+                        added = vec3(ev[0] * f[0], ev[1] * f[1], ev[2] * f[2])
+                    disk_col += vec3(transm[0] * added[0], transm[1] * added[1], transm[2] * added[2])
                     # depth / total_emission key off the radiance actually contributed,
                     # so the transmittance-weighted Z stays consistent with the march.
-                    contribution = transm * (added[0] + added[1] + added[2])
+                    # transm[0] (any channel; equal in grey) keeps the depth proxy
+                    # bit-identical to the pre-Task-7 scalar march.
+                    contribution = transm[0] * (added[0] + added[1] + added[2])
                     weighted_depth += ray_length * contribution
                     total_emission += contribution
-                    transm *= ti.exp(-dtau)
+                    transm[0] *= ti.exp(-dtau_v[0])
+                    transm[1] *= ti.exp(-dtau_v[1])
+                    transm[2] *= ti.exp(-dtau_v[2])
 
                 s = _rk4_step_k1(s, a, local_h, k1)
                 ray_length += local_h
@@ -2025,7 +2045,9 @@ def render_beauty_physics(
         disk_buf[py, px, 0] = disk_col[0]
         disk_buf[py, px, 1] = disk_col[1]
         disk_buf[py, px, 2] = disk_col[2]
-        disk_buf[py, px, 3] = transm
+        disk_buf[py, px, 3] = transm[0]
+        disk_buf[py, px, 4] = transm[1]
+        disk_buf[py, px, 5] = transm[2]
         # optimization Phase 3.4: emission-weighted mean depth, or +∞ sentinel for empty pixels.
         if total_emission > 1e-6:
             depth_pixels[py, px] = weighted_depth / total_emission
@@ -2334,8 +2356,10 @@ def render_beauty_shade(
                 bg = _sample_trilinear(u, v, lod)
 
         disk_col = vec3(disk_buf[py, px, 0], disk_buf[py, px, 1], disk_buf[py, px, 2])
-        transm = disk_buf[py, px, 3]
-        col = disk_col + transm * bg
+        # CKS-19 Task 7: per-channel transmittance reddens the background seen through
+        # cold dust (T⃗ ⊙ bg). Grey extinction ⇒ all three equal ⇒ scalar transm·bg.
+        transm = vec3(disk_buf[py, px, 3], disk_buf[py, px, 4], disk_buf[py, px, 5])
+        col = disk_col + vec3(transm[0] * bg[0], transm[1] * bg[1], transm[2] * bg[2])
         frame_pixels[py, px, 0] = col[0]
         frame_pixels[py, px, 1] = col[1]
         frame_pixels[py, px, 2] = col[2]
@@ -2553,6 +2577,14 @@ def render_beauty_frame(
             a,
         )
 
+    # CKS-19 Task 7: chromatic extinction κ⃗ = absb_c·extinction_rgb. Optional list
+    # [kR,kG,kB]; absent/grey [1,1,1] ⇒ neutral, scalar-march bit-identical. κ_B>κ_R
+    # reddens dust lanes (astrophysical reddening). A scalar value broadcasts to grey.
+    ext_cfg = d.get("extinction_rgb", [1.0, 1.0, 1.0])
+    if not isinstance(ext_cfg, (list, tuple)):
+        ext_cfg = [ext_cfg, ext_cfg, ext_cfg]
+    ext_rgb = (float(ext_cfg[0]), float(ext_cfg[1]), float(ext_cfg[2]))
+
     _alloc_frame(width, height)
     # Phase 2.4 kernel split: physics pass writes exit_buf/disk_buf, shading pass
     # computes the screen-space-Jacobian LOD and composites.
@@ -2594,6 +2626,11 @@ def render_beauty_frame(
         float(d["T_0"]),
         float(d["emission_coeff"]),
         float(d["absorption_coeff"]),
+        # CKS-19 Task 7: per-channel extinction multiplier κ⃗ = absb_c·extinction_rgb.
+        # Grey default [1,1,1] ⇒ neutral darkening, bit-identical to the scalar march.
+        ext_rgb[0],
+        ext_rgb[1],
+        ext_rgb[2],
         disk_model,
         doppler_strength,
         float(d.get("max_step_vfrac", 0.5)),
