@@ -186,6 +186,14 @@ disk_noise_params: ti.Field = None  # type: ignore[assignment]  (_NOISE_N,) f32
 # `disk.multiphase.enabled` requires a recompile, unlike the other noise dials.
 _MP_COMPILE: bool = False
 
+# CKS-20 single-scattering compile gate (same rationale as _MP_COMPILE above): the
+# scatter body (a ρ_cold re-eval, a shadow lookup, two normalizes, an HG eval) would
+# bloat the JIT if emitted unconditionally, so it is gated by this module bool via
+# ti.static. OFF ⇒ no bytes emitted ⇒ the default path compiles exactly as before and
+# golden frames are bit-identical. `_setup_disk_noise` sets it from disk.scatter.enabled;
+# setup_renderer re-runs ti.init so the new value takes effect on the next compile.
+_SCATTER_COMPILE: bool = False
+
 # global
 _NI_M_MAX = 0
 # L0 base streaks (fbm2 on density)
@@ -624,6 +632,10 @@ def _setup_disk_noise(cfg: dict) -> None:
     # the default path keeps its original (bit-identical) JIT. Read via ti.static.
     global _MP_COMPILE
     _MP_COMPILE = mp_enabled
+
+    # CKS-20: compile the scatter branch only when disk.scatter.enabled (see _SCATTER_COMPILE).
+    global _SCATTER_COMPILE
+    _SCATTER_COMPILE = bool((d.get("scatter", {}) or {}).get("enabled", False))
 
     disk_noise_params = ti.field(dtype=ti.f32, shape=_NOISE_N)
     disk_noise_params.from_numpy(buf)
@@ -1700,6 +1712,70 @@ def _disk_emit_cks(
                         emission * chroma[2],
                         absb_c * density_cold * ds,   # CKS-19: κ·ρ_cold (grey κ)
                     )
+    return out
+
+
+@ti.func
+def _disk_scatter_cks(
+    x, y, z, cx, cy, cz, a, r_inner, r_outer, r_isco, theta_half_bound,
+    sigma_theta0, flare_beta, noise_enabled, noise_seed, t_disk,
+    self_shadow, shadow_strength, absb_c, ds, albedo, hg_g, src_rgb,
+):
+    """CKS-20 single-scatter source at one CKS sample → vec4(J_scat·ds RGB, σ_s·ρ_cold·ds).
+
+    Single-scattering from the hot inner edge (the dominant illuminant):
+        σ_s        = albedo · absb_c                      # ϖ·κ, grey (Decision 3)
+        ρ_cold     = _disk_density_cks(...)[1]            # CKS-19 cold absorber
+        ŝ_src      = normalize(x − x_inner), x_inner = (r_inner·cosφ, r_inner·sinφ, 0)
+        ŝ_view     = normalize(x_cam − x)
+        cosθ_s     = ŝ_src·ŝ_view                          # straight CKS rays (constraint 3)
+        e^{−τ_src} = exp(−shadow_strength·τ_shadow)        # CKS-17 deep-shadow-map (=shadow_atten)
+        J_scat·ds  = σ_s·ρ_cold·_hg_phase(cosθ_s, hg_g)·src_rgb·e^{−τ_src}·ds
+
+    Returns vec4(J_r, J_g, J_b, σ_s·ρ_cold·ds). The caller adds σ_s·ρ_cold·ds to the
+    grey extinction (so scattering removes forward light — constraint 2) and adds
+    T⃗⊙(J·ds) to disk_col. Outside the slab band ⇒ zeros. Pure optics: no p_μ/u^μ/g/g⁴.
+    Only compiled when _SCATTER_COMPILE (caller gates with ti.static); albedo=0 ⇒ zeros.
+    """
+    out = vec4(0.0, 0.0, 0.0, 0.0)
+    r = _kerr_radius(x, y, z, a)
+    cos_th = ti.min(ti.max(z / r, -1.0), 1.0)
+    th = ti.acos(cos_th)
+    dz_ang = th - 0.5 * math.pi
+    if (ti.abs(dz_ang) < theta_half_bound) and (r >= r_inner) and (r <= r_outer):
+        sigma_eff = sigma_theta0
+        if flare_beta != 0.0:
+            sigma_eff = sigma_theta0 * ti.pow(r / r_inner, flare_beta)
+        dens = _disk_density_cks(
+            x, y, r, dz_ang, sigma_theta0, flare_beta, r_inner, r_outer, r_isco,
+            noise_enabled, noise_seed, t_disk, a,
+        )
+        rho_cold = dens[1]
+        # e^{−τ_src}: the CKS-17 inner-edge-ray shadow (graceful: self_shadow==0 ⇒ 1).
+        atten = 1.0
+        if self_shadow == 1:
+            u_n = ti.log(r / r_inner)
+            phi_n = ti.atan2(y, x)
+            zeta_n = dz_ang / sigma_eff
+            atten = ti.exp(-shadow_strength * _sample_shadow_tau(u_n, phi_n, zeta_n))
+        # Straight-CKS-ray scattering geometry (Decision 5).
+        phi = ti.atan2(y, x)
+        sx = x - r_inner * ti.cos(phi)
+        sy = y - r_inner * ti.sin(phi)
+        sz = z
+        inv_s = 1.0 / ti.max(ti.sqrt(sx * sx + sy * sy + sz * sz), 1e-9)
+        sx *= inv_s; sy *= inv_s; sz *= inv_s
+        vx = cx - x
+        vy = cy - y
+        vz = cz - z
+        inv_v = 1.0 / ti.max(ti.sqrt(vx * vx + vy * vy + vz * vz), 1e-9)
+        vx *= inv_v; vy *= inv_v; vz *= inv_v
+        cos_s = sx * vx + sy * vy + sz * vz
+        phase = _hg_phase(cos_s, hg_g)
+        sigma_s = albedo * absb_c                  # σ_s = ϖ·κ (grey)
+        sigma_dtau = sigma_s * rho_cold * ds
+        j = sigma_dtau * phase * atten             # σ_s·ρ_cold·P·e^{−τ_src}·ds (scalar)
+        out = vec4(j * src_rgb[0], j * src_rgb[1], j * src_rgb[2], sigma_dtau)
     return out
 
 
