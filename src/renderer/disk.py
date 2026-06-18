@@ -84,3 +84,17 @@ def blackbody_rgb(temperature):
     g_col = 1.0 - np.exp(-temperature / 5500.0)
     b_col = 1.0 - np.exp(-temperature / 9500.0)
     return np.array([r_col, g_col, b_col], dtype=float)
+
+
+def hg_phase(cos_theta, g):
+    """Henyey-Greenstein phase function P(cosθ) (SKILL.md CKS-20) — CPU source of truth.
+
+    P(cosθ) = (1 − g²) / [4π (1 + g² − 2g cosθ)^{3/2}].  g∈(−1,1): g=0 isotropic
+    (1/4π), g>0 forward-scattering (the rim-light lobe), g<0 back. Normalized:
+    ∫_{4π} P dΩ = 1. Pure optics — no g-factor / metric (constraint 3).
+    """
+    cos_theta = np.asarray(cos_theta, dtype=np.float64)
+    g = float(g)
+    g2 = g * g
+    denom = 1.0 + g2 - 2.0 * g * cos_theta
+    return ((1.0 - g2) / (4.0 * np.pi * denom ** 1.5)).astype(np.float64)

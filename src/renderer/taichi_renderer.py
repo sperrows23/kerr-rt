@@ -1018,6 +1018,18 @@ def _blackbody_rgb(temp):
 
 
 @ti.func
+def _hg_phase(cos_theta, g):
+    """Henyey-Greenstein phase (SKILL.md CKS-20) — GPU twin of disk.hg_phase.
+
+    P = (1−g²)/[4π·denom^{3/2}], denom = 1+g²−2g·cosθ (>0 for |g|<1). Pure optics:
+    no p_μ/u^μ/g/g⁴ (constraint 3). g=0 ⇒ 1/4π isotropic.
+    """
+    g2 = g * g
+    denom = 1.0 + g2 - 2.0 * g * cos_theta
+    return (1.0 - g2) / (4.0 * math.pi * denom * ti.sqrt(denom))
+
+
+@ti.func
 def _pt_flux_sample(r):
     """Linear-interp the Page-Thorne f_PT(r) LUT (D1; SKILL.md CKS-11).
 
