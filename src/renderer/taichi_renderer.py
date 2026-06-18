@@ -1923,6 +1923,10 @@ def render_beauty_physics(
     source_function: int,
     self_shadow: int,
     shadow_strength: float,
+    scatter_albedo: float,
+    scatter_hg_g: float,
+    scatter_inner_glow: float,
+    scatter_T_inner: float,
 ):
     """Kernel 1 (Phase 2.4 split): trace ONE primary ray per pixel (no offset ray).
 
@@ -1978,6 +1982,11 @@ def render_beauty_physics(
         # Grey extinction (1,1,1) ⇒ all three components stay equal at every step ⇒
         # the scalar single-phase march is reproduced bit-for-bit (constraint 6).
         transm = vec3(1.0, 1.0, 1.0)
+        # CKS-20: inner-edge illuminant radiance I_src = blackbody(T_inner)·inner_glow.
+        # Compiled only when scatter is on (ti.static) ⇒ off path bit-identical.
+        src_rgb = vec3(0.0, 0.0, 0.0)
+        if ti.static(_SCATTER_COMPILE):
+            src_rgb = _blackbody_rgb(scatter_T_inner) * scatter_inner_glow
         ray_length = 0.0  # accumulated affine path length (depth proxy)
         weighted_depth = 0.0  # Σ ray_length·contribution  (optimization Phase 3.4)
         total_emission = 0.0  # Σ contribution
@@ -2104,6 +2113,20 @@ def render_beauty_physics(
                     # Grey extinction ⇒ dtau_v ≡ base ⇒ f⃗ ≡ scalar w ⇒ bit-identical.
                     dtau = ev[3]
                     dtau_v = vec3(dtau * ext_r, dtau * ext_g, dtau * ext_b)
+                    # CKS-20 single-scatter. σ_s adds to the grey extinction (so it removes
+                    # forward light); J_scat is injected below. OFF (ti.static) ⇒ removed
+                    # ⇒ dtau_v unchanged, no J term ⇒ exactly CKS-19 (constraint 6).
+                    scatter_j = vec3(0.0, 0.0, 0.0)
+                    if ti.static(_SCATTER_COMPILE):
+                        sc = _disk_scatter_cks(
+                            x, y, z, cx, cy, cz, a, r_inner, r_outer, r_isco,
+                            theta_half_bound, sigma_theta0, flare_beta,
+                            noise_enabled, noise_seed, t_disk, self_shadow, shadow_strength,
+                            absb_c, local_h, scatter_albedo, scatter_hg_g, src_rgb,
+                        )
+                        sig = sc[3]
+                        dtau_v = vec3(dtau_v[0] + sig, dtau_v[1] + sig, dtau_v[2] + sig)
+                        scatter_j = vec3(sc[0], sc[1], sc[2])
                     added = vec3(ev[0], ev[1], ev[2])
                     if source_function == 1 and dtau > _RTE_TAU_EPS:
                         f = vec3(1.0, 1.0, 1.0)
@@ -2117,6 +2140,14 @@ def render_beauty_physics(
                     # transm[0] (any channel; equal in grey) keeps the depth proxy
                     # bit-identical to the pre-Task-7 scalar march.
                     contribution = transm[0] * (added[0] + added[1] + added[2])
+                    # CKS-20: add the in-scattered radiance as its own source (NOT through
+                    # the emission f factor), attenuated by the running T⃗ like emission.
+                    # OFF (ti.static) ⇒ removed ⇒ disk_col/contribution unchanged (bit-identical).
+                    if ti.static(_SCATTER_COMPILE):
+                        disk_col += vec3(transm[0] * scatter_j[0],
+                                         transm[1] * scatter_j[1],
+                                         transm[2] * scatter_j[2])
+                        contribution += transm[0] * (scatter_j[0] + scatter_j[1] + scatter_j[2])
                     weighted_depth += ray_length * contribution
                     total_emission += contribution
                     transm[0] *= ti.exp(-dtau_v[0])
@@ -2673,6 +2704,15 @@ def render_beauty_frame(
         ext_cfg = [ext_cfg, ext_cfg, ext_cfg]
     ext_rgb = (float(ext_cfg[0]), float(ext_cfg[1]), float(ext_cfg[2]))
 
+    # CKS-20 single-scatter dials. Absent block ⇒ off (and _SCATTER_COMPILE=False ⇒ the
+    # kernel has no scatter body). T_inner = simple model at r_inner (Decision 4): always
+    # hot, avoids the page_thorne f_PT→0 ISCO-edge zero. Derived, never stored (CKS-13 rule).
+    sc_cfg = d.get("scatter", {}) or {}
+    scatter_albedo = float(sc_cfg.get("albedo", 0.5))
+    scatter_hg_g = float(sc_cfg.get("hg_g", 0.6))
+    scatter_inner_glow = float(sc_cfg.get("inner_glow", 1.0))
+    scatter_T_inner = float(d["T_0"]) * (6.0 / float(d["r_inner"])) ** 0.75
+
     _alloc_frame(width, height)
     # Phase 2.4 kernel split: physics pass writes exit_buf/disk_buf, shading pass
     # computes the screen-space-Jacobian LOD and composites.
@@ -2728,6 +2768,10 @@ def render_beauty_frame(
         source_function,
         self_shadow,
         shadow_strength,
+        scatter_albedo,
+        scatter_hg_g,
+        scatter_inner_glow,
+        scatter_T_inner,
     )
     # starfield.mode: dngr ⇒ Formula-13 two-layer background; else legacy F10 texture.
     dngr_mode = 1 if str(cfg.get("starfield", {}).get("mode", "texture")) == "dngr" else 0
