@@ -1806,7 +1806,7 @@ stack), CKS-14 (march). **Unblocks:** CKS-20 (needs ρ_cold/κ).
 
 ---
 
-## Formula CKS-20 — Volumetric single-scattering + Henyey-Greenstein phase (DESIGN 2026-06-16; PHYSICS, owner planning-approved; NOT yet wired)
+## Formula CKS-20 — Volumetric single-scattering + Henyey-Greenstein phase (DESIGN ratified 2026-06-19 (owner-approved); wiring in progress; PHYSICS)
 
 > **Status (2026-06-16): DESIGN — authored under owner-permitted SKILL change; default OFF,
 > NOT yet ported.** Source brief `tip.md` Pillar 3; design
@@ -1860,13 +1860,31 @@ single-phase march). Default OFF ⇒ goldens bit-identical (constraint 6).
    emission spectrum, but the scattering kernel itself adds no new g factor.
 4. **Depends on CKS-19** (ρ_cold, κ⃗) **and CKS-17** (τ_src, ŝ_src). Not buildable before P2.
 
-**Open decisions (ratify in the P3 spec — flagged, NOT decided):**
-- **`I_src` model:** (a) physical inner-edge ring radiance derived from CKS-11 (recommended —
-  ties the rim-light color to the disk's own inner edge) vs (b) a free `inner_glow` intensity dial.
-- **`σ_s` parametrization:** `σ_s = ϖ·κ` (recommended — one albedo dial, standard radiative
-  transfer) vs an independent scattering field.
-- **`g_HG`:** default magnitude/sign (~0.6 forward), and whether a two-term HG (forward+back
-  lobe, `g_HG1`,`g_HG2`,weight) is worth the extra eval.
+**Decisions (ratified 2026-06-19, owner-approved):**
+- **`I_src` model:** physical inner-edge ring radiance — `I_src = blackbody_chroma(T_inner)·inner_glow`,
+  `T_inner = T_0·(6/r_inner)^0.75` (the SIMPLE model at r_inner, used regardless of
+  `disk.temperature_model`; the Page-Thorne f_PT(r_inner)→0 at the ISCO edge would blacken the
+  illuminant). `inner_glow` is a free amplitude dial; the COLOR is tied to the disk's own inner edge.
+- **`σ_s` parametrization:** `σ_s = ϖ·κ` (grey), one albedo dial `ϖ = disk.scatter.albedo ∈ [0,1)`.
+  `κ` is the grey `absorption_coeff`. The scattered light is colored by `I_src`, not `σ_s`.
+- **`g_HG`:** a SINGLE forward HG lobe, default `g_HG = 0.6`. No two-term (forward+back) lobe — the
+  single lobe delivers the rim-light; a second lobe is deferred (revisit only if back-scatter haze
+  is wanted).
+
+**Geometry (straight CKS rays, derived in-march — NOT baked):**
+- `ŝ_src(x) = normalize(x − x_inner)`, `x_inner = (r_inner·cosφ, r_inner·sinφ, 0)`, `φ = atan2(y,x)` —
+  the midplane inner-edge illuminant at the sample's azimuth.
+- `ŝ_view(x) = normalize(x_cam − x)` — the camera direction (camera position is a kernel arg).
+- `cosθ_s = ŝ_src·ŝ_view`. Both are STRAIGHT CKS rays (not geodesics), the same VISUALIZATION
+  posture as the CKS-17 shadow ray, so the scattering angle is a pure geometric dot product — no
+  metric, no p_μ (constraint 3).
+
+**March assembly (single extinction; ρ_cold in J_scat — energy-consistent):**
+- `dτ_ext⃗ = (κ⃗ + σ_s)·ρ_cold·ds` is the SINGLE per-step extinction, used for both the running
+  transmittance T⃗ AND the CKS-14 emission source-function factor f = (1−e^{−dτ})/dτ.
+- `J_scat·ds = σ_s·ρ_cold·P(cosθ_s)·I_src·e^{−τ_src}·ds` carries an EXPLICIT ρ_cold (constraint 2:
+  re-inject exactly the σ_s·ρ_cold·ds removed from the forward beam). Added as its own source —
+  `disk_col += T⃗ ⊙ (J_scat·ds)` — NOT through the emission f factor.
 
 **Config (additions to `disk:`):** `scatter.{enabled, albedo ϖ, hg_g, inner_glow}` (default OFF).
 **Implementation plan / guards:** reuse the baked `disk_shadow_tau` for `τ_src`; add `ŝ_src`
