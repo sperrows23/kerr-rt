@@ -375,8 +375,17 @@ def setup_renderer(cfg: dict) -> Starmap:
     _J_FOLD = float(cfg["render"].get("j_fold", 0.15))
 
     mem_gb = float(cfg["render"]["device_memory_gb"])
+    # Taichi JIT compile knobs (configs/render.yaml render.advanced_optimization /
+    # cfg_optimization). Both default True == Taichi's own defaults, so an absent
+    # key (every production config) reproduces the prior ti.init byte-for-byte.
+    # Flipping them False skips the super-linear IR/CFG passes that make the
+    # scatter-ON mega-kernel cold-compile cost explode (>80 min) — for tests /
+    # iteration only; the final video keeps them True (compile-once, render-many).
+    adv_opt = bool(cfg["render"].get("advanced_optimization", True))
+    cfg_opt = bool(cfg["render"].get("cfg_optimization", True))
     # LOCKED backend — ti.cuda, never ti.gpu (CLAUDE.md / SKILL.md).
-    ti.init(arch=ti.cuda, device_memory_GB=mem_gb, default_fp=ti.f32)
+    ti.init(arch=ti.cuda, device_memory_GB=mem_gb, default_fp=ti.f32,
+            advanced_optimization=adv_opt, cfg_optimization=cfg_opt)
 
     sm = Starmap.load(str(_ROOT / cfg["starmap"]["path"]))
     _STARMAP_WIDTH = int(cfg["starmap"]["width"])
@@ -1717,41 +1726,43 @@ def _disk_emit_cks(
 
 @ti.func
 def _disk_scatter_cks(
-    x, y, z, cx, cy, cz, a, r_inner, r_outer, r_isco, theta_half_bound,
-    sigma_theta0, flare_beta, noise_enabled, noise_seed, t_disk,
-    self_shadow, shadow_strength, absb_c, ds, albedo, hg_g, src_rgb,
+    x, y, z, cx, cy, cz, a, r_inner,
+    sigma_theta0, flare_beta, self_shadow, shadow_strength,
+    grey_dtau, albedo, hg_g, src_rgb,
 ):
     """CKS-20 single-scatter source at one CKS sample → vec4(J_scat·ds RGB, σ_s·ρ_cold·ds).
 
     Single-scattering from the hot inner edge (the dominant illuminant):
-        σ_s        = albedo · absb_c                      # ϖ·κ, grey (Decision 3)
-        ρ_cold     = _disk_density_cks(...)[1]            # CKS-19 cold absorber
+        σ_s·ρ_cold·ds = albedo · (absb_c·ρ_cold·ds)       # σ_s=ϖ·κ ⇒ = albedo·grey_dtau
         ŝ_src      = normalize(x − x_inner), x_inner = (r_inner·cosφ, r_inner·sinφ, 0)
         ŝ_view     = normalize(x_cam − x)
         cosθ_s     = ŝ_src·ŝ_view                          # straight CKS rays (constraint 3)
         e^{−τ_src} = exp(−shadow_strength·τ_shadow)        # CKS-17 deep-shadow-map (=shadow_atten)
         J_scat·ds  = σ_s·ρ_cold·_hg_phase(cosθ_s, hg_g)·src_rgb·e^{−τ_src}·ds
 
+    ``grey_dtau`` is the GREY base optical depth ``absb_c·ρ_cold·ds`` (=``ev[3]``) the
+    caller's emission march ALREADY computed for this sample — so σ_s·ρ_cold·ds reduces
+    algebraically to ``albedo·grey_dtau`` and we do NOT re-evaluate the (very expensive)
+    ``_disk_density_cks`` noise stack here. Re-inlining that leaf a second time into the
+    beauty mega-kernel exploded LLVM compile (15 h / >50 GB); this regrouping keeps the
+    CKS-20 formula byte-identical while inlining the density leaf exactly once.
+
     Returns vec4(J_r, J_g, J_b, σ_s·ρ_cold·ds). The caller adds σ_s·ρ_cold·ds to the
     grey extinction (so scattering removes forward light — constraint 2) and adds
-    T⃗⊙(J·ds) to disk_col. Outside the slab band ⇒ zeros. Pure optics: no p_μ/u^μ/g/g⁴.
-    Only compiled when _SCATTER_COMPILE (caller gates with ti.static); albedo=0 ⇒ zeros.
+    T⃗⊙(J·ds) to disk_col. grey_dtau≤0 (out-of-band / no cold dust) ⇒ zeros. Pure
+    optics: no p_μ/u^μ/g/g⁴. Only compiled when _SCATTER_COMPILE (caller gates ti.static).
     """
     out = vec4(0.0, 0.0, 0.0, 0.0)
-    r = _kerr_radius(x, y, z, a)
-    cos_th = ti.min(ti.max(z / r, -1.0), 1.0)
-    th = ti.acos(cos_th)
-    dz_ang = th - 0.5 * math.pi
-    if (ti.abs(dz_ang) < theta_half_bound) and (r >= r_inner) and (r <= r_outer):
+    sigma_dtau = albedo * grey_dtau            # σ_s·ρ_cold·ds (grey_dtau = absb_c·ρ_cold·ds)
+    if sigma_dtau > 0.0:
+        r = _kerr_radius(x, y, z, a)
+        cos_th = ti.min(ti.max(z / r, -1.0), 1.0)
+        dz_ang = ti.acos(cos_th) - 0.5 * math.pi
         sigma_eff = sigma_theta0
         if flare_beta != 0.0:
             sigma_eff = sigma_theta0 * ti.pow(r / r_inner, flare_beta)
-        dens = _disk_density_cks(
-            x, y, r, dz_ang, sigma_theta0, flare_beta, r_inner, r_outer, r_isco,
-            noise_enabled, noise_seed, t_disk, a,
-        )
-        rho_cold = dens[1]
         # e^{−τ_src}: the CKS-17 inner-edge-ray shadow (graceful: self_shadow==0 ⇒ 1).
+        # Cheap trilinear LUT lookup — NOT a march, so safe to inline a second time.
         atten = 1.0
         if self_shadow == 1:
             u_n = ti.log(r / r_inner)
@@ -1772,8 +1783,6 @@ def _disk_scatter_cks(
         vx *= inv_v; vy *= inv_v; vz *= inv_v
         cos_s = sx * vx + sy * vy + sz * vz
         phase = _hg_phase(cos_s, hg_g)
-        sigma_s = albedo * absb_c                  # σ_s = ϖ·κ (grey)
-        sigma_dtau = sigma_s * rho_cold * ds
         j = sigma_dtau * phase * atten             # σ_s·ρ_cold·P·e^{−τ_src}·ds (scalar)
         out = vec4(j * src_rgb[0], j * src_rgb[1], j * src_rgb[2], sigma_dtau)
     return out
@@ -2118,11 +2127,13 @@ def render_beauty_physics(
                     # ⇒ dtau_v unchanged, no J term ⇒ exactly CKS-19 (constraint 6).
                     scatter_j = vec3(0.0, 0.0, 0.0)
                     if ti.static(_SCATTER_COMPILE):
+                        # Reuse the grey base dτ = absb_c·ρ_cold·ds the emission march
+                        # already produced (dtau = ev[3]); scatter does NOT re-evaluate
+                        # _disk_density_cks (that double-inline blew up LLVM compile).
                         sc = _disk_scatter_cks(
-                            x, y, z, cx, cy, cz, a, r_inner, r_outer, r_isco,
-                            theta_half_bound, sigma_theta0, flare_beta,
-                            noise_enabled, noise_seed, t_disk, self_shadow, shadow_strength,
-                            absb_c, local_h, scatter_albedo, scatter_hg_g, src_rgb,
+                            x, y, z, cx, cy, cz, a, r_inner,
+                            sigma_theta0, flare_beta, self_shadow, shadow_strength,
+                            dtau, scatter_albedo, scatter_hg_g, src_rgb,
                         )
                         sig = sc[3]
                         dtau_v = vec3(dtau_v[0] + sig, dtau_v[1] + sig, dtau_v[2] + sig)

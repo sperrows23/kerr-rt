@@ -207,6 +207,32 @@ def main(argv: list[str] | None = None) -> None:
         "'0.6,1.0,1.6') reddens cold-dust lanes (astrophysical reddening). Pair with "
         "--absorption / --multiphase so there is optical depth to redden.",
     )
+    p.add_argument(
+        "--scatter", action="store_true",
+        help="enable disk.scatter (CKS-20): single-scattering + Henyey-Greenstein rim-light. "
+        "Cold dust (rho_cold) catches forward-scattered inner-edge light. Implies multiphase "
+        "is worthwhile (needs a rho_cold absorber) and self_shadow on (source occlusion).",
+    )
+    p.add_argument(
+        "--albedo", type=float, default=None,
+        help="override disk.scatter.albedo (implies --scatter): single-scatter albedo varpi in [0,1).",
+    )
+    p.add_argument(
+        "--hg-g", type=float, default=None,
+        help="override disk.scatter.hg_g (implies --scatter): HG anisotropy in (-1,1), >0 forward.",
+    )
+    p.add_argument(
+        "--inner-glow", type=float, default=None,
+        help="override disk.scatter.inner_glow (implies --scatter): inner-edge illuminant amplitude.",
+    )
+    p.add_argument(
+        "--fast-compile", action="store_true",
+        help="set render.advanced_optimization/cfg_optimization False for this run: skips the "
+        "super-linear Taichi IR/CFG passes so the heavy scatter-ON mega-kernel cold-compiles in "
+        "minutes instead of >80 min (trades kernel RUNTIME speed). For look-dev / smoke renders "
+        "only — the final video keeps the YAML defaults (true). NOTE the offline cache keys on "
+        "these flags, so a fast-compile kernel and a production kernel are cached separately.",
+    )
     # --- NON-PHYSICAL color grade (VISUALIZATION, like doppler_strength) — the warm-amber
     #     reference look. Overrides render.color_grade; identity defaults ⇒ ungraded. ---
     p.add_argument("--saturation", type=float, default=None,
@@ -220,6 +246,9 @@ def main(argv: list[str] | None = None) -> None:
     args = p.parse_args(argv)
 
     cfg = tr.load_config()
+    if args.fast_compile:
+        cfg["render"]["advanced_optimization"] = False
+        cfg["render"]["cfg_optimization"] = False
     if args.peak_temp is not None:
         # Re-anchor the disk hue: target_peak_temperature is a BASE param; T_0 is
         # CKS-13-derived from it, so drop the stale derived T_0 and re-resolve.
@@ -301,6 +330,18 @@ def main(argv: list[str] | None = None) -> None:
         except ValueError:
             p.error("--extinction must be three comma-separated floats, e.g. 0.6,1.0,1.6")
         cfg["disk"]["extinction_rgb"] = ext
+    # CKS-20 single-scatter. Default OFF in the YAML; --scatter / any --albedo/--hg-g/--inner-glow
+    # turns it on. Recompiles the kernel (ti.static _SCATTER_COMPILE gate).
+    if args.scatter or args.albedo is not None or args.hg_g is not None \
+            or args.inner_glow is not None:
+        sc = cfg["disk"].setdefault("scatter", {})
+        sc["enabled"] = True
+        if args.albedo is not None:
+            sc["albedo"] = args.albedo
+        if args.hg_g is not None:
+            sc["hg_g"] = args.hg_g
+        if args.inner_glow is not None:
+            sc["inner_glow"] = args.inner_glow
     if args.noise_boost != 1.0:
         # Scale only the AMPLITUDE dials (how far the [0,1] envelopes swing), never the
         # frequencies/seed/geometry — pure look-dev re-upload through _setup_disk_noise.
@@ -350,6 +391,11 @@ def main(argv: list[str] | None = None) -> None:
     mp_status = f"on(chi={mp_cfg.get('dust_correlation', -0.6)})" if mp_on else "off"
     ext_rgb = cfg["disk"].get("extinction_rgb", [1.0, 1.0, 1.0])
     ext_status = "grey" if list(ext_rgb) == [1.0, 1.0, 1.0] else str(list(ext_rgb))
+    sc_cfg = cfg["disk"].get("scatter", {})
+    sc_status = (
+        f"on(varpi={sc_cfg.get('albedo', 0.5)},g={sc_cfg.get('hg_g', 0.6)})"
+        if sc_cfg.get("enabled") else "off"
+    )
     curl_flow = float(curl_cfg.get("flow_period_M", 0.0))
     curl_status = (
         f"on(amp={curl_cfg.get('amp')}"
@@ -365,7 +411,8 @@ def main(argv: list[str] | None = None) -> None:
         f"rendering {args.width}x{args.height}  incl={args.elevation}°  r={args.radius}M  "
         f"fov={args.fov_deg}°  noise={'on' if noise_on else 'off'}  curl={curl_status}  "
         f"source_fn={'on' if sf_on else 'off'}  self_shadow={'on' if ssh_on else 'off'}  "
-        f"multiphase={mp_status}  extinction={ext_status}  t_disk={t_disk:.3f} ..."
+        f"multiphase={mp_status}  extinction={ext_status}  scatter={sc_status}  "
+        f"t_disk={t_disk:.3f} ..."
     )
     t0 = time.time()
     beauty = tr.render_beauty_frame(
