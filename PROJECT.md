@@ -891,6 +891,39 @@ work below predates and is **superseded by** the CKS migration above):
   |Laplacian| — the LOD benefit is anti-aliasing vs a supersampled reference, not raw
   curvature. SKILL.md Formula **CKS-23** (rev v1.34).
 
+**Scale-dependent shear cascade — Pillar 1, CKS-21 (authored 2026-06-20, rev v1.35).**
+  Makes the CKS-12 §2 uniform Keplerian shear **frequency-dependent** so coarse disk-noise
+  octaves wind into long filaments while high-frequency micro-vortices are *protected* from
+  laminarizing into the same spiral (Kolmogorov-like). Per density octave `o` of spatial
+  frequency `f_o = f_base·lac^o`, the Butterworth-like transfer `S(f) = 1/(1+(f/f_c)^p)` (low
+  f→1, high f→0) sets the net shear `S(f_o)·shear_k` (`shear_k = dynamism·Ω(r)·a_k·T`,
+  Ω = Formula 3 verbatim). Implemented as a per-octave **de-shear add-back**: the CKS-18 curl
+  warp is applied to the fully-sheared `φ−shear_k` (order UNCHANGED), then inside the shared
+  `_octaves` loop each octave adds `Δφ_o = (1−S(f_o))·shear_k` back — so `S≡1` reproduces the
+  §2 uniform shear bit-for-bit. Centralized in the CPU `_octaves` generator (so
+  `fbm2`/`fbm2_lod`/`ridged3` all inherit it via default-arg forwarding) with explicit GPU
+  twins `shear_transfer_ti` + sheared `fbm2_lod_ti`/`ridged3_ti`; threaded through
+  `_disk_noise_m`/`_disk_blended_m` per dynamic phase. **Scope:** the density octave stacks
+  L0/L2/L1-`ridged3` (L1 Voronoi has no octaves; the L1 coverage mask and the §3 modulation
+  envelopes keep uniform shear — density-only v1). Density φ is linear-Perlin (integer-period
+  wrap), so the constant-in-φ correction preserves the φ-seam (constraint 5; no trig added per
+  octave — the cylinder embedding is KH/curl-only). New slots `_NI_SC_{EN,FC,P}`
+  (`_NOISE_N` 69→72). **JIT:** like CKS-23 there is **no** `ti.static` recompile gate — the
+  `shear_k=0` sentinel default makes the add-back exactly 0 (`(1−S)·0=0`), so the sheared fBm
+  is always compiled and `disk.noise.shear_cascade.enabled:false` (default, or the block
+  absent) ⇒ golden frames **bit-identical**; the `f_c ≥ SHEAR_FC_OFF=1e9` sentinel
+  short-circuits `S≡1` and skips the `pow`. Config `disk.noise.shear_cascade`
+  (`enabled`/`shear_cutoff`=`f_c`/`shear_falloff`=`p`; base dials, no CKS-13 change). Guards:
+  `tests/test_noise.py` (CPU `shear_transfer` monotone+sentinel, per-octave displacement = the
+  correction, octave-1 net shear < octave-0, OFF bit-identity), `tests/test_disk_noise.py`
+  (`test_shear_cascade_stack_matches_cpu_reference` GPU twin parity + C0-at-reset),
+  `tests/test_disk_shear_cascade.py` (OFF bit-identity + ON re-textures the disk-only buffer at
+  a face-on camera, with coordinate-warp containment), unchanged `test_gpu_regression.py`. The
+  cascade *math* (frequency-selective net shear, `S≡1` collapse, C0-at-reset) is proven by the
+  CPU/GPU twins above, not a render-level φ-spectrum: at a fixed radius the shear is a pure φ
+  translation (spectrum-invariant) and the laminarization is RADIAL. SKILL.md Formula **CKS-21**
+  (rev v1.35).
+
 *Note — `render_pipe_a`* (the 256² dev LOD kernel for `_gate2_lod_test`) was
 migrated to `[y,u,…]` but **intentionally keeps its offset ray** as the offset-ray
 LOD reference; it is not on the 4K production path.
@@ -923,6 +956,7 @@ re-derive. **`disk.py`, `geodesic.py`/`metric.py` CPU references, and any
 | **P3** | Volumetric single-scattering + Henyey-Greenstein rim-light: cold dust catches forward-scattered inner-edge light (the "silver-lining") instead of only absorbing | ✅ **Resolved (2026-06-19)** — `σ_s = ϖ·κ` added to the extinction + single-scatter source `J_scat = σ_s·ρ_cold·P(cosθ_s)·I_src·e^{−τ_src}` from the hot inner edge, forward HG phase (`disk.scatter.hg_g`, default 0.6). SKILL.md Formula **CKS-20** (DESIGN→ACTIVE, rev v1.32); `_hg_phase`/`_disk_scatter_cks` behind the `ti.static` `_SCATTER_COMPILE` gate; `disk.scatter` config (default `enabled:false` ⇒ CKS-19 march bit-identical). **Compile:** scatter reuses the march's `grey_dtau` (no `_disk_density_cks` double-inline) + new `render.advanced_optimization`/`cfg_optimization` JIT knobs (default true; `--fast-compile` for tests/look-dev). **Empirical scene note:** the canonical edge-on camera is back-scatter-dominated (forward silver-lining is a localized limb; scatter-ON net-darkens) — `test_scatter_rim_light` asserts the true observables, not a net-brighten. Guards `tests/test_disk_scatter.py` (6), `test_gpu_regression.py` unshifted. Plan `docs/plans/2026-06-19-pillar3-scattering-implementation.md`. | Visualization/Physics |
 | **P4** | Kelvin-Helmholtz edge erosion: shred the clean outer rim into vacuum (fingers/holes) instead of a smooth falloff | ✅ **Resolved (2026-06-20)** — inside the §3 modulation branch of `_disk_density_cks`, `win_out → smoothstep(0, w_soft, win_out − τ_KH·N_KH)`; `N_KH` = high-freq simplex (`_kh_field` GPU / `noise.kh_field` CPU, seed `NSEED_KH=1009`) §2-advected, φ via the CKS-18 cylinder embedding (seamless, constraint 5). Clips the SHARED `win` ⇒ with CKS-19 emission & absorption fray together. Interior immunity (`τ_KH ≤ 1−w_soft` clamp), step-cap floor on `w_soft` (k_soft=1). New slots `_NI_EROS_{EN,STR,FU,FP,FZ,OCT,WSOFT}` (`_NOISE_N` 57→64). **JIT:** clip emitted only under `ti.static(_EROS_COMPILE)` ⇒ `disk.edge_erosion.enabled:false` (default) keeps the original JIT + **bit-identical** goldens. REQUIRES `disk.noise.modulation.enabled`. SKILL.md Formula **CKS-22** (rev v1.33). Guards `tests/test_noise.py` (CPU twins), `tests/test_noise_gpu.py::test_kh_field_gpu_matches_cpu`, `tests/test_disk_edge_erosion.py` (OFF bit-identity + tearing), unchanged `test_gpu_regression.py`. Plan `docs/specs/2026-06-20-P4-P5-edge-erosion-lod-cascade-plan.md`. | Visualization |
 | **P5** | Fractal LOD octave cascade: anti-alias the disk turbulence so it survives a moving/zooming camera (the V4 free-camera prerequisite) | ✅ **Resolved (2026-06-20)** — per disk sample `n_oct = clamp(N_max − log₂(ε·d / J₀), N_min, N_max)` (ε = vertical_fov/HEIGHT, d = camera distance; `_lod_noct_ti` / `noise.lod_noct`) gates the L0/L2/L1-mask fBm octaves by `g_o = clamp(n_oct − o, 0, 1)` via the new `fbm2_lod_ti` / `noise.fbm2_lod` (gates BOTH numerator and denominator ⇒ exact renorm; top octave crossfades ⇒ no integer popping). `n_oct` threaded `render_beauty_physics → _disk_emit_cks → _disk_density_cks → _disk_blended_m/_disk_cold_mult_from_hot → _disk_noise_m`, every hop defaulting to the `_LOD_OFF` sentinel (1e9) ⇒ shadow bake + parity-test callers exact with no edit. New slots `_NI_LOD_{EN,NMAX,NMIN,J0,EPS}` (`_NOISE_N` 64→69). **JIT:** NO `ti.static` recompile gate — the gated fBm is bit-exact at the sentinel (×1.0 is exact), always compiled ⇒ `disk.lod.enabled:false` (default) keeps goldens **bit-identical**; ε refreshed per frame in `render_beauty_frame` (one f32 upload, no re-JIT). Config `disk.lod` (base dials, no CKS-13 change); v1 scope octaves-only / isotropic scalar `J`. SKILL.md Formula **CKS-23** (rev v1.34). Guards `tests/test_noise.py` (CPU `fbm2_lod`/`lod_noct`/`lod_octave_weight`), `tests/test_noise_gpu.py` (`fbm2_lod_ti` twin + LOD-off = `fbm2_ti`), `tests/test_disk_lod.py` (OFF bit-identity + octave dropping), unchanged `test_gpu_regression.py`. Plan `docs/specs/2026-06-20-P4-P5-edge-erosion-lod-cascade-plan.md`. | Sampling |
+| **P1** | Scale-dependent shear cascade: protect high-frequency disk-noise octaves from winding into the same Keplerian spiral as the coarse filaments (frequency-selective shear, Kolmogorov-like) | ✅ **Resolved (2026-06-20)** — per density octave `o` (frequency `f_o = f_base·lac^o`) the net shear becomes `S(f_o)·shear_k` with `S(f) = 1/(1+(f/f_c)^p)` (`shear_k = dynamism·Ω(r)·a_k·T`), implemented as a per-octave **de-shear add-back** `Δφ_o = (1−S(f_o))·shear_k` applied AFTER the CKS-18 curl warp inside the shared CPU `_octaves` generator (so `fbm2`/`fbm2_lod`/`ridged3` inherit it) + GPU twins `shear_transfer_ti`/`fbm2_lod_ti`/`ridged3_ti`, threaded through `_disk_noise_m`/`_disk_blended_m`. Curl order (shear→curl) UNCHANGED ⇒ `S≡1` is the CKS-12 §2 uniform shear bit-for-bit. Scope = density octave stacks L0/L2/L1-`ridged3` (L1 Voronoi/mask + §3 modulation envelopes keep uniform shear). Density φ is linear-Perlin (integer-period wrap) ⇒ the constant-in-φ correction preserves the φ-seam (constraint 5; no trig added). New slots `_NI_SC_{EN,FC,P}` (`_NOISE_N` 69→72). **JIT:** NO `ti.static` gate — the `shear_k=0` sentinel default makes the add-back exactly 0, always compiled ⇒ `disk.noise.shear_cascade.enabled:false` (default/absent) keeps goldens **bit-identical**; `f_c ≥ SHEAR_FC_OFF=1e9` short-circuits `S≡1` (skips the `pow`). Config `disk.noise.shear_cascade` (base dials, no CKS-13 change); density-only v1. SKILL.md Formula **CKS-21** (rev v1.35). Guards `tests/test_noise.py` (CPU `shear_transfer`/per-octave displacement/net-shear ordering/OFF bit-identity), `tests/test_disk_noise.py` (`test_shear_cascade_stack_matches_cpu_reference` GPU twin parity + C0-at-reset), `tests/test_disk_shear_cascade.py` (OFF bit-identity + ON re-textures face-on disk buffer), unchanged `test_gpu_regression.py`. Spec `docs/specs/2026-06-20-P1-shear-cascade-design.md`; plan `docs/specs/2026-06-20-P1-shear-cascade-plan.md`. | Visualization |
 
 ### Code-review findings (verified against current code)
 
