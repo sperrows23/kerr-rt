@@ -202,6 +202,10 @@ disk:
                            #   timescale, clock B1 — no CKS-13 resolver change). Try ~3–12 M.
                            #   (No flow_dynamism gain: a reset-blend has no C0-safe separable
                            #   boil-rate dial — see SKILL.md CKS-18 §2 flag.)
+    shear_cascade:           # CKS-21 — frequency-dependent shear transfer. Default OFF ⇒ bit-identical.
+      enabled: false         # false (or shear_cutoff huge) ⇒ S≡1 ⇒ CKS-12 §2 uniform shear, bit-for-bit.
+      shear_cutoff: 0.0      # f_c (cycles). 0 ⇒ auto = +inf sentinel ⇒ S≡1 (no protection). >0 ⇒ protect octaves above f_c.
+      shear_falloff: 2.0     # p — transfer steepness; larger ⇒ sharper low/high split around f_c.
     layers:
       # L0 base streaks — fBm, features long along the orbit (freq_phi ≪ freq_u).
       base:  {enabled: true, amp: 0.6, octaves: 5, lacunarity: 2.0, gain: 0.5,

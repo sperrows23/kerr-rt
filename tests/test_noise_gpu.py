@@ -420,3 +420,25 @@ def test_kh_field_gpu_static_path(ti_cuda):
                          shear_T=0.0, dynamism=1.0, freq_u=4.0, freq_phi=12,
                          freq_z=1.0, octaves=3, seed=1234)
     assert np.allclose(out.to_numpy(), ref, atol=1e-4), np.abs(out.to_numpy() - ref).max()
+
+
+# --------------------------------------------------------------------------- #
+# CKS-21 — shear cascade param buffer packing (no kernel; setup smoke test)
+# --------------------------------------------------------------------------- #
+def test_setup_packs_shear_cascade_params(ti_cuda):
+    from renderer import taichi_renderer as tr
+    cfg = {
+        "disk": {"noise": {"shear_cascade": {
+            "enabled": True, "shear_cutoff": 5.0, "shear_falloff": 3.0}}},
+    }
+    tr._setup_disk_noise(cfg)
+    buf = tr.disk_noise_params.to_numpy()
+    assert buf.shape[0] == tr._NOISE_N == 72
+    assert buf[tr._NI_SC_EN] == 1.0
+    assert np.isclose(buf[tr._NI_SC_FC], 5.0)
+    assert np.isclose(buf[tr._NI_SC_P], 3.0)
+    # Disabled / absent ⇒ enabled flag 0 and f_c = the sentinel (S ≡ 1).
+    tr._setup_disk_noise({"disk": {"noise": {}}})
+    buf2 = tr.disk_noise_params.to_numpy()
+    assert buf2[tr._NI_SC_EN] == 0.0
+    assert buf2[tr._NI_SC_FC] >= tr._SC_FC_OFF

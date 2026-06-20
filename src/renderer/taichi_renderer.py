@@ -281,13 +281,25 @@ _NI_LOD_NMAX = 65     # N_max — full octave count at J=J0 (anchor; ≥ every g
 _NI_LOD_NMIN = 66     # N_min — coarse far-field octave floor
 _NI_LOD_J0 = 67       # J0 — pixel footprint (world units) at which the cascade is Nyquist-resolved
 _NI_LOD_EPS = 68      # ε = fov_y/HEIGHT (rad/px) — per-pixel cone, so J = ε·d_cam
-_NOISE_N = 69
+
+# CKS-21 scale-dependent shear cascade (frequency-dependent shear transfer). Base dials
+# (no CKS-13 resolver change). enabled:false / absent ⇒ _NI_SC_EN=0 ⇒ shear_k=0 fed to the
+# fBm twins ⇒ the de-shear correction is exactly 0 ⇒ bit-identical (constraint 6).
+_NI_SC_EN = 69
+_NI_SC_FC = 70    # f_c — shear cutoff frequency (sentinel _SC_FC_OFF ⇒ S≡1, no protection)
+_NI_SC_P = 71     # p — transfer steepness
+_NOISE_N = 72
 
 # CKS-23: sentinel n_oct fed to the gated fBm on the LOD-OFF / shadow-bake path. Larger
 # than any layer's native octave count ⇒ every gate g_o = clamp(n_oct−o,0,1) = 1 ⇒ the
 # cascade collapses to the ungated fBm bit-for-bit (constraint 6). It is the DEFAULT of
 # every threaded ``n_oct`` arg so callers that predate LOD (bake, parity tests) stay exact.
 _LOD_OFF = 1.0e9
+
+# CKS-21: sentinel f_c fed to the sheared fBm on the cascade-OFF path. f_c ≥ this ⇒ the
+# transfer S(f) short-circuits to exactly 1.0 ⇒ no correction (constraint 6). Sourced from
+# the CPU twin so the two cannot drift.
+_SC_FC_OFF = float(noise.SHEAR_FC_OFF)
 
 # CKS-14 RTE source-function march: divide guard on dτ. Below this the source
 # function S = emission/dτ is numerically undefined AND physically the optically-
@@ -715,6 +727,15 @@ def _setup_disk_noise(cfg: dict) -> None:
     fov_deg_l = float(cfg.get("camera", {}).get("default_fov_deg", 90.0))
     height_l = float(cfg.get("resolution", {}).get("height", 1080))
     buf[_NI_LOD_EPS] = math.radians(fov_deg_l) / max(height_l, 1.0)
+
+    # CKS-21 scale-dependent shear cascade. Absent block / enabled:false ⇒ _NI_SC_EN=0 ⇒
+    # _disk_noise_m feeds shear_k=0 + f_c=_SC_FC_OFF to the fBm twins ⇒ (1−S)·0 = 0 ⇒
+    # bit-identical (constraint 6). Base look dials — no CKS-13 resolver change.
+    sc = nz.get("shear_cascade", {}) or {}
+    buf[_NI_SC_EN] = 1.0 if sc.get("enabled", False) else 0.0
+    fc = float(sc.get("shear_cutoff", 0.0) or 0.0)
+    buf[_NI_SC_FC] = fc if fc > 0.0 else _SC_FC_OFF
+    buf[_NI_SC_P] = float(sc.get("shear_falloff", 2.0))
 
     # Compile-time gate (see _MP_COMPILE): OFF ⇒ the dust branch is not emitted, so
     # the default path keeps its original (bit-identical) JIT. Read via ti.static.
