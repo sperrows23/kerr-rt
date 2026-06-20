@@ -194,6 +194,14 @@ _MP_COMPILE: bool = False
 # setup_renderer re-runs ti.init so the new value takes effect on the next compile.
 _SCATTER_COMPILE: bool = False
 
+# CKS-22 KH edge-erosion compile gate (same rationale as _MP_COMPILE/_SCATTER_COMPILE):
+# the clip calls _kh_field (2× sfbm3 inline) inside _disk_density_cks, which is itself
+# inlined into the beauty mega-kernel AND the shadow bake — emitting it unconditionally
+# would grow the JIT for every render even when erosion is off. Gated by this module bool
+# via ti.static. OFF ⇒ no bytes emitted ⇒ the §3 smoothstep compiles exactly as before and
+# golden frames are bit-identical. `_setup_disk_noise` sets it from disk.edge_erosion.enabled.
+_EROS_COMPILE: bool = False
+
 # global
 _NI_M_MAX = 0
 # L0 base streaks (fbm2 on density)
@@ -256,7 +264,30 @@ _NI_MP_EN = 53
 _NI_MP_CHI = 54       # χ ∈ [−1,1] dust↔plasma correlation
 _NI_MP_AMP = 55       # a_cold — dust log-density gain
 _NI_MP_SIGFRAC = 56   # σ_cold / σ_hot — dust slab thickness ratio
-_NOISE_N = 57
+# CKS-22 KH edge erosion. _NI_EROS_EN gates the win_out soft-Heaviside clip inside the
+# §3 modulation branch: 0 ⇒ no clip (the §3 smoothstep is bit-identical, constraint 6).
+_NI_EROS_EN = 57
+_NI_EROS_STR = 58     # τ_KH — erosion depth (clamped to [0, 1-w_soft] at setup ⇒ interior immune)
+_NI_EROS_FU = 59      # freq_u (radial feature frequency of N_KH)
+_NI_EROS_FP = 60      # freq_phi (cylinder-embedding angular frequency — seamless, any real)
+_NI_EROS_FZ = 61      # freq_z (vertical feature frequency, folded into the u axis of sfbm3)
+_NI_EROS_OCT = 62     # N_KH simplex octaves
+_NI_EROS_WSOFT = 63   # w_soft (resolved: max(soft_width, step-cap floor), clamped [0.02, 0.5])
+# CKS-23 fractal LOD octave cascade. _NI_LOD_EN selects, per disk sample, n_oct from the
+# camera footprint J=ε·d (else the large off-sentinel ⇒ every octave gate g_o=1 ⇒ the
+# L0/L2/L1-mask fBm is bit-identical, constraint 6). NMAX/NMIN/J0/EPS are base dials.
+_NI_LOD_EN = 64
+_NI_LOD_NMAX = 65     # N_max — full octave count at J=J0 (anchor; ≥ every gated layer's native oct)
+_NI_LOD_NMIN = 66     # N_min — coarse far-field octave floor
+_NI_LOD_J0 = 67       # J0 — pixel footprint (world units) at which the cascade is Nyquist-resolved
+_NI_LOD_EPS = 68      # ε = fov_y/HEIGHT (rad/px) — per-pixel cone, so J = ε·d_cam
+_NOISE_N = 69
+
+# CKS-23: sentinel n_oct fed to the gated fBm on the LOD-OFF / shadow-bake path. Larger
+# than any layer's native octave count ⇒ every gate g_o = clamp(n_oct−o,0,1) = 1 ⇒ the
+# cascade collapses to the ungated fBm bit-for-bit (constraint 6). It is the DEFAULT of
+# every threaded ``n_oct`` arg so callers that predate LOD (bake, parity tests) stay exact.
+_LOD_OFF = 1.0e9
 
 # CKS-14 RTE source-function march: divide guard on dτ. Below this the source
 # function S = emission/dτ is numerically undefined AND physically the optically-
@@ -289,6 +320,7 @@ _NSEED_L1_VORO = noise.NSEED_L1_VORO
 _NSEED_L1_MASK = noise.NSEED_L1_MASK
 _NSEED_L2 = noise.NSEED_L2
 _NSEED_DUST = noise.NSEED_DUST  # CKS-19: GPU twin of noise.NSEED_DUST
+_NSEED_KH = noise.NSEED_KH  # CKS-22: GPU twin of noise.NSEED_KH (KH edge-erosion stack)
 _NOISE_RIDGE_FEEDBACK = noise.RIDGE_FEEDBACK
 _NOISE_MASK_SOFT = noise.MASK_SOFT
 _NCYC_PHASE = noise.NCYC_PHASE  # dual-phase reseed offsets (CKS-12 §2, D2.3)
@@ -637,6 +669,53 @@ def _setup_disk_noise(cfg: dict) -> None:
     buf[_NI_MP_CHI] = float(mp.get("dust_correlation", -0.6))
     buf[_NI_MP_AMP] = float(mp.get("dust_amp", 1.0))
     buf[_NI_MP_SIGFRAC] = float(mp.get("dust_sigma_frac", 1.0))
+
+    # CKS-22 KH edge erosion. Clips the §3 outer smoothstep (requires modulation on).
+    # Absent block / enabled:false ⇒ _NI_EROS_EN=0 ⇒ the §3 window is bit-identical
+    # (constraint 6). Base look dials only — no CKS-13 resolver change.
+    eros = d.get("edge_erosion", {}) or {}
+    buf[_NI_EROS_EN] = 1.0 if eros.get("enabled", False) else 0.0
+    buf[_NI_EROS_FU] = float(eros.get("freq_u", 4.0))
+    buf[_NI_EROS_FP] = float(eros.get("freq_phi", 12))
+    buf[_NI_EROS_FZ] = float(eros.get("freq_z", 1.0))
+    buf[_NI_EROS_OCT] = float(eros.get("octaves", 3))
+    # w_soft step-cap floor (k_soft=1): the soft-Heaviside must span ≥ one capped vertical
+    # step. σ_z(r_outer)=σ0·r_outer is the physical scale height the Pipe-B cap sizes on
+    # (sigma_z=r·σ0); dividing by the §3 edge width `soft` maps that vertical step into the
+    # [0,1] envelope domain via the radial slope. A positive `soft_width` overrides the floor.
+    # Guarded by `enabled`: _NI_EROS_WSOFT/_STR are read ONLY under ti.static(_EROS_COMPILE)
+    # AND _NI_EROS_EN>0.5, so when erosion is off these stay 0 (never read) — and the geometry
+    # keys (only present in a fully-resolved scene config) are not required by minimal
+    # noise-only callers (e.g. the parity tests), which never enable erosion.
+    if eros.get("enabled", False):
+        sigma0_e = float(d["theta_half_width"]) * float(d["vertical_sigma_frac"])
+        r_outer_e = float(d["r_outer"])
+        vfrac_e = float(d.get("max_step_vfrac", 0.5))
+        soft_e = float(mod.get("edge_softness", 0.0))
+        floor_e = vfrac_e * (sigma0_e * r_outer_e) / max(soft_e, 1e-6)
+        w_soft_e = max(float(eros.get("soft_width", 0.0)) or 0.0, floor_e)
+        w_soft_e = min(max(w_soft_e, 0.02), 0.5)  # keep the soft-Heaviside sane
+        buf[_NI_EROS_WSOFT] = w_soft_e
+        # τ_KH clamped to [0, 1-w_soft] ⇒ interior immunity (win_out=1 stays 1).
+        buf[_NI_EROS_STR] = min(max(float(eros.get("strength", 0.0)), 0.0), 1.0 - w_soft_e)
+
+    # CKS-23 fractal LOD octave cascade. Absent block / enabled:false ⇒ _NI_LOD_EN=0 ⇒
+    # render_beauty_physics feeds the _LOD_OFF sentinel ⇒ every octave gate g_o=1 ⇒ the
+    # L0/L2/L1-mask fBm is bit-identical (constraint 6). NO ti.static gate is needed: the
+    # gated fBm is bit-exact at n_oct≥octaves (×1.0 is exact), so it is always compiled and
+    # the goldens are unshifted. Base look dials only — no CKS-13 resolver change.
+    lod = d.get("lod", {}) or {}
+    buf[_NI_LOD_EN] = 1.0 if lod.get("enabled", False) else 0.0
+    buf[_NI_LOD_NMAX] = float(lod.get("n_max", 6.0))
+    buf[_NI_LOD_NMIN] = float(lod.get("n_min", 2.0))
+    buf[_NI_LOD_J0] = float(lod.get("j0", 0.02))
+    # ε = vertical_fov / HEIGHT (rad/px) — the per-pixel cone so J = ε·d_cam. Defaulted
+    # here from the config camera+resolution; render_beauty_frame overrides _NI_LOD_EPS
+    # with the ACTUAL per-frame cam_frame fov / render height (the production path).
+    fov_deg_l = float(cfg.get("camera", {}).get("default_fov_deg", 90.0))
+    height_l = float(cfg.get("resolution", {}).get("height", 1080))
+    buf[_NI_LOD_EPS] = math.radians(fov_deg_l) / max(height_l, 1.0)
+
     # Compile-time gate (see _MP_COMPILE): OFF ⇒ the dust branch is not emitted, so
     # the default path keeps its original (bit-identical) JIT. Read via ti.static.
     global _MP_COMPILE
@@ -645,6 +724,11 @@ def _setup_disk_noise(cfg: dict) -> None:
     # CKS-20: compile the scatter branch only when disk.scatter.enabled (see _SCATTER_COMPILE).
     global _SCATTER_COMPILE
     _SCATTER_COMPILE = bool((d.get("scatter", {}) or {}).get("enabled", False))
+
+    # CKS-22: compile the KH edge-erosion clip only when disk.edge_erosion.enabled
+    # (see _EROS_COMPILE) ⇒ off-default keeps the original fast JIT + bit-identical goldens.
+    global _EROS_COMPILE
+    _EROS_COMPILE = bool(eros.get("enabled", False))
 
     disk_noise_params = ti.field(dtype=ti.f32, shape=_NOISE_N)
     disk_noise_params.from_numpy(buf)
@@ -1089,7 +1173,7 @@ def _disk_curl_warp(u, phi, t_disk):
 
 
 @ti.func
-def _disk_noise_m(u, phi, zeta, seed, t_disk):
+def _disk_noise_m(u, phi, zeta, seed, t_disk, n_oct=_LOD_OFF):
     """Unclamped log-density sum ``m = Σ amp·(layer − bias)`` (CKS-12 §3, spec §4);
     GPU twin of :func:`noise._noise_m_stack`. Reads the per-layer dials from
     ``disk_noise_params`` and evaluates the L0/L1/L2 stack at the disk-natural coords
@@ -1114,7 +1198,7 @@ def _disk_noise_m(u, phi, zeta, seed, t_disk):
     if disk_noise_params[_NI_L0_EN] > 0.5:
         fpf = disk_noise_params[_NI_L0_FP]
         fp = ti.cast(fpf, ti.i32)
-        n0 = noise.fbm2_ti(
+        n0 = noise.fbm2_lod_ti(
             u * disk_noise_params[_NI_L0_FU],
             phi01 * fpf,
             fp,
@@ -1122,6 +1206,7 @@ def _disk_noise_m(u, phi, zeta, seed, t_disk):
             ti.cast(disk_noise_params[_NI_L0_LAC], ti.i32),
             disk_noise_params[_NI_L0_GAIN],
             seed + _NSEED_L0,
+            n_oct,
         )
         m += disk_noise_params[_NI_L0_AMP] * (n0 - 0.5)
 
@@ -1148,12 +1233,13 @@ def _disk_noise_m(u, phi, zeta, seed, t_disk):
         # Coverage mask M ∈ [0,1]: slow low-freq fBm, smoothstep-thresholded at
         # (1 − coverage) so clumps appear in patches, not uniformly (spec §4).
         mfpf = disk_noise_params[_NI_L1_MFP]
-        mask_raw = noise.fbm2_ti(
+        mask_raw = noise.fbm2_lod_ti(
             u * disk_noise_params[_NI_L1_MFU],
             phi01 * mfpf,
             ti.cast(mfpf, ti.i32),
             2, 2, 0.5,
             seed + _NSEED_L1_MASK,
+            n_oct,
         )
         thr = 1.0 - disk_noise_params[_NI_L1_COV]
         t = (mask_raw - (thr - _NOISE_MASK_SOFT)) / (2.0 * _NOISE_MASK_SOFT)
@@ -1165,7 +1251,7 @@ def _disk_noise_m(u, phi, zeta, seed, t_disk):
     if disk_noise_params[_NI_L2_EN] > 0.5:
         fpf = disk_noise_params[_NI_L2_FP]
         fp = ti.cast(fpf, ti.i32)
-        n2 = noise.fbm2_ti(
+        n2 = noise.fbm2_lod_ti(
             u * disk_noise_params[_NI_L2_FU],
             phi01 * fpf,
             fp,
@@ -1173,6 +1259,7 @@ def _disk_noise_m(u, phi, zeta, seed, t_disk):
             ti.cast(disk_noise_params[_NI_L2_LAC], ti.i32),
             disk_noise_params[_NI_L2_GAIN],
             seed + _NSEED_L2,
+            n_oct,
         )
         m += disk_noise_params[_NI_L2_AMP] * (n2 - 0.5)
 
@@ -1180,7 +1267,7 @@ def _disk_noise_m(u, phi, zeta, seed, t_disk):
 
 
 @ti.func
-def _disk_blended_m(u, phi, zeta, t_disk, omega, seed):
+def _disk_blended_m(u, phi, zeta, t_disk, omega, seed, n_oct=_LOD_OFF):
     """Pre-clamp blended modulator m (CKS-12 §2 dual-phase shear + §4 stack),
     BEFORE the ±m_max clamp and exp. GPU twin of noise._advected_m. CKS-19 calls
     it twice (hot seed, dust seed) for the ρ_cold correlation mix."""
@@ -1189,7 +1276,7 @@ def _disk_blended_m(u, phi, zeta, t_disk, omega, seed):
     if T <= 0.0:
         # Static (D2.2 / bit-identical default): no shear advection, sample at φ.
         # t_disk still drives the CKS-18 §2 curl-flow (own clock, independent of T).
-        m = _disk_noise_m(u, phi, zeta, seed, t_disk)
+        m = _disk_noise_m(u, phi, zeta, seed, t_disk, n_oct)
     else:
         s = t_disk / T
         g = disk_noise_params[_NI_DYNAMISM]  # viz gain on the shear amount (1.0 = formula)
@@ -1199,7 +1286,7 @@ def _disk_blended_m(u, phi, zeta, t_disk, omega, seed):
         a0 = s - c0
         w0 = 1.0 - ti.abs(2.0 * a0 - 1.0)
         seed0 = seed + ti.cast(c0, ti.i32) * _NCYC_CYCLE
-        m += w0 * _disk_noise_m(u, phi - g * omega * (a0 * T), zeta, seed0, t_disk)
+        m += w0 * _disk_noise_m(u, phi - g * omega * (a0 * T), zeta, seed0, t_disk, n_oct)
         wsq += w0 * w0
         # Phase k = 1 (half-period staggered reset).
         ar1 = s + 0.5
@@ -1207,7 +1294,7 @@ def _disk_blended_m(u, phi, zeta, t_disk, omega, seed):
         a1 = ar1 - c1
         w1 = 1.0 - ti.abs(2.0 * a1 - 1.0)
         seed1 = seed + _NCYC_PHASE + ti.cast(c1, ti.i32) * _NCYC_CYCLE
-        m += w1 * _disk_noise_m(u, phi - g * omega * (a1 * T), zeta, seed1, t_disk)
+        m += w1 * _disk_noise_m(u, phi - g * omega * (a1 * T), zeta, seed1, t_disk, n_oct)
         wsq += w1 * w1
         if disk_noise_params[_NI_VAR_PRESERVE] > 0.5 and wsq > 0.0:
             m = m / ti.sqrt(wsq)
@@ -1215,7 +1302,7 @@ def _disk_blended_m(u, phi, zeta, t_disk, omega, seed):
 
 
 @ti.func
-def _disk_cold_mult_from_hot(m_hot, u, phi, zeta, t_disk, omega, seed):
+def _disk_cold_mult_from_hot(m_hot, u, phi, zeta, t_disk, omega, seed, n_oct=_LOD_OFF):
     """CKS-19 cold (dust) modulator given the ALREADY-computed hot modulator
     ``m_hot`` (pre-clamp). ``m_cold = a_cold·(χ·m_hot + √(1−χ²)·m_dust)``, where
     ``m_dust`` is the same dual-phase stack reseeded by ``_NSEED_DUST`` (equal
@@ -1228,7 +1315,7 @@ def _disk_cold_mult_from_hot(m_hot, u, phi, zeta, t_disk, omega, seed):
     (the JIT-blowup fix; see ``_MP_COMPILE``)."""
     chi = disk_noise_params[_NI_MP_CHI]
     a_cold = disk_noise_params[_NI_MP_AMP]
-    m_dust = _disk_blended_m(u, phi, zeta, t_disk, omega, seed + _NSEED_DUST)
+    m_dust = _disk_blended_m(u, phi, zeta, t_disk, omega, seed + _NSEED_DUST, n_oct)
     s = ti.sqrt(1.0 - chi * chi)
     m_cold = a_cold * (chi * m_hot + s * m_dust)
     mmax = disk_noise_params[_NI_M_MAX]
@@ -1349,9 +1436,67 @@ def _disk_noise_mod_fields(u, phi, t_disk, omega, seed):
 
 
 @ti.func
+def _kh_field(u, phi, zeta, t_disk, omega, seed):
+    """N_KH ∈ [0,1] for CKS-22 KH edge erosion — GPU twin of ``noise.kh_field``.
+
+    The φ axis is the CKS-18 cylinder embedding ``(cos φ, sin φ)·freq_phi`` (seamless
+    across φ = ±π — classic simplex is non-periodic, so a linear-φ argument would tear
+    at the seam, constraint 5); the third ``sfbm3`` axis carries ``u·freq_u + ζ·freq_z``.
+    Advected with the SAME §2 dual-phase shear (material frame) as the density
+    (:func:`_disk_blended_m`): single ``sfbm3_ti`` layer per reset phase, convex triangle
+    weights ⇒ stays in [0,1]."""
+    fu = disk_noise_params[_NI_EROS_FU]
+    fpf = disk_noise_params[_NI_EROS_FP]
+    fz = disk_noise_params[_NI_EROS_FZ]
+    oct_ = ti.cast(disk_noise_params[_NI_EROS_OCT], ti.i32)
+    sd = seed + _NSEED_KH
+    uz = u * fu + zeta * fz
+    T = disk_noise_params[_NI_SHEAR_T]
+    n = 0.0
+    if T <= 0.0:
+        # Static (D2.2) path: single layer sampled at φ.
+        n = noise.sfbm3_ti(ti.cos(phi) * fpf, ti.sin(phi) * fpf, uz, 0, oct_, 2, 0.5, sd)
+    else:
+        s = t_disk / T
+        g = disk_noise_params[_NI_DYNAMISM]
+        c0 = ti.floor(s)
+        a0 = s - c0
+        w0 = 1.0 - ti.abs(2.0 * a0 - 1.0)
+        sd0 = sd + ti.cast(c0, ti.i32) * _NCYC_CYCLE
+        ph0 = phi - g * omega * (a0 * T)
+        ar1 = s + 0.5
+        c1 = ti.floor(ar1)
+        a1 = ar1 - c1
+        w1 = 1.0 - ti.abs(2.0 * a1 - 1.0)
+        sd1 = sd + _NCYC_PHASE + ti.cast(c1, ti.i32) * _NCYC_CYCLE
+        ph1 = phi - g * omega * (a1 * T)
+        n = (w0 * noise.sfbm3_ti(ti.cos(ph0) * fpf, ti.sin(ph0) * fpf, uz, 0, oct_, 2, 0.5, sd0)
+             + w1 * noise.sfbm3_ti(ti.cos(ph1) * fpf, ti.sin(ph1) * fpf, uz, 0, oct_, 2, 0.5, sd1))
+    return n
+
+
+@ti.func
+def _lod_noct_ti(d):
+    """Per-sample octave count for the CKS-23 cascade — GPU twin of ``noise.lod_noct``.
+
+    ``n_oct = clamp(N_max − log₂(ε·d / J₀), N_min, N_max)`` from the camera footprint
+    ``J = ε·d`` (``d`` = world distance camera→sample). Reads the base dials
+    ``_NI_LOD_{EPS,J0,NMAX,NMIN}``; ``ti.log(·)/ti.log(2)`` is the f32 log₂. Only called
+    by ``render_beauty_physics`` when ``_NI_LOD_EN`` is set — otherwise the march feeds
+    the ``_LOD_OFF`` sentinel and the gated fBm stays bit-identical (constraint 6)."""
+    eps = disk_noise_params[_NI_LOD_EPS]
+    j0 = disk_noise_params[_NI_LOD_J0]
+    nmax = disk_noise_params[_NI_LOD_NMAX]
+    nmin = disk_noise_params[_NI_LOD_NMIN]
+    j = eps * d
+    lod = ti.log(ti.max(j / j0, 1e-30)) / ti.log(2.0)
+    return ti.min(ti.max(nmax - lod, nmin), nmax)
+
+
+@ti.func
 def _disk_density_cks(
     x, y, r, dz_ang, sigma_theta, flare_beta, r_inner, r_outer, r_isco,
-    noise_enabled, noise_seed, t_disk, a,
+    noise_enabled, noise_seed, t_disk, a, n_oct=_LOD_OFF,
 ):
     """Volumetric mass density ρ at a CKS equatorial-slab point (CKS-12 §3 stack).
 
@@ -1403,7 +1548,7 @@ def _disk_density_cks(
         # Hot modulator, kept pre-clamp so the CKS-19 dust path can reuse it (the
         # JIT-blowup fix; see _MP_COMPILE). exp(clamp(m_hot)) IS _disk_noise_density_mult
         # bit-for-bit, so ρ_hot — and every golden frame — is unchanged.
-        m_hot = _disk_blended_m(u_n, phi_n, zeta_n, t_disk, omega, noise_seed)
+        m_hot = _disk_blended_m(u_n, phi_n, zeta_n, t_disk, omega, noise_seed, n_oct)
         mmax = disk_noise_params[_NI_M_MAX]
         dmult = ti.exp(ti.min(ti.max(m_hot, -mmax), mmax))
         gauss = density  # base Gaussian (unmodulated σ); reassigned below
@@ -1426,9 +1571,24 @@ def _disk_density_cks(
             soft = disk_noise_params[_NI_MOD_EDGE_SOFT]
             r_in_eff = ti.max(r_inner * (1.0 + ein * (mf[1] - 0.5)), r_isco)
             r_out_eff = r_outer * (1.0 + eout * (mf[2] - 0.5))
-            win = _smoothstep_ti(r_in_eff, r_in_eff + soft, r) * (
-                1.0 - _smoothstep_ti(r_out_eff - soft, r_out_eff, r)
-            )
+            win_in = _smoothstep_ti(r_in_eff, r_in_eff + soft, r)
+            win_out = 1.0 - _smoothstep_ti(r_out_eff - soft, r_out_eff, r)
+            # CKS-22 KH edge erosion: replace the smooth OUTER envelope with a
+            # noise-thresholded soft-Heaviside clip H_soft(win_out − τ_KH·N_KH) ⇒ the
+            # rim tears into vacuum (fingers/holes) instead of a clean falloff. It
+            # clips the SHARED win_out (before the hot/cold split below), so under
+            # CKS-19 emission AND absorption fray together (silhouette-correct lanes).
+            # τ_KH ≤ 1−w_soft (setup clamp) ⇒ interior (win_out=1) immune. The clip is
+            # emitted ONLY when _EROS_COMPILE (ti.static) so the off-default mega-kernel
+            # JIT is unchanged (constraint 6 — bit-identical compile AND runtime). Once
+            # compiled the runtime _NI_EROS_EN still toggles it per render (look-dev).
+            if ti.static(_EROS_COMPILE):
+                if disk_noise_params[_NI_EROS_EN] > 0.5:
+                    n_kh = _kh_field(u_n, phi_n, zeta_n, t_disk, omega, noise_seed)
+                    tau_kh = disk_noise_params[_NI_EROS_STR]
+                    w_soft = disk_noise_params[_NI_EROS_WSOFT]
+                    win_out = _smoothstep_ti(0.0, w_soft, win_out - tau_kh * n_kh)
+            win = win_in * win_out
             # Emitted-temperature lumps (applied to T_emit, pre-g — n_T=mf[0]).
             t_amp = disk_noise_params[_NI_MOD_TEMP_AMP]
             temp_factor = 1.0 + t_amp * (mf[0] - 0.5)
@@ -1441,7 +1601,7 @@ def _disk_density_cks(
         if ti.static(_MP_COMPILE):
             # Reuse the hot modulator (only the dust seed re-evaluates the stack).
             dmult_cold = _disk_cold_mult_from_hot(
-                m_hot, u_n, phi_n, zeta_n, t_disk, omega, noise_seed)
+                m_hot, u_n, phi_n, zeta_n, t_disk, omega, noise_seed, n_oct)
             sigma_cold = sigma_eff * disk_noise_params[_NI_MP_SIGFRAC]
             gauss_cold = ti.exp(-0.5 * (dz_ang / sigma_cold) ** 2)
             density_cold = gauss_cold * dmult_cold * win
@@ -1591,6 +1751,7 @@ def _disk_emit_cks(
     x, y, z, p_cov, a, r_inner, r_outer, r_isco, theta_half_bound, sigma_theta0, flare_beta,
     T_0, emis_c, absb_c, ds,
     disk_model, doppler_strength, noise_enabled, noise_seed, t_disk, self_shadow, shadow_strength,
+    n_oct=_LOD_OFF,
 ):
     """One volumetric disk sample at a CKS geodesic point → (emission RGB, dτ).
 
@@ -1657,7 +1818,7 @@ def _disk_emit_cks(
                 # Gaussian (legacy bit-identical).
                 dens_tf = _disk_density_cks(
                     x, y, r, dz_ang, sigma_theta0, flare_beta, r_inner, r_outer, r_isco,
-                    noise_enabled, noise_seed, t_disk, a,
+                    noise_enabled, noise_seed, t_disk, a, n_oct,
                 )
                 density = dens_tf[0]          # ρ_hot — drives emission (CKS-19)
                 density_cold = dens_tf[1]     # ρ_cold — drives absorption/dτ (CKS-19)
@@ -2077,6 +2238,13 @@ def render_beauty_physics(
                 # slab test) and r within the radial band.
                 if in_band:
                     p_cov = vec4(s[4], s[5], s[6], s[7])
+                    # CKS-23 fractal LOD: pick the octave count for THIS sample from its
+                    # camera footprint J=ε·d (d = world distance camera→sample). _NI_LOD_EN
+                    # off ⇒ the _LOD_OFF sentinel ⇒ every gate=1 ⇒ bit-identical (constraint 6).
+                    n_oct_s = _LOD_OFF
+                    if disk_noise_params[_NI_LOD_EN] > 0.5:
+                        d_cam = ti.sqrt((x - cx) ** 2 + (y - cy) ** 2 + (z - cz) ** 2)
+                        n_oct_s = _lod_noct_ti(d_cam)
                     ev = _disk_emit_cks(
                         x,
                         y,
@@ -2100,6 +2268,7 @@ def render_beauty_physics(
                         t_disk,
                         self_shadow,
                         shadow_strength,
+                        n_oct_s,
                     )
                     # CKS-14 radiative-transfer source-function march. The kernel
                     # still returns (emission=j·ds, dτ=κ·ds); the term ACTUALLY
@@ -2631,6 +2800,11 @@ def render_beauty_frame(
     fov = float(cam_frame["fov"])
     tan_half_y = math.tan(0.5 * fov)
     tan_half_x = tan_half_y * (width / height)
+    # CKS-23: refresh the LOD per-pixel cone ε = vertical_fov / render_height for THIS
+    # frame's actual camera (the setup default used the config camera/resolution). Single
+    # f32 upload, no re-JIT; read only inside the _NI_LOD_EN branch ⇒ LOD-off bit-identical.
+    if disk_noise_params is not None:
+        disk_noise_params[_NI_LOD_EPS] = float(fov) / float(max(height, 1))
 
     n_steps = int(rcfg["max_steps_pipe_a"])
     d_lambda = float(rcfg["d_lambda_pipe_a"])

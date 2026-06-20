@@ -666,6 +666,7 @@ NSEED_L1_VORO = 211
 NSEED_L1_MASK = 307
 NSEED_L2 = 401
 NSEED_DUST = 911  # CKS-19: ρ_cold's independent modulator (own decorrelated stack)
+NSEED_KH = 1009   # CKS-22: KH edge-erosion high-freq simplex N_KH (own decorrelated stack)
 RIDGE_FEEDBACK = 2.0  # ridged-MF spectral feedback (spec §3.4; not a §5 look dial)
 MASK_SOFT = 0.15  # coverage-mask smoothstep half-width around the 1−coverage threshold
 _INV_TWO_PI = np.float32(1.0 / (2.0 * np.pi))
@@ -862,6 +863,128 @@ def dust_density_mult(u, phi, zeta, nz, mp, seed: int = 1234, t_disk: float = 0.
     m_cold = chi * m_hot + s * m_dust
     m_cold = np.clip(a_cold * m_cold, -mmax, mmax)
     return np.exp(m_cold).astype(np.float32)
+
+
+# --------------------------------------------------------------------------- #
+# CKS-22 — Kelvin-Helmholtz edge erosion (amends CKS-12 §3 outer window)
+# --------------------------------------------------------------------------- #
+def _smoothstep(e0, e1, x):
+    """Hermite smoothstep ``t·t·(3−2t)`` (CPU twin of ``_smoothstep_ti``). Returns 0
+    below ``e0``, 1 above ``e1``; a hard step where ``e1 == e0``."""
+    e0 = np.float32(e0)
+    e1 = np.float32(e1)
+    t = np.clip((np.asarray(x, np.float32) - e0) / np.where(e1 > e0, e1 - e0, np.float32(1.0)),
+                np.float32(0.0), np.float32(1.0))
+    return np.where(e1 > e0, t * t * (np.float32(3.0) - np.float32(2.0) * t),
+                    (np.asarray(x, np.float32) >= e0).astype(np.float32)).astype(np.float32)
+
+
+def kh_field(u, phi, zeta, t_disk, omega, shear_T, dynamism,
+             freq_u, freq_phi, freq_z, octaves, seed):
+    """N_KH ∈ [0,1] — CKS-22 high-freq simplex, advected by the CKS-12 §2 dual-phase
+    shear (material frame). **CPU source of truth**; GPU twin
+    ``taichi_renderer._kh_field``.
+
+    The φ axis uses the CKS-18 **cylinder embedding** ``(cos φ, sin φ)·freq_phi`` so
+    the field is seamless across φ = ±π (constraint 5) — classic simplex is NOT
+    lattice-periodic (SKILL v1.23), so passing φ linearly would tear at the seam. The
+    third ``sfbm3`` axis carries the radial/vertical coordinate ``u·freq_u + ζ·freq_z``
+    (``sfbm3`` is 3-D; ζ folds in alongside u so the fingers vary with height). A single
+    ``sfbm3`` layer per reset phase; convex triangle weights (``w_0 + w_1 ≡ 1``) keep
+    the blend in [0,1] (no variance-preserve divide — we want the [0,1] envelope domain,
+    exactly like :func:`noise_modulation_fields`).
+    """
+    u = np.asarray(u, np.float32)
+    phi = np.asarray(phi, np.float32)
+    zeta = np.asarray(zeta, np.float32)
+    fpf = np.float32(freq_phi)
+    fu = np.float32(freq_u)
+    fz = np.float32(freq_z)
+    oct_ = int(octaves)
+    sd = int(seed) + NSEED_KH
+
+    def layer(ph, s):
+        cx = (np.cos(ph).astype(np.float32) * fpf).astype(np.float32)
+        sx = (np.sin(ph).astype(np.float32) * fpf).astype(np.float32)
+        uz = (u * fu + zeta * fz).astype(np.float32)
+        return sfbm3(cx, sx, uz, 0, oct_, 2, 0.5, s).astype(np.float32)
+
+    if np.float32(shear_T) <= np.float32(0.0):
+        return layer(phi, sd)
+    T = np.float32(shear_T)
+    s = np.float32(t_disk) / T
+    g = np.float32(dynamism)
+    om = np.float32(omega)
+    c0 = np.floor(s)
+    a0 = s - c0
+    w0 = np.float32(1.0) - np.abs(np.float32(2.0) * a0 - np.float32(1.0))
+    ar1 = s + np.float32(0.5)
+    c1 = np.floor(ar1)
+    a1 = ar1 - c1
+    w1 = np.float32(1.0) - np.abs(np.float32(2.0) * a1 - np.float32(1.0))
+    sd0 = sd + int(c0) * NCYC_CYCLE
+    sd1 = sd + NCYC_PHASE + int(c1) * NCYC_CYCLE
+    ph0 = phi - g * om * (a0 * T)
+    ph1 = phi - g * om * (a1 * T)
+    return (w0 * layer(ph0, sd0) + w1 * layer(ph1, sd1)).astype(np.float32)
+
+
+def kh_erode_winout(win_out, n_kh, strength, w_soft):
+    """Replace the smooth outer envelope with the soft-Heaviside clip (CKS-22):
+    ``smoothstep(0, w_soft, win_out − strength·N_KH)``. ``strength`` is assumed already
+    clamped to ``[0, 1 − w_soft]`` by the caller/setup (interior immunity)."""
+    return _smoothstep(np.float32(0.0), np.float32(w_soft),
+                       np.asarray(win_out, np.float32)
+                       - np.float32(strength) * np.asarray(n_kh, np.float32))
+
+
+# --------------------------------------------------------------------------- #
+# CKS-23 — Fractal LOD octave cascade (gates the CKS-12 fBm density octaves)
+# --------------------------------------------------------------------------- #
+def lod_octave_weight(n_oct, o):
+    """Smooth per-octave gate ``g_o = clamp(n_oct − o, 0, 1)`` (CKS-23, float32).
+
+    Octave ``o`` is full-weight once ``n_oct ≥ o+1``, absent once ``n_oct ≤ o``,
+    and crossfades linearly across the one-octave band between — so as the camera
+    pulls back and ``n_oct`` slides down through an integer the top octave fades out
+    continuously (no integer popping). Every gate is ``1`` when ``n_oct`` is at/above
+    the native octave count ⇒ :func:`fbm2_lod` collapses to :func:`fbm2` byte-for-byte
+    (the LOD-off / shadow-bake path passes a large sentinel ⇒ constraint 6)."""
+    return np.clip(np.float32(n_oct) - np.float32(o),
+                   np.float32(0.0), np.float32(1.0)).astype(np.float32)
+
+
+def lod_noct(d, j0, n_max, n_min, eps_cone):
+    """Per-sample octave count ``n_oct = clamp(N_max − log₂(ε·d / J₀), N_min, N_max)``
+    (CKS-23). **CPU source of truth**; GPU twin ``taichi_renderer._lod_noct_ti``.
+
+    ``ε = fov_y / HEIGHT`` is the per-pixel cone (rad/px); ``J = ε·d`` is the
+    world-space footprint of one pixel at camera distance ``d``; ``J₀`` is the
+    footprint at which the full octave stack is exactly Nyquist-resolved. Doubling
+    the footprint (distance) drops one octave. Clamped to ``[N_min, N_max]`` so the
+    far field keeps a coarse floor and close-ups never exceed the native detail."""
+    j = np.float32(eps_cone) * np.asarray(d, np.float32)
+    lod = np.log2(np.maximum(j / np.float32(j0), np.float32(1e-30))).astype(np.float32)
+    return np.clip(np.float32(n_max) - lod,
+                   np.float32(n_min), np.float32(n_max)).astype(np.float32)
+
+
+def fbm2_lod(x, y, period, n_oct, octaves=4, lacunarity=2, gain=0.5, seed=0) -> np.ndarray:
+    """LOD-gated fBm of :func:`gnoise2` (CKS-23) — :func:`fbm2` with octave ``o``
+    weighted by :func:`lod_octave_weight`, gating BOTH numerator and denominator so
+    the ``[0,1]`` normalization stays exact at every ``n_oct``. With ``n_oct ≥ octaves``
+    every gate is 1 ⇒ :func:`fbm2` byte-for-byte; at integer ``n_oct = k`` it equals
+    :func:`fbm2` truncated to ``k`` octaves (same seeds/amp schedule)."""
+    total = np.float32(0.0)
+    norm = np.float32(0.0)
+    o = 0
+    for n, amp in _octaves(gnoise2, _f32(x), _f32(y), None, period,
+                           octaves, lacunarity, gain, seed):
+        w = (amp * lod_octave_weight(n_oct, o)).astype(np.float32)
+        total = total + n * w
+        norm = norm + w
+        o += 1
+    return (total / norm).astype(np.float32)
 
 
 def _mod_fbm_stack(u, phi, mod, seed_offsets, seed_base, curl=None, t_disk=0.0):
@@ -1140,6 +1263,31 @@ def fbm2_ti(x, y, period, octaves, lac, gain, seed):
 @ti.func
 def fbm3_ti(x, y, z, period, octaves, lac, gain, seed):
     return _stack3_ti(x, y, z, period, octaves, lac, gain, seed, 0)
+
+
+@ti.func
+def fbm2_lod_ti(x, y, period, octaves, lac, gain, seed, n_oct):
+    """LOD-gated fBm of :func:`gnoise2_ti` — twin of :func:`fbm2_lod` (CKS-23).
+
+    Each octave ``o`` is weighted by ``g_o = clamp(n_oct − o, 0, 1)`` applied to BOTH
+    ``total`` and ``norm``; ``n_oct ≥ octaves`` ⇒ every ``g_o = 1`` ⇒ bit-identical to
+    :func:`fbm2_ti` (multiply by f32 ``1.0`` is exact), so the off / shadow-bake path
+    (large-sentinel ``n_oct``) leaves the goldens unshifted (constraint 6)."""
+    total = 0.0
+    norm = 0.0
+    freq = 1
+    per = period
+    amp = 1.0
+    for o in range(octaves):
+        n = gnoise2_ti(x * freq, y * freq, per, seed + o)
+        g = ti.min(ti.max(n_oct - ti.cast(o, ti.f32), 0.0), 1.0)
+        w = amp * g
+        total += n * w
+        norm += w
+        amp *= gain
+        freq *= lac
+        per *= lac
+    return total / norm
 
 
 @ti.func

@@ -70,6 +70,12 @@ def _kernels(ti):
             out[i] = noise.fbm3_ti(x[i], y[i], z[i], period, oct, lac, gain, seed)
 
     @ti.kernel
+    def k_fbm2_lod(x: f32, y: f32, out: f32, period: ti.i32, oct: ti.i32, lac: ti.i32,
+                   gain: ti.f32, seed: ti.i32, n_oct: ti.f32):
+        for i in range(x.shape[0]):
+            out[i] = noise.fbm2_lod_ti(x[i], y[i], period, oct, lac, gain, seed, n_oct)
+
+    @ti.kernel
     def k_billow3(x: f32, y: f32, z: f32, out: f32, period: ti.i32, oct: ti.i32,
                   lac: ti.i32, gain: ti.f32, seed: ti.i32):
         for i in range(x.shape[0]):
@@ -195,6 +201,28 @@ def test_fbm3_twin_matches_reference(ti_cuda):
     K["k_fbm3"](x, y, z, out, _PERIOD, 5, 2, 0.5, 1)
     ref = noise.fbm3(x, y, z, _PERIOD, octaves=5, lacunarity=2, gain=0.5, seed=1)
     assert np.allclose(out, ref, atol=_ATOL), np.abs(out - ref).max()
+
+
+def test_fbm2_lod_twin_matches_reference(ti_cuda):
+    # CKS-23: gated fBm GPU twin == CPU noise.fbm2_lod at a partial (crossfading) n_oct.
+    K = _kernels(ti_cuda)
+    x, y, _z = _grid()
+    out = _out(x.size)
+    K["k_fbm2_lod"](x, y, out, _PERIOD, 5, 2, 0.5, 1, 2.6)
+    ref = noise.fbm2_lod(x, y, _PERIOD, n_oct=2.6, octaves=5, lacunarity=2, gain=0.5, seed=1)
+    assert np.allclose(out, ref, atol=_ATOL), np.abs(out - ref).max()
+
+
+def test_fbm2_lod_twin_off_is_fbm2(ti_cuda):
+    # n_oct ≥ octaves ⇒ every gate=1 ⇒ the gated twin is fbm2_ti byte-for-byte (the
+    # LOD-off / shadow-bake sentinel path leaves the golden frames unshifted, constraint 6).
+    K = _kernels(ti_cuda)
+    x, y, _z = _grid()
+    lod_off = _out(x.size)
+    plain = _out(x.size)
+    K["k_fbm2_lod"](x, y, lod_off, _PERIOD, 5, 2, 0.5, 1, 1.0e9)
+    K["k_fbm2"](x, y, plain, _PERIOD, 5, 2, 0.5, 1)
+    assert np.array_equal(lod_off, plain)
 
 
 def test_billow3_twin_matches_reference(ti_cuda):
@@ -324,3 +352,71 @@ def test_curl_flow_twin_matches_reference(ti_cuda):
                                  t_disk=float(t), flow_period=T_c)
         assert np.allclose(u_out, ru, atol=curl_atol), (t, np.abs(u_out - ru).max())
         assert np.allclose(phi_out, rp, atol=curl_atol), (t, np.abs(phi_out - rp).max())
+
+
+# --------------------------------------------------------------------------- #
+# CKS-22 — KH edge-erosion field _kh_field GPU twin (reads disk_noise_params, so
+# the param buffer is populated via _setup_disk_noise rather than kernel args).
+# --------------------------------------------------------------------------- #
+def _kh_cfg(enabled=True, strength=0.3, shear_T=10.0, dynamism=1.0):
+    return {"disk": {
+        "theta_half_width": 0.15, "vertical_sigma_frac": 0.2, "r_outer": 25.0,
+        "max_step_vfrac": 0.5,
+        "dynamics": {"shear_period_M": shear_T},
+        "noise": {"dynamism": dynamism, "modulation": {"edge_softness": 0.4}},
+        "edge_erosion": {"enabled": enabled, "strength": strength,
+                         "freq_u": 4.0, "freq_phi": 12, "freq_z": 1.0, "octaves": 3},
+    }}
+
+
+def test_kh_field_gpu_matches_cpu(ti_cuda):
+    """CKS-22 _kh_field GPU twin matches noise.kh_field (the §2-advected, cylinder-
+    embedded simplex N_KH). Tolerance above _SATOL: the φ embedding multiplies the
+    cos/sin twin error by freq_phi before sfbm3, on top of the base sfbm3 twin gap."""
+    ti = ti_cuda
+    from renderer import taichi_renderer as tr
+
+    tr._setup_disk_noise(_kh_cfg())  # populates disk_noise_params (EROS + SHEAR_T + DYNAMISM)
+
+    N = 48
+    out = ti.field(ti.f32, shape=N)
+    us = np.linspace(0.1, 0.9, N).astype(np.float32)
+    ph = np.linspace(-3.0, 3.0, N).astype(np.float32)
+
+    @ti.kernel
+    def fill(us: ti.types.ndarray(dtype=ti.f32, ndim=1),
+             ph: ti.types.ndarray(dtype=ti.f32, ndim=1)):
+        for i in range(N):
+            out[i] = tr._kh_field(us[i], ph[i], 0.0, 3.0, 0.05, 1234)
+
+    fill(us, ph)
+    ref = noise.kh_field(us, ph, np.zeros(N, np.float32), t_disk=3.0, omega=0.05,
+                         shear_T=10.0, dynamism=1.0, freq_u=4.0, freq_phi=12,
+                         freq_z=1.0, octaves=3, seed=1234)
+    got = out.to_numpy()
+    assert np.all(got >= -1e-6) and np.all(got <= 1.0 + 1e-6), (got.min(), got.max())
+    assert np.allclose(got, ref, atol=1e-4), np.abs(got - ref).max()
+
+
+def test_kh_field_gpu_static_path(ti_cuda):
+    """shear_T <= 0 ⇒ the GPU static branch (single sfbm3 layer at φ) matches the CPU."""
+    ti = ti_cuda
+    from renderer import taichi_renderer as tr
+
+    tr._setup_disk_noise(_kh_cfg(shear_T=0.0))
+    N = 40
+    out = ti.field(ti.f32, shape=N)
+    us = np.linspace(0.1, 0.9, N).astype(np.float32)
+    ph = np.linspace(-3.0, 3.0, N).astype(np.float32)
+
+    @ti.kernel
+    def fill(us: ti.types.ndarray(dtype=ti.f32, ndim=1),
+             ph: ti.types.ndarray(dtype=ti.f32, ndim=1)):
+        for i in range(N):
+            out[i] = tr._kh_field(us[i], ph[i], 0.0, 0.0, 0.0, 1234)
+
+    fill(us, ph)
+    ref = noise.kh_field(us, ph, np.zeros(N, np.float32), t_disk=0.0, omega=0.0,
+                         shear_T=0.0, dynamism=1.0, freq_u=4.0, freq_phi=12,
+                         freq_z=1.0, octaves=3, seed=1234)
+    assert np.allclose(out.to_numpy(), ref, atol=1e-4), np.abs(out.to_numpy() - ref).max()

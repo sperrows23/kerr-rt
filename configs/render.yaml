@@ -248,6 +248,41 @@ disk:
                              #   lobe), 0 isotropic, <0 back. ~0.6 = cinematic forward scatter.
     inner_glow: 1.0          # amplitude of the inner-edge illuminant I_src (its color is the
                              #   blackbody at T_inner = T_0·(6/r_inner)^0.75, derived in code).
+  edge_erosion:              # CKS-22 — Kelvin-Helmholtz threshold erosion of the OUTER edge.
+                             # Replaces the CKS-12 §3 outer smoothstep with a soft-Heaviside
+                             # clip H_soft(win_out − τ·N_KH): the rim TEARS into vacuum
+                             # (fingers/holes) instead of a clean falloff. N_KH is a high-freq
+                             # simplex advected by the §2 shear (cylinder-embedded ⇒ seamless).
+                             # Clips the SHARED envelope ⇒ with CKS-19 on, emission AND
+                             # absorption fray together (silhouette-correct dust lanes).
+                             # REQUIRES disk.noise.modulation.enabled (the only producer of a
+                             # soft win_out). enabled:false ⇒ the §3 smoothstep, BIT-IDENTICAL.
+    enabled: false           # master switch (golden frames intact when false).
+    strength: 0.0            # τ_KH — erosion depth; clamped to [0, 1−w_soft] at load (interior immune).
+    freq_u: 4.0              # radial feature frequency of N_KH.
+    freq_phi: 12             # azimuthal frequency (cylinder-embedding radius — seamless, any real).
+    freq_z: 1.0              # vertical feature frequency (folded into the u axis of the 3-D simplex).
+    octaves: 3               # N_KH simplex octaves (high-freq fingers).
+    soft_width: 0.0          # w_soft on the [0,1] envelope; 0 ⇒ auto = step-cap floor
+                             #   max(soft_width, max_step_vfrac·σ0·r_outer/edge_softness), k_soft=1
+                             #   (clamped to [0.02, 0.5]).
+                             # (N_KH seeds off disk.noise.seed + NSEED_KH — decorrelated from
+                             #  the density stack, co-moving with the same deterministic family.)
+  lod:                       # CKS-23 — fractal LOD octave cascade (anti-aliases the disk noise).
+                             # Per disk sample n_oct = clamp(n_max − log2(ε·d / j0), n_min, n_max)
+                             # (ε = vertical_fov/HEIGHT, d = camera distance) gates the L0/L2/L1-mask
+                             # fBm octaves by a smooth weight g_o = clamp(n_oct−o, 0, 1): far views
+                             # drop shimmering sub-pixel octaves; close-ups keep the full stack.
+                             # Gates BOTH numerator and denominator ⇒ enabled:false is BIT-IDENTICAL
+                             # (every g_o=1). Prerequisite for the V4 free camera. No CKS-13 change.
+    enabled: false           # master switch (golden frames intact when false).
+    n_max: 6.0               # full octave count at the reference footprint J=j0 (≥ the gated
+                             #   layers' native octaves: L0=5, L2/L1-mask=2, so 6 keeps full detail).
+    n_min: 2.0               # coarse far-field octave floor (never drop below this).
+    j0: 0.02                 # pixel footprint (world M) at which the cascade is Nyquist-resolved;
+                             #   J>j0 (farther) sheds one octave per doubling. ε is auto-derived
+                             #   from the per-frame camera fov / render height (not stored here).
+
   # NOTE: the Phase-3.3 |u|=|cosθ| disk-slab early-out bound is now DERIVED in code
   # as sin(theta_half_width) (renderer.render_beauty_frame) — the old hardcoded
   # `bounding_sin_theta_half: 0.14944` literal duplicated it and desynced whenever

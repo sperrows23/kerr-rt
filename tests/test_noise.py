@@ -817,3 +817,101 @@ def test_dust_chi_plus_one_is_hot_modulator():
     rho_hot = N.noise_density_mult(u, phi, zeta, _DUST_NZ, seed=7)
     rho_cold = N.dust_density_mult(u, phi, zeta, _DUST_NZ, _dust_mp(1.0), seed=7)
     np.testing.assert_allclose(rho_cold, rho_hot, rtol=1e-5, atol=1e-6)
+
+
+# --------------------------------------------------------------------------- #
+# CKS-22 — Kelvin-Helmholtz edge erosion (kh_field N_KH + kh_erode_winout clip)
+# --------------------------------------------------------------------------- #
+def test_kh_field_in_unit_range():
+    # N_KH is a convex (triangle-weight) blend of sfbm3 layers ⇒ stays in [0, 1].
+    u = np.linspace(0.0, 1.0, 64)
+    phi = np.linspace(-np.pi, np.pi, 64)
+    n = noise.kh_field(u, phi, np.zeros_like(u), t_disk=3.0, omega=0.05,
+                       shear_T=10.0, dynamism=1.0, freq_u=4.0, freq_phi=12,
+                       freq_z=1.0, octaves=3, seed=1234)
+    assert np.all(n >= 0.0) and np.all(n <= 1.0)
+
+
+def test_kh_field_phi_seamless():
+    # Seamless across φ = ±π via the CKS-18 cylinder embedding (cos/sin φ), NOT a
+    # lattice period (classic simplex is non-periodic — SKILL v1.23 / constraint 5).
+    a = noise.kh_field(np.array([0.5]), np.array([-np.pi + 1e-6]), np.array([0.0]),
+                       3.0, 0.05, 10.0, 1.0, 4.0, 12, 1.0, 3, 1234)
+    b = noise.kh_field(np.array([0.5]), np.array([np.pi - 1e-6]), np.array([0.0]),
+                       3.0, 0.05, 10.0, 1.0, 4.0, 12, 1.0, 3, 1234)
+    assert abs(float(a.reshape(-1)[0]) - float(b.reshape(-1)[0])) < 1e-3
+
+
+def test_kh_field_static_path_in_range():
+    # shear_T <= 0 ⇒ single static layer (no advection); still a valid [0,1] envelope.
+    u = np.linspace(0.0, 1.0, 32)
+    phi = np.linspace(-np.pi, np.pi, 32)
+    n = noise.kh_field(u, phi, np.zeros_like(u), t_disk=0.0, omega=0.0,
+                       shear_T=0.0, dynamism=1.0, freq_u=4.0, freq_phi=12,
+                       freq_z=1.0, octaves=3, seed=1234)
+    assert np.all(n >= 0.0) and np.all(n <= 1.0)
+
+
+def test_kh_erode_interior_immune():
+    # win_out == 1 (disk interior) stays 1 when strength <= 1 - w_soft (the clamp bound).
+    win = np.ones(32)
+    n = np.linspace(0.0, 1.0, 32)
+    w_soft, strength = 0.15, 0.85  # strength == 1 - w_soft
+    out = noise.kh_erode_winout(win, n, strength, w_soft)
+    assert np.allclose(out, 1.0, atol=1e-6)
+
+
+def test_kh_erode_tears_band():
+    # win_out in the transition band (0.3) with high noise tears to 0 (vacuum).
+    win = np.full(8, 0.3)
+    n = np.full(8, 1.0)
+    out = noise.kh_erode_winout(win, n, strength=0.85, w_soft=0.15)
+    assert np.all(out < 1e-6)  # 0.3 - 0.85 < 0 ⇒ clipped to 0
+
+
+# --------------------------------------------------------------------------- #
+# CKS-23 — fractal LOD octave cascade (gates the CKS-12 fBm density octaves)
+# --------------------------------------------------------------------------- #
+def test_fbm2_lod_full_matches_fbm2():
+    # n_oct >= octaves ⇒ every gate g_o = 1 ⇒ fbm2_lod is fbm2 byte-for-byte
+    # (the LOD-off / shadow-bake sentinel path leaves the goldens unshifted).
+    x = np.linspace(0.0, 7.0, 96)
+    y = np.linspace(0.0, 5.0, 96)
+    full = noise.fbm2(x, y, period=4, octaves=4, seed=77)
+    lod = noise.fbm2_lod(x, y, period=4, n_oct=1.0e9, octaves=4, seed=77)
+    assert np.array_equal(full, lod)
+
+
+def test_fbm2_lod_integer_equals_truncated():
+    # At integer n_oct = k the gates are 1 for o < k and 0 for o >= k, so the
+    # gated stack (numerator AND denominator) equals fbm2 truncated to k octaves.
+    x = np.linspace(0.0, 7.0, 96)
+    y = np.linspace(0.0, 5.0, 96)
+    trunc = noise.fbm2(x, y, period=4, octaves=2, seed=77)
+    lod = noise.fbm2_lod(x, y, period=4, n_oct=2.0, octaves=5, seed=77)
+    assert np.array_equal(trunc, lod)
+
+
+def test_lod_octave_weight_crossfade():
+    # g_o = clamp(n_oct - o, 0, 1): the top octave fades linearly (no integer pop).
+    assert float(noise.lod_octave_weight(1.5, 0)) == 1.0   # fully resolved
+    assert abs(float(noise.lod_octave_weight(1.5, 1)) - 0.5) < 1e-7  # crossfading
+    assert float(noise.lod_octave_weight(1.5, 2)) == 0.0   # culled
+    # Monotone non-increasing in o at fixed n_oct.
+    g = [float(noise.lod_octave_weight(2.3, o)) for o in range(5)]
+    assert all(g[i] >= g[i + 1] for i in range(len(g) - 1))
+
+
+def test_lod_noct_monotone_and_clamped():
+    # n_oct = clamp(N_max - log2(eps*d/J0), N_min, N_max): drops one octave per
+    # footprint doubling, clamped to [N_min, N_max].
+    eps, j0, n_max, n_min = 1.0e-3, 0.5, 6.0, 2.0
+    d = np.array([1.0, 10.0, 100.0, 1.0e3, 1.0e5], np.float32)
+    n = noise.lod_noct(d, j0, n_max, n_min, eps)
+    assert np.all(np.diff(n) <= 1e-6)              # non-increasing with distance
+    assert np.all(n >= n_min - 1e-6) and np.all(n <= n_max + 1e-6)
+    # At J = J0 (eps*d == j0) the cascade is exactly Nyquist ⇒ n_oct == N_max.
+    d0 = j0 / eps
+    assert abs(float(noise.lod_noct(d0, j0, n_max, n_min, eps)) - n_max) < 1e-5
+    # One footprint doubling beyond J0 drops exactly one octave.
+    assert abs(float(noise.lod_noct(2.0 * d0, j0, n_max, n_min, eps)) - (n_max - 1.0)) < 1e-5

@@ -837,6 +837,60 @@ work below predates and is **superseded by** the CKS migration above):
   `docs/plans/2026-06-19-pillar3-scattering-implementation.md`; SKILL.md Formula **CKS-20**
   (DESIGN→ACTIVE, rev v1.32). Look-dev `scripts/showcase_disk.py --scatter/--albedo/--hg-g/--inner-glow`.
 
+**Kelvin-Helmholtz edge erosion — Pillar 4, CKS-22 (authored 2026-06-20, rev v1.33).**
+  Replaces the clean CKS-12 §3 outer smoothstep rim with a noise-thresholded soft-Heaviside
+  clip so the outer edge TEARS into vacuum (fingers/holes) instead of fading smoothly:
+  inside the §3 modulation branch of `_disk_density_cks`,
+  `win_out → smoothstep(0, w_soft, win_out − τ_KH·N_KH)`. `N_KH ∈ [0,1]` is a high-freq
+  simplex (`_kh_field` GPU / `noise.kh_field` CPU twin, seed `NSEED_KH=1009`) advected by the
+  SAME §2 dual-phase shear as the density; its φ axis uses the CKS-18 **cylinder embedding**
+  `(cos φ, sin φ)·freq_phi` so it is seamless across φ=±π (classic simplex is not
+  φ-periodic — constraint 5). The clip multiplies the SHARED `win` before the hot/cold split,
+  so under CKS-19 emission AND absorption fray together (silhouette-correct lanes). Interior
+  immunity via the load-time clamp `τ_KH ≤ 1−w_soft`; step-cap floor
+  `w_soft ≥ max_step_vfrac·σ0·r_outer/edge_softness` (k_soft=1, clamped [0.02,0.5]). New slots
+  `_NI_EROS_{EN,STR,FU,FP,FZ,OCT,WSOFT}` (`_NOISE_N` 57→64). **JIT:** the clip is emitted only
+  under a `ti.static(_EROS_COMPILE)` gate (like `_MP_COMPILE`/`_SCATTER_COMPILE`), so
+  `disk.edge_erosion.enabled:false` (default) ⇒ the original mega-kernel compiles unchanged and
+  golden frames are **bit-identical**. REQUIRES `disk.noise.modulation.enabled` (the only
+  producer of a soft `win_out`). Config `disk.edge_erosion` (base dials, no CKS-13 change).
+  Guards: `tests/test_noise.py` (CPU `kh_field`/`kh_erode_winout` range/seam/clip),
+  `tests/test_noise_gpu.py::test_kh_field_gpu_matches_cpu` (twin parity),
+  `tests/test_disk_edge_erosion.py` (OFF bit-identity + outer-band tearing), unchanged
+  `test_gpu_regression.py`. SKILL.md Formula **CKS-22** (rev v1.33).
+
+**Fractal LOD octave cascade — Pillar 5, CKS-23 (authored 2026-06-20, rev v1.34).**
+  Anti-aliases the disk turbulence so it survives a moving/zooming camera (the V4
+  prerequisite): each disk sample picks an octave count from its pixel footprint
+  `n_oct = clamp(N_max − log₂(ε·d / J₀), N_min, N_max)` (ε = vertical_fov/HEIGHT,
+  d = camera→sample distance, `_lod_noct_ti` / `noise.lod_noct`), and the L0/L2/L1-mask
+  fBm octaves are weighted by the smooth gate `g_o = clamp(n_oct − o, 0, 1)` — far views
+  shed the shimmering sub-pixel octaves, close-ups keep the full stack, and the top partial
+  octave crossfades so there is no integer popping. The new gated primitive
+  `fbm2_lod_ti` / `noise.fbm2_lod` gates BOTH the fBm numerator AND denominator, so the
+  normalization is exact and at `n_oct ≥ octaves` every `g_o = 1` ⇒ the result is `fbm2`
+  **byte-for-byte**. `n_oct` is threaded `render_beauty_physics → _disk_emit_cks →
+  _disk_density_cks → _disk_blended_m / _disk_cold_mult_from_hot → _disk_noise_m`; every
+  hop defaults the arg to the `_LOD_OFF` sentinel (1e9), so the shadow bake and the
+  parity-test callers stay exact with no edit. New slots `_NI_LOD_{EN,NMAX,NMIN,J0,EPS}`
+  (`_NOISE_N` 64→69). **JIT:** there is **no** `ti.static` recompile gate — the gated fBm
+  is bit-exact at the sentinel (×1.0 is exact), so it is always compiled and
+  `disk.lod.enabled:false` (default) ⇒ golden frames **bit-identical**. ε is refreshed
+  per frame in `render_beauty_frame` from the actual cam fov / render height (one f32
+  upload, no re-JIT). Config `disk.lod` (base dials `n_max`/`n_min`/`j0`, no CKS-13 change).
+  v1 scope: octaves-only (no `dλ`), isotropic scalar `J`. Guards: `tests/test_noise.py`
+  (CPU `fbm2_lod`/`lod_noct`/`lod_octave_weight`: full-octave identity, integer-truncation,
+  crossfade, distance clamp), `tests/test_noise_gpu.py` (`fbm2_lod_ti` twin parity +
+  LOD-off = `fbm2_ti`), `tests/test_disk_lod.py` (OFF bit-identity + ON re-textures the
+  disk-only buffer at a face-on camera, with sampling-only containment), unchanged
+  `test_gpu_regression.py`. The cascade *math* (octave-drop = fBm truncation, exact
+  renorm, monotone `n_oct`, anti-pop crossfade) is proven by the CPU/GPU twins above, not
+  a render-level high-frequency metric: the gated fBm renormalizes (numerator AND
+  denominator), so culling the already-sub-pixel octaves re-weights the surviving coarse
+  octave UP and does not lower (empirically slightly raises) the rendered disk's
+  |Laplacian| — the LOD benefit is anti-aliasing vs a supersampled reference, not raw
+  curvature. SKILL.md Formula **CKS-23** (rev v1.34).
+
 *Note — `render_pipe_a`* (the 256² dev LOD kernel for `_gate2_lod_test`) was
 migrated to `[y,u,…]` but **intentionally keeps its offset ray** as the offset-ray
 LOD reference; it is not on the 4K production path.
@@ -867,6 +921,8 @@ re-derive. **`disk.py`, `geodesic.py`/`metric.py` CPU references, and any
 | **D3** | Dynamic derived parameters: editing base config (spin, target temperature, disk extent) must rescale every dependent quantity automatically | ✅ **Resolved (2026-06-13)** — `src/renderer/kerr_params.resolve_config` (SKILL.md Formula **CKS-13**, rev v1.14) runs inside every config loader (`taichi_renderer.load_config`, `thumb.py`); derives `r_plus`/`r_isco`/`disk.r_inner`/`disk.T_0` (from new base `disk.target_peak_temperature`) + `disk.dynamics` time mapping (`time_scale`, `shear_period_M` for D2). Desync-prone YAML literals removed. Closed forms (BPT 1972 — exact, beats any LUT; only CKS-11 f_PT needs tabulation), literature anchors pinned in `tests/test_kerr_params.py` (11 tests). Render impact: r_inner 1.182→1.181765 (exact ISCO). ⚠️ The original "GPU regression bit-identical except Doppler Δ5e-6" claim was wrong: re-keying `T_0`→`target_peak_temperature` dropped the simple-model peak T_eff 18,600→5,500 K, moving the disk peak 6.17→14.45 and Doppler ratio 4.32→5.15 — the `test_gpu_regression.py` goldens were re-anchored + made dynamic in `doppler_strength` 2026-06-13 (see the test entry above + SKILL.md v1.16) | Config |
 | **P2** | Multi-phase disk media: decouple emission density (`ρ_hot`) from absorption density (`ρ_cold`) so cold dust carves dark **silhouettes** into the glow rather than only dimming it | ✅ **Resolved (2026-06-16; GPU-verified 2026-06-18)** — `_disk_density_cks` returns `vec3(ρ_hot, ρ_cold, temp_factor)`; emission←`ρ_hot`, absorption (`dτ`) + the CKS-15 self-shadow bake←`ρ_cold`; step cap resolves the thinner cold slab (`σ_cold=σ_hot·dust_sigma_frac`). `ρ_cold=exp(clamp(m_cold))`, `m_cold=χ·m_hot+√(1−χ²)·m_dust` (variance-preserving Pearson mix; dust field at `seed+NSEED_DUST=911`). SKILL.md Formula **CKS-19** (DESIGN→ACTIVE, rev v1.31); **chromatic per-channel `dτ⃗` shipped 2026-06-18 (Task 7)** — `κ⃗ = absb_c·extinction_rgb` (`disk.extinction_rgb`, default grey `[1,1,1]` ⇒ bit-identical), vec3 transmittance `T⃗`, `disk_buf` widened (H,W,4)→(H,W,6) so the background reddens through dust; guard `test_disk_multiphase.py::test_chromatic_extinction_reddens`. Config `disk.multiphase` (sibling of `disk.noise`, default `enabled:false` ⇒ `ρ_cold≡ρ_hot` ⇒ legacy march bit-identical). **JIT:** dust branch emitted only when enabled (`ti.static` `_MP_COMPILE` gate) ⇒ toggling `enabled` forces a one-time recompile; OFF default keeps the original fast JIT (a runtime `if` blew compile past 2 h). New slots `_NI_MP_{EN,CHI,AMP,SIGFRAC}` (`_NOISE_N` 53→57). Guards: `test_noise.py` (CPU correlation/variance parity), `test_disk_noise.py::{test_rho_cold_gpu_matches_cpu,test_multiphase_off_bit_identical}`, `test_disk_multiphase.py::test_dust_carves_silhouette`, unchanged `test_gpu_regression.py`. Plan `docs/plans/2026-06-16-pillar2-multiphase-implementation.md`. | Visualization/Physics |
 | **P3** | Volumetric single-scattering + Henyey-Greenstein rim-light: cold dust catches forward-scattered inner-edge light (the "silver-lining") instead of only absorbing | ✅ **Resolved (2026-06-19)** — `σ_s = ϖ·κ` added to the extinction + single-scatter source `J_scat = σ_s·ρ_cold·P(cosθ_s)·I_src·e^{−τ_src}` from the hot inner edge, forward HG phase (`disk.scatter.hg_g`, default 0.6). SKILL.md Formula **CKS-20** (DESIGN→ACTIVE, rev v1.32); `_hg_phase`/`_disk_scatter_cks` behind the `ti.static` `_SCATTER_COMPILE` gate; `disk.scatter` config (default `enabled:false` ⇒ CKS-19 march bit-identical). **Compile:** scatter reuses the march's `grey_dtau` (no `_disk_density_cks` double-inline) + new `render.advanced_optimization`/`cfg_optimization` JIT knobs (default true; `--fast-compile` for tests/look-dev). **Empirical scene note:** the canonical edge-on camera is back-scatter-dominated (forward silver-lining is a localized limb; scatter-ON net-darkens) — `test_scatter_rim_light` asserts the true observables, not a net-brighten. Guards `tests/test_disk_scatter.py` (6), `test_gpu_regression.py` unshifted. Plan `docs/plans/2026-06-19-pillar3-scattering-implementation.md`. | Visualization/Physics |
+| **P4** | Kelvin-Helmholtz edge erosion: shred the clean outer rim into vacuum (fingers/holes) instead of a smooth falloff | ✅ **Resolved (2026-06-20)** — inside the §3 modulation branch of `_disk_density_cks`, `win_out → smoothstep(0, w_soft, win_out − τ_KH·N_KH)`; `N_KH` = high-freq simplex (`_kh_field` GPU / `noise.kh_field` CPU, seed `NSEED_KH=1009`) §2-advected, φ via the CKS-18 cylinder embedding (seamless, constraint 5). Clips the SHARED `win` ⇒ with CKS-19 emission & absorption fray together. Interior immunity (`τ_KH ≤ 1−w_soft` clamp), step-cap floor on `w_soft` (k_soft=1). New slots `_NI_EROS_{EN,STR,FU,FP,FZ,OCT,WSOFT}` (`_NOISE_N` 57→64). **JIT:** clip emitted only under `ti.static(_EROS_COMPILE)` ⇒ `disk.edge_erosion.enabled:false` (default) keeps the original JIT + **bit-identical** goldens. REQUIRES `disk.noise.modulation.enabled`. SKILL.md Formula **CKS-22** (rev v1.33). Guards `tests/test_noise.py` (CPU twins), `tests/test_noise_gpu.py::test_kh_field_gpu_matches_cpu`, `tests/test_disk_edge_erosion.py` (OFF bit-identity + tearing), unchanged `test_gpu_regression.py`. Plan `docs/specs/2026-06-20-P4-P5-edge-erosion-lod-cascade-plan.md`. | Visualization |
+| **P5** | Fractal LOD octave cascade: anti-alias the disk turbulence so it survives a moving/zooming camera (the V4 free-camera prerequisite) | ✅ **Resolved (2026-06-20)** — per disk sample `n_oct = clamp(N_max − log₂(ε·d / J₀), N_min, N_max)` (ε = vertical_fov/HEIGHT, d = camera distance; `_lod_noct_ti` / `noise.lod_noct`) gates the L0/L2/L1-mask fBm octaves by `g_o = clamp(n_oct − o, 0, 1)` via the new `fbm2_lod_ti` / `noise.fbm2_lod` (gates BOTH numerator and denominator ⇒ exact renorm; top octave crossfades ⇒ no integer popping). `n_oct` threaded `render_beauty_physics → _disk_emit_cks → _disk_density_cks → _disk_blended_m/_disk_cold_mult_from_hot → _disk_noise_m`, every hop defaulting to the `_LOD_OFF` sentinel (1e9) ⇒ shadow bake + parity-test callers exact with no edit. New slots `_NI_LOD_{EN,NMAX,NMIN,J0,EPS}` (`_NOISE_N` 64→69). **JIT:** NO `ti.static` recompile gate — the gated fBm is bit-exact at the sentinel (×1.0 is exact), always compiled ⇒ `disk.lod.enabled:false` (default) keeps goldens **bit-identical**; ε refreshed per frame in `render_beauty_frame` (one f32 upload, no re-JIT). Config `disk.lod` (base dials, no CKS-13 change); v1 scope octaves-only / isotropic scalar `J`. SKILL.md Formula **CKS-23** (rev v1.34). Guards `tests/test_noise.py` (CPU `fbm2_lod`/`lod_noct`/`lod_octave_weight`), `tests/test_noise_gpu.py` (`fbm2_lod_ti` twin + LOD-off = `fbm2_ti`), `tests/test_disk_lod.py` (OFF bit-identity + octave dropping), unchanged `test_gpu_regression.py`. Plan `docs/specs/2026-06-20-P4-P5-edge-erosion-lod-cascade-plan.md`. | Sampling |
 
 ### Code-review findings (verified against current code)
 
