@@ -19,9 +19,9 @@ Load this skill whenever the task involves:
 - Disk curl-flow domain warp / divergence-free noise-coordinate distortion (Formula CKS-18 — VISUALIZATION)
 - Multi-phase disk media — decoupled hot-emission / cold-absorption fields, dust lanes (Formula CKS-19 — PHYSICS)
 - Volumetric single-scattering + Henyey-Greenstein phase, cloud rim-light (Formula CKS-20 — PHYSICS)
+- Disk scale-dependent shear cascade / frequency-dependent shear transfer (Formula CKS-21 — VISUALIZATION)
 - Kelvin-Helmholtz threshold erosion of the outer disk edge (Formula CKS-22 — VISUALIZATION)
 - Distance-driven fractal LOD octave cascade for the disk noise (Formula CKS-23 — SAMPLING)
-- (RESERVED, design `docs/specs/2026-06-16-cinematic-volumetric-multiphase-scattering-design.md`) scale-dependent shear cascade (CKS-21 — VISUALIZATION)
 - Any formula involving `r_isco`, `E_I`, `L_I`, `u^t`, `u^r`, `u^phi`, `g-factor`, `Carter Q`
 
 ---
@@ -1918,6 +1918,47 @@ storage to the CKS-17 bake; HG phase `@ti.func` (CPU twin + parity); the march a
 
 ---
 
+## Formula CKS-21 — Scale-dependent shear cascade (owner-approved 2026-06-20; VISUALIZATION, NOT a metric)
+
+> **Status:** same VISUALIZATION class as CKS-12 §2 / CKS-18 — it warps the disk-noise
+> **coordinate** only (a per-octave azimuthal offset). It may not touch `p_μ`, `u^μ` (CKS-8),
+> `g` (CKS-9), `g⁴` (Formula 9), `f_PT` (CKS-11), or the chroma form. Spec:
+> `docs/specs/2026-06-20-P1-shear-cascade-design.md`.
+
+CKS-12 §2 applies the Keplerian shear `φ′_k = φ − Ω(r)·a_k·T` **uniformly to the whole fBm**,
+so every octave winds at the same rate and fine detail laminarizes into the same spiral as the
+coarse structure. CKS-21 makes the shear **frequency-dependent**: per octave `o` of frequency
+`f_o = f_base·lac^o`,
+
+```
+S(f)     = 1 / (1 + (f / f_c)^p)                       # transfer: low f → 1, high f → 0
+shear_k  = dynamism · Ω(r) · (a_k · T)                 # the CKS-12 §2 shear amount, unchanged
+φ′_{o,k} = φ − S(f_o) · shear_k                         # intuitive form (no curl)
+```
+
+**Composition with the CKS-18 curl warp (the implementation form).** The curl warp is nonlinear
+and is applied to the already-sheared `φ_k` (CKS-18 §2). To keep that order (and bit-identity
+when `S≡1`), the cascade is a per-octave **de-shear add-back** applied *after* curl:
+
+```
+φ_k       = φ − shear_k                                 # full §2 shear, before curl (UNCHANGED)
+φ_c       = curl_φ(u, φ_k)                              # CKS-18 warp on φ_k (UNCHANGED order)
+φ′_{o,k}  = φ_c + (1 − S(f_o)) · shear_k                # per-octave correction (the cascade)
+```
+
+`S(f_o) ≡ 1` (cascade off / `f_c → ∞`) ⇒ correction `0` ⇒ CKS-12 §2 uniform shear bit-for-bit.
+C0-continuity at resets is preserved (the `w_k → 0` reset weight is independent of `S`).
+
+**Scope:** the density octave stacks L0 (`fbm2`), L2 (`fbm2`), and L1's `ridged3`. The L1
+Voronoi (single-frequency cellular — no octaves) and the L1 coverage mask + the §3 modulation
+envelopes keep uniform shear. Density φ is linear-Perlin (`gnoise`, integer-period wrap) — the
+constant-in-φ correction preserves the seam (constraint 5); no trig added.
+
+Config `disk.noise.shear_cascade`: `enabled` (default false), `shear_cutoff` = `f_c` (0 ⇒ a
+large sentinel ⇒ `S≡1`), `shear_falloff` = `p`. Base dials — no CKS-13 resolver change.
+
+---
+
 ## Formula CKS-22 — Kelvin-Helmholtz edge erosion (VISUALIZATION)
 
 **Class:** VISUALIZATION (amplitude only). Amends CKS-12 §3. Never touches
@@ -2055,6 +2096,7 @@ configs/render.yaml              ← BASE params only: a, WIDTH, HEIGHT, step co
 | Version | Change |
 |---|---|
 | v1.0 | Initial release |
+| v1.35 | **Formula CKS-21 authored (2026-06-20) — scale-dependent shear cascade / frequency-dependent shear transfer (VISUALIZATION), extends CKS-12 §2.** Makes the §2 Keplerian shear frequency-dependent so coarse disk-noise octaves wind into filaments while high-frequency octaves are protected from laminarizing into the same spiral (Kolmogorov-like). Per octave `o` of frequency `f_o = f_base·lac^o`, the transfer `S(f)=1/(1+(f/f_c)^p)` (low f→1, high f→0); implemented as a per-octave **de-shear add-back** `φ′_{o,k} = curl_φ(φ−shear_k) + (1−S(f_o))·shear_k` (`shear_k = dynamism·Ω(r)·a_k·T`) so the CKS-18 shear→curl order is UNCHANGED and `S≡1` reproduces the CKS-12 §2 uniform shear bit-for-bit. Threads through the shared CPU `_octaves` generator (`fbm2`/`fbm2_lod`/`ridged3`) + the GPU `fbm2_lod_ti`/`ridged3_ti` twins; scope = density octave stacks L0/L2/L1-`ridged3` (L1 Voronoi/mask + the §3 modulation envelopes keep uniform shear). Density φ is linear-Perlin (integer-period wrap), so the constant-in-φ correction preserves the φ-seam (constraint 5; no trig added). Config `disk.noise.shear_cascade {enabled, shear_cutoff=f_c, shear_falloff=p}` — base dials, no CKS-13 resolver change; `_NI_SC_{EN,FC,P}` slots (`_NOISE_N` 69→72). **Bit-identity:** `enabled:false` (or absent) ⇒ `shear_k=0` sentinel default ⇒ `(1−S)·0=0` ⇒ always-compiled, goldens bit-identical (constraint 6; the CKS-23 no-`ti.static`-gate precedent), and `f_c ≥ SHEAR_FC_OFF=1e9` short-circuits `S≡1` (skips the `pow`). Spec: `docs/specs/2026-06-20-P1-shear-cascade-design.md`; plan `docs/specs/2026-06-20-P1-shear-cascade-plan.md`. |
 | v1.34 | **Formula CKS-23 authored (2026-06-20) — fractal LOD octave cascade (SAMPLING), extends Formula 10.** Per disk sample, `n_oct = clamp(N_max − log₂(ε·d/J₀), N_min, N_max)` (ε=fov_y/HEIGHT, d=camera distance) gates the fBm density octaves by a smooth per-octave weight `g_o = clamp(n_oct−o, 0, 1)` — far views drop shimmering sub-pixel octaves, close-ups keep the full native stack, with no integer popping (the top partial octave crossfades). New gated primitive `fbm2_lod_ti`/`noise.fbm2_lod` gates BOTH `total` and `norm` so normalization is exact ⇒ the `g_o≡1` path is `fbm2` byte-for-byte. `J₀`/`N_max`/`N_min` are base dials (`disk.lod`, no CKS-13 change). Threaded `n_oct` through `render_beauty_physics → _disk_emit_cks → _disk_density_cks → _disk_blended_m/_disk_cold_mult_from_hot → _disk_noise_m` (L0/L2/L1-mask only — v1 scope); `_NI_LOD_{EN,NMAX,NMIN,J0,EPS}` slots (`_NOISE_N` 64→69). **Bit-identity:** `lod.enabled:false` ⇒ each layer gates over its OWN native octave count with `n_oct=native` ⇒ every `g_o=1` ⇒ ungated (constraint 6); the shadow bake always passes the native sentinel (no camera). Octaves-only (no `dλ`), isotropic scalar `J`; anisotropic/`dλ` deferred. Prerequisite for the V4 free camera. | **Formula CKS-22 authored (2026-06-20) — KH outer-edge threshold erosion (VISUALIZATION), amends CKS-12 §3.** Replaces the §3 outer smoothstep envelope with a soft-Heaviside clip `win_out' = H_soft(win_out − τ_KH·N_KH, w_soft)`, where `N_KH ∈ [0,1]` is a high-freq simplex advected by the SAME §2 dual-phase shear as the density (own seed `NSEED_KH`). The outer rim tears into vacuum (fingers/holes) instead of a clean falloff. **Interior immunity** via the clamp `τ_KH ≤ 1−w_soft` (where `win_out=1` the clip stays 1); **step-cap floor** `w_soft ≥ max_step_vfrac·σ_θ(r_outer)/soft` (k_soft=1) keeps the torn edge resolved. Clips the **shared** `win` before the hot/cold split, so under CKS-19 emission AND absorption fray together (silhouette-correct lanes). Lives inside the §3 modulation branch (the only producer of a soft `win_out`), so requires `disk.noise.modulation.enabled`; decoupling deferred. Config `disk.edge_erosion` (base dials, no CKS-13 change); default OFF ⇒ the §3 smoothstep is bit-identical (constraint 6). |
 | v1.32 | **Formula CKS-20 WIRED & validated (2026-06-19) — volumetric single-scattering + Henyey-Greenstein rim-light.** The beauty march now (behind `disk.scatter.enabled`, default OFF) adds the scattering coefficient to the extinction (`dτ_ext⃗ = (κ⃗+σ_s)·ρ_cold·ds`, `σ_s = ϖ·κ`) and a single-scatter source from the hot inner edge `J_scat·ds = σ_s·ρ_cold·P(cosθ_s)·I_src·e^{−τ_src}·ds` with a forward Henyey-Greenstein phase (`g_HG`, default 0.6). New `@ti.func` `_hg_phase` (GPU) + `renderer.disk.hg_phase` (CPU twin, parity-tested); new `@ti.func` `_disk_scatter_cks` returning `vec4(J_rgb, σ_s·ρ_cold·ds)`; both behind the `_SCATTER_COMPILE` `ti.static` gate so OFF ⇒ the CKS-19 march is bit-identical (constraint 6; `test_scatter_albedo_zero_identical` atol 1e-6). `I_src = blackbody_chroma(T_inner)·inner_glow`, `T_inner = T_0·(6/r_inner)^0.75` (SIMPLE model regardless of `temperature_model`); straight-CKS-ray geometry (no geodesic/Doppler contamination). **Compile:** `_disk_scatter_cks` reuses the emission march's `grey_dtau` rather than re-inlining `_disk_density_cks` (the double-inline exploded LLVM compile to 15 h / >50 GB; `σ_s·ρ_cold·ds = albedo·grey_dtau` byte-for-byte); plus new `render.advanced_optimization` / `render.cfg_optimization` JIT knobs (default `true`, skip the super-linear IR/CFG passes when `false` for tests/look-dev — `showcase_disk.py --fast-compile`; the offline cache keys on these flags). **Scene note (empirical):** for the canonical edge-on camera the visible dust is mostly front-lit (`cosθ_s<0`), so back-scatter (`g<0`) dominates the *aggregate* rim brightening ≈25× over forward, and scatter-ON net-darkens the frame (σ_s adds opacity; single-scatter re-injects only the inner-glow bounce); the forward silver-lining is a localized limb — see the CKS-20 'Aggregate vs limb' note. `test_scatter_rim_light` asserts the true observables (rim light on dim edges + directional lobe + σ_s removes forward light), not a net-brighten. Look-dev: `scripts/showcase_disk.py --scatter/--albedo/--hg-g/--inner-glow`. |
 | v1.31 | **Formula CKS-19 Task 7 WIRED (2026-06-18) — chromatic per-channel extinction.** The beauty march now carries a vec3 transmittance `T⃗` and per-channel optical depth `dτ⃗ = absb_c·extinction_rgb·ρ_cold·ds`; `extinction_rgb` (`disk.extinction_rgb`, default grey `[1,1,1]`) is the κ⃗ multiplier (`κ_B>κ_R` reddens cold-dust lanes like astrophysical dust). Task 5 left the march scalar, so this promoted `transm`→vec3 and widened `disk_buf` (H,W,4)→(H,W,6) so `T⃗` reaches the composite (`col = disk_col + T⃗ ⊙ bg` — the background reddens through dust too); the depth proxy keeps `transm[0]·Σadded` form so grey is bit-exact. `extinction_rgb` is a runtime kernel arg (3 new floats `ext_r/g/b` to `render_beauty_physics`), NOT a `_MP_COMPILE`-style compile gate, so it tunes per render. Self-shadow bake stays grey (scalar τ_s — chromatic τ_s not required). **Grey `[1,1,1]` ⇒ `T⃗` equal across channels ⇒ scalar-march bit-identical** (goldens unshifted, constraint 6); works on the MP-off path too (extinction is orthogonal to the ρ_hot/ρ_cold split). Guard: `tests/test_disk_multiphase.py::test_chromatic_extinction_reddens` (blue-weighted κ⃗ lets proportionally more red than blue survive), unchanged `test_gpu_regression.py` goldens. Look-dev: `scripts/showcase_disk.py` (config `disk.extinction_rgb`). |
