@@ -1194,7 +1194,7 @@ def _disk_curl_warp(u, phi, t_disk):
 
 
 @ti.func
-def _disk_noise_m(u, phi, zeta, seed, t_disk, n_oct=_LOD_OFF):
+def _disk_noise_m(u, phi, zeta, seed, t_disk, n_oct=_LOD_OFF, shear_k=0.0):
     """Unclamped log-density sum ``m = Σ amp·(layer − bias)`` (CKS-12 §3, spec §4);
     GPU twin of :func:`noise._noise_m_stack`. Reads the per-layer dials from
     ``disk_noise_params`` and evaluates the L0/L1/L2 stack at the disk-natural coords
@@ -1212,6 +1212,16 @@ def _disk_noise_m(u, phi, zeta, seed, t_disk, n_oct=_LOD_OFF):
         w = _disk_curl_warp(u, phi, t_disk)
         u = w[0]
         phi = w[1]
+    # CKS-21 cascade dials: off (_NI_SC_EN<0.5) ⇒ sk=0 + f_c=sentinel ⇒ S≡1 ⇒ the de-shear
+    # correction is exactly 0 ⇒ the fBm twins are bit-identical (constraint 6). Applied to the
+    # octave stacks L0/L2/L1-ridged only; the L1 Voronoi + mask keep uniform shear.
+    sk = 0.0
+    fc = _SC_FC_OFF
+    pp = 2.0
+    if disk_noise_params[_NI_SC_EN] > 0.5:
+        sk = shear_k
+        fc = disk_noise_params[_NI_SC_FC]
+        pp = disk_noise_params[_NI_SC_P]
     m = 0.0
     phi01 = phi * _INV_TWO_PI  # φ/(2π) ∈ [−0.5, 0.5]; ×freq_phi → lattice y
 
@@ -1228,6 +1238,7 @@ def _disk_noise_m(u, phi, zeta, seed, t_disk, n_oct=_LOD_OFF):
             disk_noise_params[_NI_L0_GAIN],
             seed + _NSEED_L0,
             n_oct,
+            sk, fc, pp,
         )
         m += disk_noise_params[_NI_L0_AMP] * (n0 - 0.5)
 
@@ -1246,6 +1257,7 @@ def _disk_noise_m(u, phi, zeta, seed, t_disk, n_oct=_LOD_OFF):
             disk_noise_params[_NI_L1_ROFF],
             _NOISE_RIDGE_FEEDBACK,
             seed + _NSEED_L1_RIDGE,
+            sk, fc, pp,
         )
         voro = noise.voronoi_billow3_ti(
             xu, yphi, zz, fp, disk_noise_params[_NI_L1_VK], seed + _NSEED_L1_VORO,
@@ -1281,6 +1293,7 @@ def _disk_noise_m(u, phi, zeta, seed, t_disk, n_oct=_LOD_OFF):
             disk_noise_params[_NI_L2_GAIN],
             seed + _NSEED_L2,
             n_oct,
+            sk, fc, pp,
         )
         m += disk_noise_params[_NI_L2_AMP] * (n2 - 0.5)
 
@@ -1307,7 +1320,8 @@ def _disk_blended_m(u, phi, zeta, t_disk, omega, seed, n_oct=_LOD_OFF):
         a0 = s - c0
         w0 = 1.0 - ti.abs(2.0 * a0 - 1.0)
         seed0 = seed + ti.cast(c0, ti.i32) * _NCYC_CYCLE
-        m += w0 * _disk_noise_m(u, phi - g * omega * (a0 * T), zeta, seed0, t_disk, n_oct)
+        m += w0 * _disk_noise_m(u, phi - g * omega * (a0 * T), zeta, seed0, t_disk, n_oct,
+                                g * omega * (a0 * T))
         wsq += w0 * w0
         # Phase k = 1 (half-period staggered reset).
         ar1 = s + 0.5
@@ -1315,7 +1329,8 @@ def _disk_blended_m(u, phi, zeta, t_disk, omega, seed, n_oct=_LOD_OFF):
         a1 = ar1 - c1
         w1 = 1.0 - ti.abs(2.0 * a1 - 1.0)
         seed1 = seed + _NCYC_PHASE + ti.cast(c1, ti.i32) * _NCYC_CYCLE
-        m += w1 * _disk_noise_m(u, phi - g * omega * (a1 * T), zeta, seed1, t_disk, n_oct)
+        m += w1 * _disk_noise_m(u, phi - g * omega * (a1 * T), zeta, seed1, t_disk, n_oct,
+                                g * omega * (a1 * T))
         wsq += w1 * w1
         if disk_noise_params[_NI_VAR_PRESERVE] > 0.5 and wsq > 0.0:
             m = m / ti.sqrt(wsq)

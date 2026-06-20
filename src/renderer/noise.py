@@ -245,10 +245,15 @@ def _octaves(base, x, y, z, period, octaves, lacunarity, gain, seed,
     freq = 1
     per = int(period)
     amp = 1.0
-    sk = np.float32(shear_k)
+    sk = np.asarray(shear_k, np.float32)
+    # Gate on the f_c sentinel (a scalar), NOT on shear_k — shear_k may be a
+    # vectorized array (sk = g·Ω(r)·a_k·T over many samples) for which a scalar
+    # truth test is ambiguous. When shear_fc is the sentinel, S≡1 ⇒ correction 0,
+    # so skipping the block is bit-identical to computing it.
+    active = np.float32(shear_fc) < SHEAR_FC_OFF
     for o in range(int(octaves)):
         yo = y
-        if sk != np.float32(0.0):
+        if active:
             f_o = np.float32(period * freq)
             s_o = shear_transfer(f_o, shear_fc, shear_p)
             yo = (y + (np.float32(1.0) - s_o) * sk * np.float32(_INV_TWO_PI) * np.float32(period)).astype(np.float32)
@@ -710,6 +715,12 @@ NSEED_KH = 1009   # CKS-22: KH edge-erosion high-freq simplex N_KH (own decorrel
 RIDGE_FEEDBACK = 2.0  # ridged-MF spectral feedback (spec §3.4; not a §5 look dial)
 MASK_SOFT = 0.15  # coverage-mask smoothstep half-width around the 1−coverage threshold
 _INV_TWO_PI = np.float32(1.0 / (2.0 * np.pi))
+
+# CKS-21 GPU-twin constants. Plain Python floats so they work as @ti.func default args and
+# Taichi literals; derived from the CPU constants (NOT recomputed) so the GPU twins use the
+# identical f32 value ⇒ no CPU/GPU drift on the cascade path.
+_SC_FC_OFF_TI = float(SHEAR_FC_OFF)
+_INV_TWO_PI_TI = float(_INV_TWO_PI)
 
 # Dual-phase shear-advection reseed offsets (CKS-12 §2, D2.3). The base
 # ``disk.noise.seed`` is offset per advection phase (k∈{0,1}) and per reset cycle
@@ -1324,20 +1335,40 @@ def fbm3_ti(x, y, z, period, octaves, lac, gain, seed):
 
 
 @ti.func
-def fbm2_lod_ti(x, y, period, octaves, lac, gain, seed, n_oct):
-    """LOD-gated fBm of :func:`gnoise2_ti` — twin of :func:`fbm2_lod` (CKS-23).
+def shear_transfer_ti(f, f_c, p):
+    """CKS-21 transfer ``S(f)=1/(1+(f/f_c)^p)``; twin of :func:`shear_transfer`. ``f_c`` at
+    the sentinel ``_SC_FC_OFF_TI`` ⇒ exactly ``1.0`` (the bit-identity short-circuit; no
+    ``pow`` executed) so the cascade-off path matches the un-sheared fBm bit-for-bit."""
+    s = 1.0
+    if f_c < _SC_FC_OFF_TI:
+        s = 1.0 / (1.0 + ti.pow(f / f_c, p))
+    return s
+
+
+@ti.func
+def fbm2_lod_ti(x, y, period, octaves, lac, gain, seed, n_oct,
+                shear_k=0.0, shear_fc=_SC_FC_OFF_TI, shear_p=2.0):
+    """LOD-gated fBm of :func:`gnoise2_ti` — twin of :func:`fbm2_lod` (CKS-23 + CKS-21).
 
     Each octave ``o`` is weighted by ``g_o = clamp(n_oct − o, 0, 1)`` applied to BOTH
     ``total`` and ``norm``; ``n_oct ≥ octaves`` ⇒ every ``g_o = 1`` ⇒ bit-identical to
     :func:`fbm2_ti` (multiply by f32 ``1.0`` is exact), so the off / shadow-bake path
-    (large-sentinel ``n_oct``) leaves the goldens unshifted (constraint 6)."""
+    (large-sentinel ``n_oct``) leaves the goldens unshifted (constraint 6).
+
+    **CKS-21 cascade.** The φ axis (``y``) gets the per-octave de-shear correction
+    ``Δy_o = (1 − S(f_o))·shear_k·(1/2π)·period`` (``f_o = period·freq``) before the
+    ``×freq`` scale — twin of the CPU :func:`_octaves` correction. ``shear_k = 0`` with the
+    sentinel ``shear_fc`` ⇒ ``S = 1`` ⇒ ``yo = y`` exactly ⇒ bit-identical (constraint 6)."""
     total = 0.0
     norm = 0.0
     freq = 1
     per = period
     amp = 1.0
     for o in range(octaves):
-        n = gnoise2_ti(x * freq, y * freq, per, seed + o)
+        f_o = ti.cast(period * freq, ti.f32)
+        s_o = shear_transfer_ti(f_o, shear_fc, shear_p)
+        yo = y + (1.0 - s_o) * shear_k * _INV_TWO_PI_TI * ti.cast(period, ti.f32)
+        n = gnoise2_ti(x * freq, yo * freq, per, seed + o)
         g = ti.min(ti.max(n_oct - ti.cast(o, ti.f32), 0.0), 1.0)
         w = amp * g
         total += n * w
@@ -1382,7 +1413,11 @@ def ridged2_ti(x, y, period, octaves, lac, gain, offset, feedback, seed):
 
 
 @ti.func
-def ridged3_ti(x, y, z, period, octaves, lac, gain, offset, feedback, seed):
+def ridged3_ti(x, y, z, period, octaves, lac, gain, offset, feedback, seed,
+               shear_k=0.0, shear_fc=_SC_FC_OFF_TI, shear_p=2.0):
+    """Twin of :func:`_ridged`/:func:`ridged3` (3D) + the CKS-21 cascade: the φ axis (``y``)
+    gets the same per-octave de-shear correction as :func:`fbm2_lod_ti`. ``shear_k = 0`` with
+    the sentinel ``shear_fc`` ⇒ ``yo = y`` ⇒ bit-identical to the un-sheared ridged twin."""
     total = 0.0
     norm = 0.0
     freq = 1
@@ -1390,7 +1425,10 @@ def ridged3_ti(x, y, z, period, octaves, lac, gain, offset, feedback, seed):
     amp = 1.0
     prev = 0.0
     for o in range(octaves):
-        n = gnoise3_ti(x * freq, y * freq, z * freq, per, seed + o)
+        f_o = ti.cast(period * freq, ti.f32)
+        s_o = shear_transfer_ti(f_o, shear_fc, shear_p)
+        yo = y + (1.0 - s_o) * shear_k * _INV_TWO_PI_TI * ti.cast(period, ti.f32)
+        n = gnoise3_ti(x * freq, yo * freq, z * freq, per, seed + o)
         w = 1.0 if o == 0 else ti.max(0.0, ti.min(1.0, prev * feedback))
         d = offset - ti.abs(2.0 * n - 1.0)
         r = d * d

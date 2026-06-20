@@ -495,3 +495,73 @@ def test_multiphase_off_bit_identical():
     hdr_off, _ = _render(_NOISE_ON, multiphase={"enabled": False, "dust_correlation": -0.6,
                                                 "dust_amp": 1.0, "dust_sigma_frac": 0.5})
     assert np.array_equal(hdr_none, hdr_off)
+
+
+# --------------------------------------------------------------------------- #
+# CKS-21 — scale-dependent shear cascade (GPU parity + C0-at-reset)
+# --------------------------------------------------------------------------- #
+def test_shear_cascade_stack_matches_cpu_reference():
+    """CKS-21: with the cascade ON, the GPU dual-phase stack (per-octave de-shear
+    add-back on L0/L2/L1-ridged) must match the CPU reference within the advected
+    f32 tolerance — the same end-to-end path as test_advected_stack_matches_cpu_reference
+    plus the per-octave frequency transfer S(f)."""
+    import taichi as ti
+
+    from renderer import noise
+
+    _ensure_cuda()
+    T = 10.0
+    t_disk = 1.3 * T  # s = 1.3 → both reset phases active, reseed stride exercised
+    nz = copy.deepcopy(_NOISE_ON)
+    nz["shear_cascade"] = {"enabled": True, "shear_cutoff": 2.0, "shear_falloff": 2.0}
+    tr._setup_disk_noise({"disk": {"noise": nz, "dynamics": {"shear_period_M": T}}})
+    seed = int(nz["seed"])
+
+    rng = np.random.default_rng(2)
+    n = 4096
+    u = rng.uniform(0.0, 3.0, n).astype(np.float32)
+    phi = rng.uniform(-np.pi, np.pi, n).astype(np.float32)
+    zeta = rng.uniform(-2.5, 2.5, n).astype(np.float32)
+    omega = rng.uniform(0.05, 0.4, n).astype(np.float32)  # Ω(r) per sample
+
+    uf = ti.field(ti.f32, n)
+    pf = ti.field(ti.f32, n)
+    zf = ti.field(ti.f32, n)
+    omf = ti.field(ti.f32, n)
+    of = ti.field(ti.f32, n)
+    uf.from_numpy(u)
+    pf.from_numpy(phi)
+    zf.from_numpy(zeta)
+    omf.from_numpy(omega)
+
+    @ti.kernel
+    def k_adv(s: ti.i32, td: ti.f32):
+        for i in range(n):
+            of[i] = tr._disk_noise_density_mult(uf[i], pf[i], zf[i], td, omf[i], s)
+
+    k_adv(seed, t_disk)
+    gpu = of.to_numpy()
+    cpu = noise.noise_density_mult(u, phi, zeta, nz, seed=seed,
+                                   t_disk=t_disk, omega=omega, shear_period=T)
+    assert np.allclose(gpu, cpu, rtol=1e-3, atol=2e-3), float(np.abs(gpu - cpu).max())
+
+
+def test_cascade_c0_continuous_across_reset():
+    """CKS-21 must NOT break the CKS-12 §2 C0-continuity at a reset boundary: the
+    triangle weight w_k→0 at each reset is independent of S(f), so the blended
+    modulator stays continuous across t_disk = c·T even with the cascade ON
+    (the per-octave shear_k = g·Ω·a_k·T is itself continuous in a_k)."""
+    from renderer import noise
+
+    u = np.linspace(0.1, 0.9, 48, np.float32)
+    phi = np.linspace(-np.pi, np.pi, 48, np.float32)
+    zeta = np.zeros(48, np.float32)
+    nz = copy.deepcopy(_NOISE_ON)
+    nz["shear_cascade"] = {"enabled": True, "shear_cutoff": 2.0, "shear_falloff": 2.0}
+    T = 10.0
+    eps = np.float32(1e-3)
+    args = dict(seed=int(nz["seed"]), omega=np.float32(0.2), shear_period=T)
+    # Phase-0 reset boundary at s = t_disk/T = 2.0 (w_0 → 0 either side).
+    before = noise._advected_m(u, phi, zeta, nz, t_disk=2.0 * T - eps, **args)
+    after = noise._advected_m(u, phi, zeta, nz, t_disk=2.0 * T + eps, **args)
+    assert np.allclose(before, after, atol=1e-2), float(np.abs(before - after).max())
