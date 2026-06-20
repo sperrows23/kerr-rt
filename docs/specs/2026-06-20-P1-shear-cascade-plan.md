@@ -777,6 +777,16 @@ git commit -m "feat(CKS-21): GPU shear_transfer_ti + fbm2_lod_ti/ridged3_ti casc
 
 ### Task 6: Bit-identity regression, render acceptance, golden, docs-sync
 
+> **DEVIATION (landed 2026-06-20, commit 3f1b620, final-review-approved):** Steps 1/5
+> below were written against a stored-image-golden harness (`assert np.array_equal(frame,
+> golden_frame)`) that does **not** exist in this repo — `tests/test_gpu_regression.py` is
+> *metric-based* (Doppler ratio, disk-peak, NaN, spin-axis seam), and there are no `.npy`/
+> image goldens anywhere (the CKS-22/23 precedent). Both OFF-bit-identity (compared against
+> the block being *absent*, at a nonzero `t_disk` so the advected branch threads `shear_k`)
+> and ON-re-texture were therefore placed in the feature's own `tests/test_disk_shear_cascade.py`,
+> and no image golden was added. The final whole-branch review adjudicated this a faithful
+> adaptation (coverage in fact stronger than planned), not a gap.
+
 **Files:**
 - Modify: `tests/test_gpu_regression.py` (assert OFF golden bit-identity with the new block present)
 - Create: `tests/test_disk_shear_cascade.py` (render ON-re-textures acceptance)
