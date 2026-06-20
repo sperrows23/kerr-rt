@@ -733,7 +733,8 @@ NSEED_MOD_EOUT = 701  # n_e' — outer-edge raggedness
 NSEED_MOD_H = 809     # n_h  — scale-height lumpiness
 
 
-def _noise_m_stack(u, phi, zeta, nz, seed: int, t_disk: float = 0.0) -> np.ndarray:
+def _noise_m_stack(u, phi, zeta, nz, seed: int, t_disk: float = 0.0,
+                   shear_k: float = 0.0) -> np.ndarray:
     """Unclamped log-density sum ``m = Σ amp·(layer − bias)`` at the (already-f32)
     disk-natural coords, BEFORE the ``m_max`` clamp and ``exp`` (CKS-12 §3, spec §4).
 
@@ -754,6 +755,17 @@ def _noise_m_stack(u, phi, zeta, nz, seed: int, t_disk: float = 0.0) -> np.ndarr
     phi01 = phi * _INV_TWO_PI  # φ/(2π); ×freq_phi → lattice y
     m = np.zeros(np.broadcast(u, phi, zeta).shape, dtype=np.float32)
 
+    # CKS-21 cascade dials. Off / absent ⇒ sk = 0 ⇒ every layer is uniform-sheared
+    # (bit-identical). Applied to the octave stacks L0/L2/L1-ridged only.
+    sc = nz.get("shear_cascade", {}) or {}
+    if sc.get("enabled", False):
+        _sk = np.float32(shear_k)
+        _fc = np.float32(sc.get("shear_cutoff", 0.0) or 0.0)
+        _fc = _fc if _fc > np.float32(0.0) else SHEAR_FC_OFF
+        _sp = np.float32(sc.get("shear_falloff", 2.0))
+    else:
+        _sk, _fc, _sp = np.float32(0.0), SHEAR_FC_OFF, np.float32(2.0)
+
     layers = nz.get("layers", {}) or {}
     base = layers.get("base", {}) or {}
     clump = layers.get("clump", {}) or {}
@@ -763,7 +775,8 @@ def _noise_m_stack(u, phi, zeta, nz, seed: int, t_disk: float = 0.0) -> np.ndarr
     if base.get("enabled", False):
         fp = int(base["freq_phi"])
         n0 = fbm2(u * base["freq_u"], phi01 * fp, fp, octaves=int(base["octaves"]),
-                  lacunarity=int(base["lacunarity"]), gain=base["gain"], seed=seed + NSEED_L0)
+                  lacunarity=int(base["lacunarity"]), gain=base["gain"], seed=seed + NSEED_L0,
+                  shear_k=_sk, shear_fc=_fc, shear_p=_sp)
         m = m + np.float32(base["amp"]) * (n0 - np.float32(0.5))
 
     # L1 — clump/tear (ridged MF × Voronoi billow, coverage-masked).
@@ -775,7 +788,8 @@ def _noise_m_stack(u, phi, zeta, nz, seed: int, t_disk: float = 0.0) -> np.ndarr
         ridge = ridged3(xu, yphi, zz, fp, octaves=int(clump["octaves"]),
                         lacunarity=int(clump["lacunarity"]), gain=clump["gain"],
                         offset=clump["ridge_offset"], feedback=RIDGE_FEEDBACK,
-                        seed=seed + NSEED_L1_RIDGE)
+                        seed=seed + NSEED_L1_RIDGE,
+                        shear_k=_sk, shear_fc=_fc, shear_p=_sp)
         voro = voronoi_billow3(xu, yphi, zz, fp, k=clump["voronoi_k"], seed=seed + NSEED_L1_VORO)
         cl = ridge * voro
         mfp = int(clump["mask_freq_phi"])
@@ -791,7 +805,8 @@ def _noise_m_stack(u, phi, zeta, nz, seed: int, t_disk: float = 0.0) -> np.ndarr
     if patch.get("enabled", False):
         fp = int(patch["freq_phi"])
         n2 = fbm2(u * patch["freq_u"], phi01 * fp, fp, octaves=int(patch["octaves"]),
-                  lacunarity=int(patch["lacunarity"]), gain=patch["gain"], seed=seed + NSEED_L2)
+                  lacunarity=int(patch["lacunarity"]), gain=patch["gain"], seed=seed + NSEED_L2,
+                  shear_k=_sk, shear_fc=_fc, shear_p=_sp)
         m = m + np.float32(patch["amp"]) * (n2 - np.float32(0.5))
 
     return m
@@ -825,8 +840,9 @@ def _advected_m(u, phi, zeta, nz, seed: int, t_disk: float = 0.0,
         ak = ar - np.float32(ck)         # age fraction ∈ [0, 1)
         wk = np.float32(1.0) - np.abs(np.float32(2.0) * ak - np.float32(1.0))
         seed_k = int(seed) + k * NCYC_PHASE + ck * NCYC_CYCLE
-        phi_k = phi - g * omega * (ak * T)   # CKS-12 §2: φ sheared for ≤ T (×gain)
-        mk = wk * _noise_m_stack(u, phi_k, zeta, nz, seed_k, t_disk=t_disk)
+        sk = g * omega * (ak * T)            # the amount sheared off this phase
+        phi_k = phi - sk                     # CKS-12 §2: φ sheared for ≤ T (×gain)
+        mk = wk * _noise_m_stack(u, phi_k, zeta, nz, seed_k, t_disk=t_disk, shear_k=sk)
         m = mk if m is None else m + mk
         wsq = wsq + wk * wk
     if var_preserve and wsq > np.float32(0.0):

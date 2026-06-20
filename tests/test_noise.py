@@ -969,3 +969,44 @@ def test_fbm2_octave1_net_shear_strictly_smaller_than_octave0():
     # Net shear applied to octave o is S(f_o)·shear_k (intuitive form φ′ = φ − S·shear_k),
     # so the higher-frequency octave keeps MORE of its position — less net shear.
     assert s1 < s0
+
+
+def _nz_with_cascade(enabled, f_c=2.0, p=2.0):
+    return {
+        "m_max": 2.5, "variance_preserve": True, "dynamism": 1.0,
+        "layers": {
+            "base": {"enabled": True, "amp": 0.6, "octaves": 5, "lacunarity": 2,
+                     "gain": 0.5, "freq_u": 6.0, "freq_phi": 4},
+            "clump": {"enabled": False},
+            "patch": {"enabled": False},
+        },
+        "shear_cascade": {"enabled": enabled, "shear_cutoff": f_c, "shear_falloff": p},
+    }
+
+
+def test_advected_m_cascade_off_is_static_reference():
+    # Cascade OFF ⇒ identical to the pre-CKS-21 advected modulator (constraint 6).
+    u = np.linspace(0.1, 0.9, 32, dtype=np.float32)
+    phi = np.linspace(0.0, 6.0, 32, dtype=np.float32)
+    zeta = np.zeros(32, np.float32)
+    nz_off = _nz_with_cascade(False)
+    a = noise._advected_m(u, phi, zeta, nz_off, seed=11, t_disk=40.0,
+                          omega=np.float32(0.05), shear_period=10.0)
+    # Same dict WITHOUT the shear_cascade key must give the byte-identical result.
+    nz_nokey = {k: v for k, v in nz_off.items() if k != "shear_cascade"}
+    b = noise._advected_m(u, phi, zeta, nz_nokey, seed=11, t_disk=40.0,
+                          omega=np.float32(0.05), shear_period=10.0)
+    assert np.array_equal(a, b)
+
+
+def test_advected_m_cascade_on_changes_field_at_long_T():
+    # Cascade ON re-textures the advected modulator vs OFF (the protected high octaves
+    # no longer wind with the bulk). Different field, same shape.
+    u = np.linspace(0.1, 0.9, 64, dtype=np.float32)
+    phi = np.linspace(0.0, 6.0, 64, dtype=np.float32)
+    zeta = np.zeros(64, np.float32)
+    args = dict(seed=11, t_disk=80.0, omega=np.float32(0.08), shear_period=8.0)
+    off = noise._advected_m(u, phi, zeta, _nz_with_cascade(False), **args)
+    on = noise._advected_m(u, phi, zeta, _nz_with_cascade(True, f_c=2.0, p=2.0), **args)
+    assert off.shape == on.shape
+    assert not np.allclose(on, off, atol=1e-4)
