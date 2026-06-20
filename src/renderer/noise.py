@@ -207,41 +207,78 @@ def gnoise3(x, y, z, period: int, seed: int = 0) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 # §3.2–3.4 Octave stacks: fBm, billow/turbulence, ridged multifractal
 # --------------------------------------------------------------------------- #
-def _octaves(base, x, y, z, period, octaves, lacunarity, gain, seed):
+# CKS-21 — scale-dependent shear cascade: frequency transfer S(f). Defined here
+# (above the octave stacks) so SHEAR_FC_OFF is in scope for the default args below.
+# --------------------------------------------------------------------------- #
+SHEAR_FC_OFF = np.float32(1.0e9)  # sentinel f_c ⇒ S ≡ 1 (no cutoff ⇒ uniform shear)
+
+
+def shear_transfer(f, f_c, p):
+    """CKS-21 frequency transfer ``S(f) = 1/(1 + (f/f_c)^p)`` ∈ (0, 1] (float32).
+
+    Low frequencies → 1 (fully sheared into filaments); high frequencies → 0 (protected
+    from the bulk shear). ``f_c >= SHEAR_FC_OFF`` short-circuits to exactly ``1.0`` (the
+    bit-identity sentinel ⇒ uniform CKS-12 §2 shear). **CPU source of truth**; GPU twin
+    ``shear_transfer_ti``."""
+    f = np.asarray(f, np.float32)
+    f_c = np.float32(f_c)
+    if f_c >= SHEAR_FC_OFF:
+        return np.ones_like(f, np.float32)
+    ratio = (f / f_c).astype(np.float32)
+    return (np.float32(1.0) / (np.float32(1.0) + np.power(ratio, np.float32(p)))).astype(np.float32)
+
+
+def _octaves(base, x, y, z, period, octaves, lacunarity, gain, seed,
+             shear_k=0.0, shear_fc=SHEAR_FC_OFF, shear_p=2.0):
     """Yield ``(value, weight)`` per octave for the fBm-family loops.
 
     ``base`` is a callable ``(x*f, y*f[, z*f], period*f, seed+o) -> [0,1]``.
     ``lacunarity`` is cast to ``int`` so ``period*f`` stays integral every octave
     (the φ-periodicity guarantee). ``z`` is ``None`` for the 2D primitives.
+
+    **CKS-21 cascade.** When ``shear_k != 0`` the φ axis (``y``) gets a per-octave de-shear
+    correction ``Δy_o = (1 − S(f_o))·shear_k·(1/2π)·period`` (``f_o = period·freq``), added
+    BEFORE the ``×freq`` scale. The offset is constant in φ ⇒ the integer-period seam
+    (constraint 5) survives. ``shear_k == 0`` ⇒ ``y`` unchanged ⇒ bit-identical.
     """
     lac = int(lacunarity)
     freq = 1
     per = int(period)
     amp = 1.0
+    sk = np.float32(shear_k)
     for o in range(int(octaves)):
+        yo = y
+        if sk != np.float32(0.0):
+            f_o = np.float32(period * freq)
+            s_o = shear_transfer(f_o, shear_fc, shear_p)
+            yo = (y + (np.float32(1.0) - s_o) * sk * np.float32(_INV_TWO_PI) * np.float32(period)).astype(np.float32)
         if z is None:
-            n = base(x * freq, y * freq, per, seed + o)
+            n = base(x * freq, yo * freq, per, seed + o)
         else:
-            n = base(x * freq, y * freq, z * freq, per, seed + o)
+            n = base(x * freq, yo * freq, z * freq, per, seed + o)
         yield n, np.float32(amp)
         amp *= gain
         freq *= lac
         per *= lac
 
 
-def _fbm(base, x, y, z, period, octaves, lacunarity, gain, seed, transform):
+def _fbm(base, x, y, z, period, octaves, lacunarity, gain, seed, transform,
+         shear_k=0.0, shear_fc=SHEAR_FC_OFF, shear_p=2.0):
     total = np.float32(0.0)
     norm = np.float32(0.0)
-    for n, amp in _octaves(base, x, y, z, period, octaves, lacunarity, gain, seed):
+    for n, amp in _octaves(base, x, y, z, period, octaves, lacunarity, gain, seed,
+                           shear_k, shear_fc, shear_p):
         total = total + transform(n) * amp
         norm = norm + amp
     return (total / norm).astype(np.float32)
 
 
-def fbm2(x, y, period, octaves=4, lacunarity=2, gain=0.5, seed=0) -> np.ndarray:
-    """fBm of :func:`gnoise2` — normalized to ``[0, 1]`` (spec §3.2)."""
+def fbm2(x, y, period, octaves=4, lacunarity=2, gain=0.5, seed=0,
+         shear_k=0.0, shear_fc=SHEAR_FC_OFF, shear_p=2.0) -> np.ndarray:
+    """fBm of :func:`gnoise2` — normalized to ``[0, 1]`` (spec §3.2). CKS-21 cascade via the
+    trailing ``shear_*`` kwargs (default ``shear_k=0`` ⇒ bit-identical)."""
     return _fbm(gnoise2, _f32(x), _f32(y), None, period, octaves, lacunarity, gain, seed,
-                lambda n: n)
+                lambda n: n, shear_k, shear_fc, shear_p)
 
 
 def fbm3(x, y, z, period, octaves=4, lacunarity=2, gain=0.5, seed=0) -> np.ndarray:
@@ -264,17 +301,20 @@ def billow3(x, y, z, period, octaves=4, lacunarity=2, gain=0.5, seed=0) -> np.nd
                 _billow)
 
 
-def _ridged(base, x, y, z, period, octaves, lacunarity, gain, offset, feedback, seed):
+def _ridged(base, x, y, z, period, octaves, lacunarity, gain, offset, feedback, seed,
+            shear_k=0.0, shear_fc=SHEAR_FC_OFF, shear_p=2.0):
     """Musgrave-style ridged multifractal (spec §3.4).
 
     ``r_o = (offset − |2n − 1|)²``; spectral-weight feedback ``w_o = clamp(r_{o−1}
     · feedback, 0, 1)`` with ``w_0 = 1``; normalized by ``Σ gain^o`` and clamped
-    to ``[0, 1]`` (exact for the default ``offset = 1``).
+    to ``[0, 1]`` (exact for the default ``offset = 1``). CKS-21 cascade via the trailing
+    ``shear_*`` kwargs (default ``shear_k=0`` ⇒ bit-identical).
     """
     total = np.float32(0.0)
     norm = np.float32(0.0)
     prev = None
-    for n, amp in _octaves(base, x, y, z, period, octaves, lacunarity, gain, seed):
+    for n, amp in _octaves(base, x, y, z, period, octaves, lacunarity, gain, seed,
+                           shear_k, shear_fc, shear_p):
         if prev is None:
             w = np.float32(1.0)
         else:
@@ -295,9 +335,9 @@ def ridged2(x, y, period, octaves=3, lacunarity=2, gain=0.5, offset=1.0, feedbac
 
 
 def ridged3(x, y, z, period, octaves=3, lacunarity=2, gain=0.5, offset=1.0, feedback=2.0,
-            seed=0) -> np.ndarray:
+            seed=0, shear_k=0.0, shear_fc=SHEAR_FC_OFF, shear_p=2.0) -> np.ndarray:
     return _ridged(gnoise3, _f32(x), _f32(y), _f32(z), period, octaves, lacunarity, gain,
-                   offset, feedback, seed)
+                   offset, feedback, seed, shear_k, shear_fc, shear_p)
 
 
 # --------------------------------------------------------------------------- #
@@ -969,17 +1009,19 @@ def lod_noct(d, j0, n_max, n_min, eps_cone):
                    np.float32(n_min), np.float32(n_max)).astype(np.float32)
 
 
-def fbm2_lod(x, y, period, n_oct, octaves=4, lacunarity=2, gain=0.5, seed=0) -> np.ndarray:
+def fbm2_lod(x, y, period, n_oct, octaves=4, lacunarity=2, gain=0.5, seed=0,
+             shear_k=0.0, shear_fc=SHEAR_FC_OFF, shear_p=2.0) -> np.ndarray:
     """LOD-gated fBm of :func:`gnoise2` (CKS-23) — :func:`fbm2` with octave ``o``
     weighted by :func:`lod_octave_weight`, gating BOTH numerator and denominator so
     the ``[0,1]`` normalization stays exact at every ``n_oct``. With ``n_oct ≥ octaves``
     every gate is 1 ⇒ :func:`fbm2` byte-for-byte; at integer ``n_oct = k`` it equals
-    :func:`fbm2` truncated to ``k`` octaves (same seeds/amp schedule)."""
+    :func:`fbm2` truncated to ``k`` octaves (same seeds/amp schedule). CKS-21 cascade via the
+    trailing ``shear_*`` kwargs (default ``shear_k=0`` ⇒ bit-identical)."""
     total = np.float32(0.0)
     norm = np.float32(0.0)
     o = 0
     for n, amp in _octaves(gnoise2, _f32(x), _f32(y), None, period,
-                           octaves, lacunarity, gain, seed):
+                           octaves, lacunarity, gain, seed, shear_k, shear_fc, shear_p):
         w = (amp * lod_octave_weight(n_oct, o)).astype(np.float32)
         total = total + n * w
         norm = norm + w

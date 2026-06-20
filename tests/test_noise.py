@@ -915,3 +915,57 @@ def test_lod_noct_monotone_and_clamped():
     assert abs(float(noise.lod_noct(d0, j0, n_max, n_min, eps)) - n_max) < 1e-5
     # One footprint doubling beyond J0 drops exactly one octave.
     assert abs(float(noise.lod_noct(2.0 * d0, j0, n_max, n_min, eps)) - (n_max - 1.0)) < 1e-5
+
+
+# --------------------------------------------------------------------------- #
+# CKS-21 — scale-dependent shear cascade (frequency-dependent shear transfer)
+# --------------------------------------------------------------------------- #
+def test_shear_transfer_monotone_and_sentinel():
+    f = np.array([0.0, 1.0, 4.0, 16.0, 64.0], np.float32)
+    s = noise.shear_transfer(f, np.float32(8.0), np.float32(2.0))
+    # S(0) = 1, monotone decreasing, S(f≫f_c) → 0.
+    assert np.isclose(s[0], 1.0, atol=1e-6)
+    assert np.all(np.diff(s) <= 1e-7)
+    assert s[-1] < 0.05
+    # Sentinel f_c ⇒ S ≡ 1 exactly (the bit-identity hook).
+    s_off = noise.shear_transfer(f, noise.SHEAR_FC_OFF, np.float32(2.0))
+    assert np.all(s_off == np.float32(1.0))
+
+
+def test_fbm2_shear_zero_is_bit_identical():
+    # shear_k = 0 (default) ⇒ byte-for-byte the un-sheared fBm (constraint 6 hook).
+    rng = np.random.default_rng(0)
+    x = rng.uniform(-3, 3, 64).astype(np.float32)
+    y = rng.uniform(-3, 3, 64).astype(np.float32)
+    a = noise.fbm2(x, y, 4, octaves=5, seed=7)
+    b = noise.fbm2(x, y, 4, octaves=5, seed=7, shear_k=0.0)
+    assert np.array_equal(a, b)
+
+
+def test_fbm2_single_octave_displacement_matches_correction():
+    # 1-octave fBm with shear_k = Δ equals the un-sheared fBm sampled at y displaced by
+    # (1 − S(f_base))·Δ·(1/2π)·period  (the de-shear correction, octave 0).
+    period = 4
+    x = np.float32(0.3)
+    y = np.float32(1.1)            # y is already (φ/2π)·period in the production caller
+    delta = np.float32(0.7)        # shear_k (radians)
+    f_c = np.float32(2.0)
+    p = np.float32(2.0)
+    f_base = np.float32(period * 1)               # octave 0: freq = 1
+    s0 = noise.shear_transfer(f_base, f_c, p)
+    y_corr = (np.float32(1.0) - s0) * delta * np.float32(noise._INV_TWO_PI) * np.float32(period)
+    got = noise.fbm2(x, y, period, octaves=1, seed=3,
+                     shear_k=delta, shear_fc=f_c, shear_p=p)
+    ref = noise.fbm2(x, y + y_corr, period, octaves=1, seed=3)
+    assert np.allclose(got, ref, atol=1e-6)
+
+
+def test_fbm2_octave1_net_shear_strictly_smaller_than_octave0():
+    # The differential / cascade: octave 1 (higher f) is sheared LESS than octave 0.
+    period = 4
+    f_c, p = np.float32(3.0), np.float32(2.0)
+    s0 = noise.shear_transfer(np.float32(period * 1), f_c, p)   # octave 0 (freq=1)
+    s1 = noise.shear_transfer(np.float32(period * 2), f_c, p)   # octave 1 (freq=2)
+    # Net shear applied to octave o is S(f_o)·shear_k (intuitive form φ′ = φ − S·shear_k),
+    # so the higher-frequency octave keeps MORE of its position — less net shear.
+    assert s1 < s0
