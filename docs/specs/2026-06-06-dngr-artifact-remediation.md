@@ -1,5 +1,9 @@
 # DNGR / Star-Ingest Artifact Remediation — Root-Cause Investigation & Plan
 
+> **Historical design record (snapshot of 2026-06-06).** Current status lives in
+> `PROJECT.md` §6/§7 (S4–S7). Notably, the star counts below predate the
+> 2026-06-07 starless Layer-B swap (`mag_limit` 8.0→11.0; 41 410→115 324 stars).
+
 **Date:** 2026-06-06
 **Branch:** `feat/point-star-ingest`
 **Author:** Claude (Opus 4.8) under CLAUDE.md physics-formula policy

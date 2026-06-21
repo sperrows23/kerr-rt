@@ -1,23 +1,32 @@
 black_hole:
-  spin: 0.999      # a — the single source of truth; r_isco and r_plus below are FUNCTIONS of it
-  r_isco: 1.182    # DERIVED (Formula 2 of a=0.999). Duplicated literal — re-derive if spin changes
-  r_plus: 1.0447   # DERIVED: r+ = 1 + sqrt(1-a^2), a=0.999 (true horizon). Now UNUSED at runtime:
-                   # both the GPU renderer and the CPU preview (thumb.py) compute r+ from `spin`
-                   # via _horizon_radius (CKS-6). Kept as documentation only; it silently desyncs
-                   # if `spin` is edited (FLAGGED) — the live value is always derived from `spin`.
+  spin: 0.999      # a — the single source of truth. r_isco / r_plus are NOT stored here:
+                   # they are FUNCTIONS of spin, computed at load by
+                   # src/renderer/kerr_params.resolve_config (Formula 2 / CKS-6, see CKS-13)
+                   # and injected as black_hole.r_isco / black_hole.r_plus. The old literals
+                   # (1.182 / 1.0447 for a=0.999) silently desynced whenever spin was edited.
 
 render:
   width: 3840
   height: 2160
   thumb_width: 256
   thumb_height: 256
-  max_steps_pipe_a: 800        # Pipe B (volumetric disk march) shares this same trace loop / step cap.
+  max_steps_pipe_a: 500        # Pipe B (volumetric disk march) shares this same trace loop / step cap.
                                # CKS affine λ advances ~1 coord-unit per unit λ (unlike BL Mino time, which
                                # advanced ~r² per unit λ), so a photon must take ~(r_max−r_cam)/h far-field
                                # steps to escape plus extra near the photon ring — hence the larger cap.
   r_max: 50.0
   device_memory_gb: 6.0
-  d_lambda_pipe_a: 0.25        # CKS affine-parameter step dλ for the Hamiltonian geodesic (Formula CKS-5).
+  # Taichi JIT compile knobs. BOTH default true (= Taichi's own defaults) so the
+  # production render is byte-for-byte unchanged. The beauty mega-kernel (RK4
+  # geodesics + CKS-14 density march + CKS-20 scatter) is large enough that
+  # Taichi's IR-level "advanced optimization" passes are super-linear in kernel
+  # size — a cold compile of the scatter-ON kernel exceeds 80 min / tens of GB.
+  # Setting these false trades a little kernel RUNTIME for a vastly faster COLD
+  # COMPILE; intended for tests / iteration. Leave true for the final video
+  # (compile-once, render-many) where runtime speed dominates.
+  advanced_optimization: true  # Taichi ti.init(advanced_optimization=...) IR opt passes
+  cfg_optimization: true       # Taichi ti.init(cfg_optimization=...) control-flow-graph opt
+  d_lambda_pipe_a: 0.2        # CKS affine-parameter step dλ for the Hamiltonian geodesic (Formula CKS-5).
                                # Far-field h≈dλ (≈0.25 coord-units/step); shrinks toward the horizon via the
                                # adaptive factor below. Sized so a ~35-unit traverse (r_cam≈15→r_max=50) is
                                # ~140 steps and a photon-ring grazer's few orbits stay under max_steps.
@@ -36,18 +45,248 @@ render:
   depth_infinity: 1.0e5        # optimization Phase 3.4: Z value written to pixels with no disk emission
 
 disk:
-  r_inner: 1.182
+  r_inner: auto            # auto → r_isco(spin) (zero-torque inner edge, Formula CKS-13).
+                           # A number here is an artistic override; values below r_isco are
+                           # clamped UP to it (no emission inside the ISCO — gas plunges).
   r_outer: 25.0
   theta_half_width: 0.15   # |θ - π/2| < this for bounding box (single source of truth for the slab)
-  T_0: 1.0e4               # inner reference temperature (Decision B: T = T_0·(6/r)^0.75)
-  emission_coeff: 0.25     # volumetric emission scale (visualization). RECALIBRATED for CKS
+  target_peak_temperature: 5500.0  # BASE look parameter: desired peak T_eff (K) of the disk.
+                           # kerr_params derives the model amplitude T_0 from it (CKS-13):
+                           #   page_thorne: T_0 = target (f_PT LUT is normalized to max 1)
+                           #   simple:      T_0 = target·(r_inner/6)^0.75 (peak sits at r_inner)
+                           # An explicit disk.T_0 key would override this (legacy escape hatch).
+  emission_coeff: 4.0     # volumetric emission scale (visualization). RECALIBRATED for CKS
                            # (2026-06-07): the march integrates emis·density·g⁴·ds with ds = the
                            # CKS affine step (~0.1–0.24 coord-units), whereas the old 8.0 was tuned
                            # for the BL Mino step (~0.003–0.009, ~30× smaller). Scaled ~1/30 so the
                            # disk is optically thin and the g⁴-beamed inner edge is not washed out.
-  absorption_coeff: 0.05   # volumetric absorption scale (visualization). RECALIBRATED for CKS ds
+  absorption_coeff: 0.8   # volumetric absorption scale (visualization). RECALIBRATED for CKS ds
                            # (2026-06-07; was 1.5) — same ~1/30 BL-Mino→CKS-affine rescale.
-  vertical_sigma_frac: 0.5 # gaussian scale height as fraction of theta_half_width
+  extinction_rgb: [1.0, 1.0, 1.0]  # CKS-19 Task 7: per-channel κ⃗ multiplier on absorption_coeff.
+                           # Grey [1,1,1] = neutral darkening (bit-identical to the scalar march).
+                           # κ_B>κ_R (e.g. [0.6,1.0,1.6]) reddens cold-dust lanes — astrophysical
+                           # dust reddening. Most visible with disk.multiphase on (a ρ_cold absorber).
+  vertical_sigma_frac: 0.2 # gaussian scale height as fraction of theta_half_width
+  max_step_vfrac: 0.5      # disk-thickness adaptive-step cap (Pipe B). While a ray is inside the
+                           # slab its geodesic step is shrunk so the VERTICAL displacement |dz/dλ|·h
+                           # spans at most this fraction of the local Gaussian scale height
+                           # σ_z = r·theta_half_width·vertical_sigma_frac. Stops the horizon-distance
+                           # step rule (CKS-5) from striding over the thin emitting layer when a ray
+                           # crosses the equatorial plane steeply (face-on views), aliasing it into a
+                           # moiré band. Only bites for steep crossings; near-in-plane / edge-on
+                           # grazers (dz/dλ→0) keep the full step, so it adds no cost there and cannot
+                           # push them into max_steps_pipe_a. Smaller = finer/slower; 0.5 ≈ 2 samples
+                           # per σ. Guarded by tests/test_disk_step_convergence.py.
+  temperature_model: page_thorne  # simple | page_thorne (D1). simple = T = T_0·(6/r)^0.75 (Decision B,
+                           # default, golden frames). page_thorne = CKS-11 flux LUT: T_eff = T_0·f_PT^¼,
+                           # emission amplitude ×f_PT, zero-torque F(r_isco)=0; T_0 stays the amplitude knob.
+  flux_lut_samples: 256    # LUT resolution over [r_isco, r_outer] for the page_thorne f_PT(r) profile.
+  doppler_strength: 0.1    # VISUALIZATION knob (not physics): g_eff = g^s on the CKS-9 shift, feeding
+                           # both the g⁴ beaming amplitude AND the blackbody color shift. 1.0 = full
+                           # physics (default; bit-identical kernel path, golden frames intact).
+                           # 0.0 = shift off — the Interstellar/DNGR treatment (the film suppressed
+                           # the Doppler asymmetry so the disk reads symmetric to the audience);
+                           # ~0.2–0.4 keeps a hint of the bright approaching side. Scales the TOTAL
+                           # shift (orbital Doppler + gravitational, inseparable in CKS-9).
+  dynamics:                # BASE time-mapping look parameters (Formula CKS-13). The resolver
+                           # derives from these + spin + disk extent: omega_inner/outer,
+                           # period_inner_M / period_outer_M, wrap_time_M, and the two values the
+                           # D2 noise system consumes — time_scale (geometric M of disk time per
+                           # second of footage; t_disk = frame/fps · time_scale) and
+                           # shear_period_M (the CKS-12 §2 dual-phase reseed period T).
+                           # Everything rescales automatically when spin / r_inner / r_outer move.
+    inner_lap_seconds: 10.0 # [look-dev] footage seconds for ONE full revolution of the disk
+                           # inner edge → time_scale = T_orb(r_inner)/this. Smaller = faster disk.
+    shear_wrap_budget: 3.0 # [look-dev] differential 2π-wraps across [r_inner, r_outer] tolerated
+                           # before the CKS-12 reseed → shear_period_M = budget·2π/(Ω_in−Ω_out).
+  volumetric:              # V1 volumetric lighting (spec docs/specs/2026-06-13-V1-self-shadow-
+                           # source-function.md). Both flags default OFF ⇒ the legacy emission+
+                           # extinction march is bit-identical to the D2 goldens.
+    source_function: false # CKS-14 radiative-transfer source-function march. false ⇒ legacy
+                           # color += T·emission. true ⇒ dI=(S−I)dτ with S = emission/dτ =
+                           # (emis_c/absb_c)·[f_PT]·g_eff⁴·chroma (ρ,ds cancel). SAME continuum
+                           # integral as legacy (∫S e^{−τ}dτ) — CKS-14 is its EXACT per-step
+                           # quadrature (legacy over-counts thick steps), and it MATERIALISES S
+                           # for the CKS-15 self_shadow below (S·e^{−τ_shadow} ⇒ voids). Thin
+                           # limit reduces to Formula 9. The voids need source_function + the
+                           # self_shadow block together, not source_function alone.
+    self_shadow:           # CKS-15 radial deep-shadow-map self-shadow (VISUALIZATION, like
+                           # doppler_strength — not a metric). WIRED V1.2; off here.
+      enabled: false       # false ⇒ no bake, no shadow lookup (bit-identical). true ⇒ τ_shadow
+                           # baked radially outward from r_inner per frame, then emission *=
+                           # exp(−strength·τ_shadow) per sample. Pair with source_function for voids.
+      strength: 1.0        # depth of the voids (0 = off; higher = darker shadow lanes).
+      grid_nu: 96          # deep-shadow-map log-radial bins (u = ln r/r_inner).
+      grid_nphi: 256       # azimuthal bins (φ, periodic).
+      grid_nz: 16          # vertical bins across the slab (ζ = dz_ang/σ_θ).
+      zeta_max: 3.0        # ±ζ extent of the grid (≈3σ covers the Gaussian slab).
+      max_tau: 8.0         # clamp on accumulated shadow τ (overflow / caustic safety).
+      lod_max_camera_radius: 0.0  # V1.3 LOD gate (M). 0 ⇒ off (always honor enabled). >0 ⇒
+                           # skip the bake + lookup when |camera| exceeds it (wide/mid shots
+                           # ride the cheap legacy march; close-ups keep the voids).
+    flare:                 # V2 flared 3D density (SKILL.md CKS-16; spec docs/specs/
+                           # 2026-06-14-V2-flared-3d-density.md). Gives the disk real vertical
+                           # bulk so the noise's ζ-variation stops being squashed flat by the
+                           # constant thin slab. Default OFF ⇒ bit-identical to the V1 goldens.
+      enabled: false       # false ⇒ constant σ_θ slab (today, bit-identical). true ⇒ flared.
+      beta: 0.0            # radial flare exponent: σ_θ(r) = σ0·(r/r_inner)^β with
+                           # σ0 = theta_half_width·vertical_sigma_frac (the r_inner width).
+                           # β=0 ⇒ constant-H/r slab (today); β>0 thickens the disk OUTWARD
+                           # (H/r grows with radius — astrophysical flare). ~0.2–0.5 = visible.
+      band_sigma: 3.0      # θ-band coverage factor. The CKS-13 resolver widens the bounding
+                           # half-angle (theta_half_bound) to ≥ band_sigma·σ_θ(r_outer) so the
+                           # flared outer envelope is not hard-clipped by the θ cutoff. 3 ≈ ±3σ.
+  noise:                   # D2 procedural turbulence (SKILL.md CKS-12, spec docs/specs/
+                           # 2026-06-13-disk-noise-turbulence.md). D2.2 = static DENSITY
+                           # structure; D2.3 = Keplerian SHEAR ADVECTION (the field wraps
+                           # with t_disk → the Interstellar filament look). Needs the
+                           # disk.dynamics block above (shear_period_M); without it the
+                           # field stays static (bit-identical to D2.2). temperature/edges/
+                           # height are D2.4. All amps/freqs are [look-dev] placeholders.
+                           # freq_phi MUST be an integer (2π periodicity, CKS-12 constraint 5).
+    enabled: true          # master switch; false ⇒ branch bit-identical to the legacy
+                           # kernel (golden frames untouched, CKS-12 constraint 6).
+                           # Enabled globally 2026-06-13 (D2.4) so the production beauty
+                           # path renders the turbulent disk. The GPU regression / step-
+                           # convergence guards force this back to false so their goldens
+                           # stay a pure GR/calibration check (noise is art, not physics).
+    seed: 1234             # deterministic integer hash seed (no ti.random; same seed +
+                           # same t_disk ⇒ identical frame, constraint 7).
+    m_max: 2.5             # clamp on the log-density sum: density_mult = exp(clamp(m, ±m_max)).
+    variance_preserve: true # D2.3: divide the dual-phase blend by √(w0²+w1²) so contrast
+                           # doesn't "breathe" at mid-crossfade (w0=w1=0.5). No effect on
+                           # the static path (single phase).
+    dynamism: 6.0          # NON-PHYSICAL viz gain on the shear amount: φ′ = φ − dynamism·Ω·a·T.
+                           # 1.0 = the CKS-12 §2 formula exactly (bit-identical). >1 emphasises
+                           # the per-frame differential winding (swirl) without speeding up the
+                           # reset cadence — bump this (e.g. 3–6) when the swirl reads too weak.
+                           # Artistic dial, like disk.doppler_strength; not a metric change.
+    modulation:            # D2.4 (SKILL.md CKS-12 §3): modulate EMISSION AMPLITUDES only —
+                           # emitted temperature, the inner/outer edges, and the local scale
+                           # height — never p_μ/u^μ/g/g⁴/f_PT (hard constraints 1–4). Each is
+                           # an advected [0,1] fBm (co-moves with the gas, like the density
+                           # field); n−½ ⇒ a ±½ swing. enabled:false ⇒ density-only D2.3 path,
+                           # bit-identical. amps are [look-dev]; freq_phi MUST be an integer.
+      enabled: true
+      octaves: 3
+      lacunarity: 2.0
+      gain: 0.5
+      freq_u: 4.0          # log-radial feature frequency of the envelopes
+      freq_phi: 16         # azimuthal frequency (integer — 2π periodicity, constraint 5)
+      temp_amp: 0.6        # τ_amp: T_emit ·= (1 + τ_amp·(n_T − ½)) BEFORE the g shift
+                           # (constraint 2) — hot/cool filaments, the most visible cue.
+      edge_in_amp: 0.30    # e_in:  r_in_eff = max(r_inner·(1 + e_in·(n_e − ½)), r_isco)
+      edge_out_amp: 0.20   # e_out: r_out_eff = r_outer·(1 + e_out·(n_e' − ½)) — ragged rim
+      edge_softness: 0.4   # smoothstep window width (geometric M) at each modulated edge
+      height_amp: 0.5      # h_amp: σ_θ ·= (1 + h_amp·(n_h − ½)) — lumpy thickness. The Pipe-B
+                           # step cap uses the worst-case σ_θ·(1 − h_amp/2) (constraint 4).
+    curl:                  # V3.0 (SKILL.md CKS-18): in-plane divergence-free domain warp of
+                           # the noise coords (u, φ) = 2-D curl of an sfbm3 potential on the
+                           # (cosφ, sinφ, u) cylinder embedding (seamless across φ=0; freqs may
+                           # be any real). Adds turbulent eddies the laminar §2 shear can't —
+                           # the §2 winding then draws them into filaments. Texturing only —
+                           # never p_μ/u^μ/g/g⁴/f_PT. enabled:false (or amp:0) ⇒ bit-identical.
+      enabled: false
+      amp: 0.0             # A — displacement amplitude [look-dev]; 0 ⇒ identity. Try ~0.05–0.2.
+      freq_phi: 3.0        # ρ_c — angular feature density (real; not constrained to integers)
+      freq_u: 1.0          # k_u — log-radial feature density
+      octaves: 4
+      lacunarity: 2
+      gain: 0.5
+      seed: 1337           # base seed; the V3.1 reset blend reseeds per cycle off this
+      fd_eps: 0.001        # central finite-difference step for the curl gradient (in the u,φ chart)
+      flow_period_M: 0.0   # V3.1 (CKS-18 §2): curl-flow clock T_c (geometric M). > 0 ⇒ the eddies
+                           #   BOIL over t_disk via the §2 dual-phase reset blend (form/stretch/merge),
+                           #   on top of the §2 shear winding. ≤ 0 (default) ⇒ static V3.0 warp,
+                           #   bit-for-bit. Independent of disk.dynamics.shear_period_M (separate
+                           #   timescale, clock B1 — no CKS-13 resolver change). Try ~3–12 M.
+                           #   (No flow_dynamism gain: a reset-blend has no C0-safe separable
+                           #   boil-rate dial — see SKILL.md CKS-18 §2 flag.)
+    shear_cascade:           # CKS-21 — frequency-dependent shear transfer. Default OFF ⇒ bit-identical.
+      enabled: false         # false (or shear_cutoff huge) ⇒ S≡1 ⇒ CKS-12 §2 uniform shear, bit-for-bit.
+      shear_cutoff: 0.0      # f_c (cycles). 0 ⇒ auto = +inf sentinel ⇒ S≡1 (no protection). >0 ⇒ protect octaves above f_c.
+      shear_falloff: 2.0     # p — transfer steepness; larger ⇒ sharper low/high split around f_c.
+    layers:
+      # L0 base streaks — fBm, features long along the orbit (freq_phi ≪ freq_u).
+      base:  {enabled: true, amp: 0.6, octaves: 5, lacunarity: 2.0, gain: 0.5,
+              freq_u: 6.0, freq_phi: 24}
+      # L1 clump/tear — ridged MF × Voronoi billow, gated by a slow coverage mask.
+      clump: {enabled: true, amp: 1.2, bias: 0.35, octaves: 3, lacunarity: 2.0,
+              gain: 0.5, freq_u: 3.0, freq_phi: 12, freq_z: 1.0, coverage: 0.45,
+              mask_freq_u: 1.0, mask_freq_phi: 3, ridge_offset: 1.0, voronoi_k: 4.0}
+      # L2 patchiness — subtle large-scale fBm breaking the ring symmetry.
+      patch: {enabled: true, amp: 0.35, octaves: 2, lacunarity: 2.0, gain: 0.5,
+              freq_u: 1.5, freq_phi: 4}
+  multiphase:                # CKS-19 — decoupled hot/cold media: emission tracks ρ_hot,
+                             # absorption (dτ + the CKS-15 shadow bake) tracks an independent
+                             # ρ_cold, so cold dust carves dark SILHOUETTES into the glow
+                             # rather than merely dimming it. ρ_cold = exp(clamp(m_cold)),
+                             # m_cold = χ·m_hot + √(1−χ²)·m_dust (variance-preserving Pearson
+                             # mix of the hot log-density with an independent dust field at
+                             # seed+NSEED_DUST). enabled:false ⇒ ρ_cold≡ρ_hot, grey κ ⇒ the
+                             # legacy single-phase scalar march, BIT-IDENTICAL (constraint 6).
+                             # NOTE: toggling `enabled` changes the compiled kernel
+                             # (ti.static _MP_COMPILE gate) ⇒ a one-time recompile; the
+                             # OFF default keeps the original fast JIT untouched.
+    enabled: false           # master switch. false ⇒ single-phase (golden frames intact).
+    dust_correlation: -0.6   # χ ∈ [−1,1]: −1 anti-correlated lanes (dust in the cool gaps),
+                             #   0 independent dust, +1 dust tracks the plasma exactly.
+    dust_amp: 1.0            # a_cold — dust log-density gain (clamped by noise.m_max).
+    dust_sigma_frac: 1.0     # σ_cold / σ_hot — dust slab thickness vs the emitting slab.
+                             #   <1 ⇒ thinner cold lane (tightens the Pipe-B vertical step cap).
+  scatter:                   # CKS-20 — volumetric single-scattering + Henyey-Greenstein.
+                             # The cold dust (ρ_cold) catches forward-scattered light from the
+                             # hot inner edge, so optically-thin cloud EDGES between the inner
+                             # disk and the camera glow with a rim-light / "silver lining".
+                             # Extinction grows to (κ+σ_s)·ρ_cold·ds (σ_s removes forward light);
+                             # J_scat = σ_s·ρ_cold·P(cosθ_s)·I_src·e^{−τ_src} is injected toward
+                             # the camera, P = Henyey-Greenstein, e^{−τ_src} = the CKS-17 shadow.
+                             # enabled:false ⇒ σ_s=0 ⇒ exactly CKS-19, BIT-IDENTICAL (constraint 6).
+                             # NOTE: toggling `enabled` changes the compiled kernel (ti.static
+                             # _SCATTER_COMPILE gate) ⇒ a one-time recompile; OFF keeps the
+                             # original fast JIT untouched. Depends on CKS-19 (ρ_cold) + CKS-17
+                             # (τ_src; with self_shadow off, e^{−τ_src}=1 — unoccluded illuminant).
+    enabled: false           # master switch. false ⇒ emission–absorption only (golden frames intact).
+    albedo: 0.5              # single-scatter albedo ϖ ∈ [0,1): σ_s = ϖ·absorption_coeff (grey).
+    hg_g: 0.6                # Henyey-Greenstein anisotropy g ∈ (−1,1): >0 forward (the rim-light
+                             #   lobe), 0 isotropic, <0 back. ~0.6 = cinematic forward scatter.
+    inner_glow: 1.0          # amplitude of the inner-edge illuminant I_src (its color is the
+                             #   blackbody at T_inner = T_0·(6/r_inner)^0.75, derived in code).
+  edge_erosion:              # CKS-22 — Kelvin-Helmholtz threshold erosion of the OUTER edge.
+                             # Replaces the CKS-12 §3 outer smoothstep with a soft-Heaviside
+                             # clip H_soft(win_out − τ·N_KH): the rim TEARS into vacuum
+                             # (fingers/holes) instead of a clean falloff. N_KH is a high-freq
+                             # simplex advected by the §2 shear (cylinder-embedded ⇒ seamless).
+                             # Clips the SHARED envelope ⇒ with CKS-19 on, emission AND
+                             # absorption fray together (silhouette-correct dust lanes).
+                             # REQUIRES disk.noise.modulation.enabled (the only producer of a
+                             # soft win_out). enabled:false ⇒ the §3 smoothstep, BIT-IDENTICAL.
+    enabled: false           # master switch (golden frames intact when false).
+    strength: 0.0            # τ_KH — erosion depth; clamped to [0, 1−w_soft] at load (interior immune).
+    freq_u: 4.0              # radial feature frequency of N_KH.
+    freq_phi: 12             # azimuthal frequency (cylinder-embedding radius — seamless, any real).
+    freq_z: 1.0              # vertical feature frequency (folded into the u axis of the 3-D simplex).
+    octaves: 3               # N_KH simplex octaves (high-freq fingers).
+    soft_width: 0.0          # w_soft on the [0,1] envelope; 0 ⇒ auto = step-cap floor
+                             #   max(soft_width, max_step_vfrac·σ0·r_outer/edge_softness), k_soft=1
+                             #   (clamped to [0.02, 0.5]).
+                             # (N_KH seeds off disk.noise.seed + NSEED_KH — decorrelated from
+                             #  the density stack, co-moving with the same deterministic family.)
+  lod:                       # CKS-23 — fractal LOD octave cascade (anti-aliases the disk noise).
+                             # Per disk sample n_oct = clamp(n_max − log2(ε·d / j0), n_min, n_max)
+                             # (ε = vertical_fov/HEIGHT, d = camera distance) gates the L0/L2/L1-mask
+                             # fBm octaves by a smooth weight g_o = clamp(n_oct−o, 0, 1): far views
+                             # drop shimmering sub-pixel octaves; close-ups keep the full stack.
+                             # Gates BOTH numerator and denominator ⇒ enabled:false is BIT-IDENTICAL
+                             # (every g_o=1). Prerequisite for the V4 free camera. No CKS-13 change.
+    enabled: false           # master switch (golden frames intact when false).
+    n_max: 6.0               # full octave count at the reference footprint J=j0 (≥ the gated
+                             #   layers' native octaves: L0=5, L2/L1-mask=2, so 6 keeps full detail).
+    n_min: 2.0               # coarse far-field octave floor (never drop below this).
+    j0: 0.02                 # pixel footprint (world M) at which the cascade is Nyquist-resolved;
+                             #   J>j0 (farther) sheds one octave per doubling. ε is auto-derived
+                             #   from the per-frame camera fov / render height (not stored here).
+
   # NOTE: the Phase-3.3 |u|=|cosθ| disk-slab early-out bound is now DERIVED in code
   # as sin(theta_half_width) (renderer.render_beauty_frame) — the old hardcoded
   # `bounding_sin_theta_half: 0.14944` literal duplicated it and desynced whenever
@@ -82,7 +321,14 @@ starfield:
                            # so the catalog now extends to ~11 to repopulate the faint field as sharp,
                            # correctly-lensed point sources (Interstellar/DNGR approach). Re-run
                            # scripts/ingest_stars.py after changing this (mag_limit is applied at ingest).
-  mag_zero_point: 0.0      # linear flux = 10^(-0.4*(Vmag - mag_zero_point)); sets overall scale
+  mag_zero_point: 4      # linear flux = 10^(-0.4*(Vmag - mag_zero_point)); sets overall Layer-A
+                           # star brightness. APPLIED AT INGEST (baked into assets/stars.npy by
+                           # scripts/ingest_stars.py) — the renderer never reads this, so you MUST
+                           # re-run ingest_stars.py after changing it. 3.5 => ~25x flux vs the old
+                           # 0.0: stars are clearly visible but stay below the accretion-disk edge
+                           # peak (~6.17), keeping the Interstellar composition (10.0 was 10000x and
+                           # blew them out). Does NOT affect the Layer-B diffuse band — that is
+                           # starfield.diffuse_gain.
   # --- Layer A: point-star gather (Formula 13) ---
   star_grid_cols: 720      # equirect candidate-cell grid columns (azimuth phi')
   star_grid_rows: 360      # equirect candidate-cell grid rows (colatitude theta')
@@ -101,6 +347,12 @@ starfield:
                            # (see star_image/starmap_workflow.md): sharp >10x spikes drop 46x to 0.045%,
                            # so EWA has no point sources to stretch. Stars are now drawn ONLY by Layer A.
   diffuse_width: 16384     # equirect diffuse map width; LOD uses log2(width)
+  diffuse_gain: 4.5        # Layer-B brightness multiplier, applied at RENDER time in _dngr_shade
+                           # (diffuse *= diffuse_gain). Unlike mag_zero_point this needs NO re-ingest
+                           # — tune it freely per render. 1.0 = raw EXR (identity). The StarNet2
+                           # plate measures ~1.75x dimmer mean than the old milkyway_2020 band, so
+                           # 1.75 restores parity and 3.0 (starting value) brightens past it. This is
+                           # the ONLY brightness control for the diffuse galaxy band.
   ewa_max_taps: 8          # max anisotropic taps along the major ellipse axis
   jacobian: finite_diff    # finite_diff | geodesic_deviation (FD shipped; deviation = future upgrade)
 
@@ -127,6 +379,15 @@ thumb:
   ring_r_sigma: 0.6               # width (M) of the ring glow falloff
   exposure: 1.0                   # linear pre-tonemap exposure multiplier
   gamma: 2.2                      # display gamma for sRGB-ish output
+  color_grade:                    # NON-PHYSICAL art-direction grade (VISUALIZATION class,
+                                  # like disk.doppler_strength). Applied in linear HDR BEFORE
+                                  # the Reinhard compressor in renderer.tonemap. Reaches the
+                                  # warm-amber reference look the Formula 9 blackbody
+                                  # chromaticity (deliberately desaturated) can't on its own.
+                                  # NEVER touches rendered radiance/physics. Identity defaults
+                                  # below ⇒ tonemap is bit-for-bit the ungraded result.
+    saturation: 1.0               # rgb' = luma + saturation·(rgb − luma); 1=unchanged, >1 richer
+    tint: [1.0, 1.0, 1.0]         # per-channel linear gain; warm amber ≈ [1.15, 1.0, 0.8]
 
 output:
   blackhole_dir: render_blackhole/

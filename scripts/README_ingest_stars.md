@@ -136,7 +136,10 @@ starfield:
   mag_limit: 11.0          # drop stars fainter than this apparent V (~Tycho-2; raised
                            # from 6.5→8.0→11.0 — Layer B is now starless, so Layer A
                            # alone carries the full star field; see PROJECT.md §6 2026-06-07)
-  mag_zero_point: 0.0      # flux = 10^(-0.4*(Vmag - mag_zero_point)); overall scale
+  mag_zero_point: 3.5      # flux = 10^(-0.4*(Vmag - mag_zero_point)); Layer-A star brightness.
+                           # Baked into stars.npy HERE — the renderer never reads it, so re-run
+                           # this script after editing. (Layer-B band brightness is a separate
+                           # render-time knob, starfield.diffuse_gain — see PROJECT.md §6 2026-06-07.)
 ```
 
 (Other `starfield:` keys — PSF size, grid resolution, lensing/caustic caps, the

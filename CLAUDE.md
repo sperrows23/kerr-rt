@@ -77,7 +77,7 @@ python scripts/check_starless_map.py
 |-------|---------|
 | `skills/kerr-physics/SKILL.md` | All GR and Kerr metric formulas — **mandatory reference** |
    Decision A: ZAMO tetrad (Formula 7)
-   Decision B: Simple temperature model T = T_0·(6/r)^0.75
+   Decision B: Simple temperature model T = T_0·(6/r)^0.75 (default; Page-Thorne CKS-11 available via disk.temperature_model: page_thorne)
 | `skills/taichi-conventions/` | Taichi kernel patterns, field layout, JIT conventions (to be written) |
 | `skills/blender-pipeline/` | Blender headless scripting, camera export, compositor nodes (to be written) |
 
@@ -87,9 +87,16 @@ python scripts/check_starless_map.py
 
 **All numerical parameters must live in `configs/render.yaml`. No hardcoded values in source.**
 
+The YAML stores **base** parameters only; everything that is a *function* of them
+(`r_isco`, `r_plus`, `disk.r_inner`, `disk.T_0`, the `disk.dynamics` time mapping) is
+derived at load by `src/renderer/kerr_params.resolve_config` (SKILL.md Formula CKS-13)
+and injected into the config dict. Never store a derived literal in the YAML — it
+silently desyncs when the base parameter is edited.
+
 Parameters that must come from config (non-exhaustive):
 
-- Spin `a`, ISCO radius `r_isco`, horizon radius `r_plus`
+- Spin `a` (single source of truth — `r_isco`/`r_plus`/`r_inner` derived from it at load)
+- Disk `target_peak_temperature`, `r_outer`, `dynamics.inner_lap_seconds` / `shear_wrap_budget`
 - `WIDTH`, `HEIGHT`, thumb dimensions
 - `max_steps` for integrator pipes A and B
 - Bounding box ranges (`r_max`, `theta_half_width`)

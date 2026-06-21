@@ -51,7 +51,9 @@ from renderer.geodesic import (  # noqa: E402
     integrate_null_geodesic,
     make_null_initial_conditions,
 )
+from renderer.kerr_params import resolve_config  # noqa: E402
 from renderer.metric import kerr_radius  # noqa: E402
+from renderer.noise import noise_density_mult, noise_modulation_fields  # noqa: E402
 
 # CKS Cartesian coordinate index order (matches renderer.metric / geodesic).
 T, X, Y, Z = 0, 1, 2, 3
@@ -61,7 +63,10 @@ _CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs" / "render.yaml"
 
 def load_config(path: Path = _CONFIG_PATH) -> dict:
     with open(path, encoding="utf-8") as fh:
-        return yaml.safe_load(fh)
+        cfg = yaml.safe_load(fh)
+    # Inject spin/extent-derived parameters (r_isco, r_inner, T_0, dynamics —
+    # Formula CKS-13); the YAML stores base parameters only. Taichi-free.
+    return resolve_config(cfg)
 
 
 # --------------------------------------------------------------------------- #
@@ -198,6 +203,15 @@ def ring_glow(
     return gain * w * color
 
 
+def _smoothstep(e0: float, e1: float, x: float) -> float:
+    """Hermite smoothstep, twin of the GPU ``_smoothstep_ti`` (CKS-12 §3 edges)."""
+    if e1 <= e0:
+        t = 1.0 if x >= e0 else 0.0
+    else:
+        t = min(max((x - e0) / (e1 - e0), 0.0), 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
 # --------------------------------------------------------------------------- #
 # Pipe B — volumetric accretion disk (CKS)
 # --------------------------------------------------------------------------- #
@@ -237,11 +251,20 @@ def march_disk(x: np.ndarray, p_cov: np.ndarray, dp: dict) -> tuple[np.ndarray, 
         cos_th = min(max(zi / r, -1.0), 1.0)
         theta = np.arccos(cos_th)
 
-        # Bounding box: thin equatorial slab between r_inner and r_outer.
+        # Bounding box: thin equatorial slab between r_inner and r_outer. With §3
+        # modulation on, widen the radial gate to the worst-case ragged band so the
+        # soft-edge falloff region is still marched (mirrors the GPU trace kernel).
         dz = theta - half_pi
-        if abs(dz) >= dp["theta_half_width"]:
+        # CKS-16 (V2): the bounding half-angle widens with flare (theta_half_bound;
+        # == theta_half_width when β=0). Mirrors the GPU early-out (bound_sin_half).
+        if abs(dz) >= dp["theta_half_bound"]:
             continue
-        if r < dp["r_inner"] or r > dp["r_outer"]:
+        r_lo = dp["r_inner"]
+        r_hi = dp["r_outer"]
+        if dp["modulation_enabled"]:
+            r_lo = dp["r_isco"]
+            r_hi = dp["r_outer"] * (1.0 + 0.5 * dp["mod_edge_out_amp"]) + dp["mod_edge_soft"]
+        if r < r_lo or r > r_hi:
             continue
 
         p = p_cov[i]
@@ -261,11 +284,63 @@ def march_disk(x: np.ndarray, p_cov: np.ndarray, dp: dict) -> tuple[np.ndarray, 
 
         # Formula 9 — emission: chromaticity * g^4 intensity.
         T_emit = dp["T_0"] * (6.0 / r) ** 0.75
+
+        # Vertical Gaussian density profile within the slab. CKS-16 (V2) flared
+        # scale height: σ_eff = σ0·(r/r_inner)^β (β=0 ⇒ σ0, bit-identical). σ0 is the
+        # BASE inner-edge width (sigma_theta above); flare thickens the disk outward.
+        beta = dp["flare_beta"]
+        sigma_eff = sigma_theta * (r / dp["r_inner"]) ** beta if beta != 0.0 else sigma_theta
+        density = np.exp(-0.5 * (dz / sigma_eff) ** 2)
+
+        # D2.2/D2.3 procedural turbulence (SKILL.md CKS-12 §2–3): multiply the
+        # density by the noise field (amplitude only — feeds emission AND
+        # absorption). Uses the SAME noise.noise_density_mult the GPU kernel
+        # mirrors, so a CPU thumb is a faithful look-dev preview of the beauty
+        # render. With dp["shear_period"] > 0 the field is Keplerian-sheared and
+        # reseeded against dp["t_disk"] (CKS-12 §2 dual-phase blend; Ω = Formula 3
+        # per sample); shear_period == 0 ⇒ the static D2.2 path.
+        if dp["noise_enabled"]:
+            u_n = np.log(r / dp["r_inner"])
+            phi_n = np.arctan2(float(yi), float(xi))
+            zeta_n = dz / sigma_eff
+            omega = 1.0 / (r**1.5 + a)  # Formula 3 (prograde Ω at this radius)
+            density *= float(
+                noise_density_mult(
+                    u_n, phi_n, zeta_n, dp["noise"], dp["noise_seed"],
+                    t_disk=dp["t_disk"], omega=omega, shear_period=dp["shear_period"],
+                )
+            )
+
+            # D2.4 §3 modulation: emitted temperature / ragged edges / lumpy scale
+            # height (twin of taichi_renderer._disk_emit_cks). Off ⇒ identity.
+            if dp["modulation_enabled"]:
+                nT, nein, neout, nh = (
+                    float(v) for v in noise_modulation_fields(
+                        u_n, phi_n, zeta_n, dp["noise"], dp["noise_seed"],
+                        t_disk=dp["t_disk"], omega=omega, shear_period=dp["shear_period"],
+                    )
+                )
+                # Scale height: re-evaluate the Gaussian at the modulated σ_θ. The
+                # §3 lump multiplies the CKS-16 flared σ_eff (β=0 ⇒ σ0 ⇒ unchanged).
+                sigma_m = sigma_eff * (1.0 + dp["mod_height_amp"] * (nh - 0.5))
+                density = (
+                    density
+                    / np.exp(-0.5 * (dz / sigma_eff) ** 2)
+                    * np.exp(-0.5 * (dz / sigma_m) ** 2)
+                )
+                # Ragged edges: smoothstep windows; r_in_eff ≥ r_isco (constraint 3).
+                r_in_eff = max(dp["r_inner"] * (1.0 + dp["mod_edge_in_amp"] * (nein - 0.5)),
+                               dp["r_isco"])
+                r_out_eff = dp["r_outer"] * (1.0 + dp["mod_edge_out_amp"] * (neout - 0.5))
+                soft = dp["mod_edge_soft"]
+                density *= _smoothstep(r_in_eff, r_in_eff + soft, r) * (
+                    1.0 - _smoothstep(r_out_eff - soft, r_out_eff, r)
+                )
+                # Emitted-temperature lumps (BEFORE the g shift — constraint 2).
+                T_emit *= 1.0 + dp["mod_temp_amp"] * (nT - 0.5)
+
         T_obs = g * T_emit
         chroma = blackbody_rgb(T_obs)
-
-        # Vertical Gaussian density profile within the slab.
-        density = np.exp(-0.5 * (dz / sigma_theta) ** 2)
 
         emission = dp["emission_coeff"] * density * chroma * (g**4) * ds
         color += transmittance * emission
@@ -274,23 +349,49 @@ def march_disk(x: np.ndarray, p_cov: np.ndarray, dp: dict) -> tuple[np.ndarray, 
     return color, transmittance
 
 
-def build_disk_params(cfg: dict, a: float, d_lambda: float) -> dict:
+def build_disk_params(cfg: dict, a: float, d_lambda: float, t_disk: float = 0.0) -> dict:
     """Assemble disk parameters from config (CKS-8 needs no frozen ISCO constants)."""
     d = cfg["disk"]
+    nz = d.get("noise", {}) or {}
+    dyn = d.get("dynamics") or {}
+    mod = nz.get("modulation", {}) or {}
     return {
         "a": a,
         "r_inner": float(d["r_inner"]),
         "r_outer": float(d["r_outer"]),
+        # r_isco floor for the §3 ragged inner edge (constraint 3); derived by CKS-13.
+        "r_isco": float(cfg.get("black_hole", {}).get("r_isco", d["r_inner"])),
         "theta_half_width": float(d["theta_half_width"]),
         "vertical_sigma_frac": float(d["vertical_sigma_frac"]),
+        # CKS-16 (V2) flared scale height. theta_half_bound (widened bound) and
+        # flare_beta are CKS-13-derived; fall back to the no-flare values so an
+        # unresolved/legacy config previews bit-identical to the constant slab.
+        "theta_half_bound": float(d.get("theta_half_bound", d["theta_half_width"])),
+        "flare_beta": float(d.get("flare_beta", 0.0)),
         "T_0": float(d["T_0"]),
         "emission_coeff": float(d["emission_coeff"]),
         "absorption_coeff": float(d["absorption_coeff"]),
         "d_lambda": d_lambda,
+        # D2.2 procedural turbulence (static; SKILL.md CKS-12). Off by default
+        # (disk.noise.enabled: false) ⇒ this CPU twin matches the legacy disk.
+        "noise": nz,
+        "noise_enabled": bool(nz.get("enabled", False)),
+        "noise_seed": int(nz.get("seed", 1234)),
+        # D2.3 shear advection (CKS-12 §2). shear_period == 0 (no disk.dynamics
+        # block) ⇒ static D2.2 noise. t_disk is the disk clock in geometric M.
+        "shear_period": float(dyn.get("shear_period_M", 0.0)),
+        "t_disk": float(t_disk),
+        # D2.4 §3 modulation (temperature / edges / scale height). Off ⇒ identity.
+        "modulation_enabled": bool(mod.get("enabled", False)),
+        "mod_temp_amp": float(mod.get("temp_amp", 0.0)),
+        "mod_edge_in_amp": float(mod.get("edge_in_amp", 0.0)),
+        "mod_edge_out_amp": float(mod.get("edge_out_amp", 0.0)),
+        "mod_edge_soft": float(mod.get("edge_softness", 0.0)),
+        "mod_height_amp": float(mod.get("height_amp", 0.0)),
     }
 
 
-def render(cfg: dict, res: int, with_disk: bool = False) -> np.ndarray:
+def render(cfg: dict, res: int, with_disk: bool = False, t_disk: float = 0.0) -> np.ndarray:
     bh = cfg["black_hole"]
     rcfg = cfg["render"]
     cam = cfg["camera"]
@@ -329,7 +430,7 @@ def render(cfg: dict, res: int, with_disk: bool = False) -> np.ndarray:
     )
     fwd, right, up = camera_basis(pos)
 
-    disk_params = build_disk_params(cfg, a, d_lambda) if with_disk else None
+    disk_params = build_disk_params(cfg, a, d_lambda, t_disk) if with_disk else None
 
     img = np.zeros((res, res, 3), dtype=float)
 
@@ -401,6 +502,13 @@ def main(argv: list[str] | None = None) -> None:
         help="Composite the volumetric accretion disk (Pipe B); "
         "saves thumb_disk.png instead of thumb_output.png.",
     )
+    parser.add_argument(
+        "--t-disk",
+        type=float,
+        default=None,
+        help="Disk clock in geometric M (CKS-12 §2 shear advection). Overrides the "
+        "value derived from --frame. Needs disk.dynamics in config to have any effect.",
+    )
     args = parser.parse_args(argv)
 
     cfg = load_config()
@@ -409,12 +517,21 @@ def main(argv: list[str] | None = None) -> None:
     if args.frame != 0:
         print(
             f"[warn] --frame {args.frame}: per-frame camera matrices are not "
-            f"wired up yet; using the config camera (frame 0)."
+            f"wired up yet; using the config camera (frame 0). The disk animation "
+            f"clock (t_disk) DOES advance with --frame."
         )
+
+    # D2.3 disk clock: t_disk = frame/fps · time_scale (geometric M, CKS-13).
+    # No disk.dynamics block ⇒ time_scale absent ⇒ 0 ⇒ static D2.2 noise.
+    if args.t_disk is not None:
+        t_disk = args.t_disk
+    else:
+        dyn = cfg["disk"].get("dynamics") or {}
+        t_disk = args.frame / float(cfg["render"]["fps"]) * float(dyn.get("time_scale", 0.0))
 
     from PIL import Image  # local import so --help works without Pillow
 
-    pixels = render(cfg, res, with_disk=args.disk)
+    pixels = render(cfg, res, with_disk=args.disk, t_disk=t_disk)
     out_name = "thumb_disk.png" if args.disk else "thumb_output.png"
     out_path = Path(__file__).resolve().parent / out_name
     Image.fromarray(pixels, mode="RGB").save(out_path)

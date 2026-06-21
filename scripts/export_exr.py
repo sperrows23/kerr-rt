@@ -112,6 +112,13 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(f"--frame {args.frame} out of range (have {len(frames)} frames)")
     cam = frames[args.frame]
 
+    # D2.3 disk-animation clock (CKS-12 §2): t_disk = frame/fps · time_scale, in
+    # geometric M (time_scale = period_inner_M / inner_lap_seconds, CKS-13). The
+    # noise system shears/reseeds against this. No disk.dynamics block ⇒ 0 ⇒ the
+    # static D2.2 path (bit-identical to the goldens).
+    dyn = cfg["disk"].get("dynamics") or {}
+    t_disk = args.frame / float(rcfg["fps"]) * float(dyn.get("time_scale", 0.0))
+
     print("initialising Taichi (ti.cuda) + uploading 16K starmap mip pyramid ...")
     tr.setup_renderer(cfg)
 
@@ -136,10 +143,12 @@ def main(argv: list[str] | None = None) -> None:
             with_disk=not args.no_disk,
             lod_enabled=True,
             return_depth=True,
+            t_disk=t_disk,
         )
     else:
         beauty, depth = tr.render_beauty_frame(
-            cfg, cam, width, height, with_disk=not args.no_disk, lod_enabled=True, return_depth=True
+            cfg, cam, width, height, with_disk=not args.no_disk, lod_enabled=True,
+            return_depth=True, t_disk=t_disk,
         )
     beauty = np.nan_to_num(beauty)
     dt = time.time() - t0

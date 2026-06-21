@@ -10,6 +10,18 @@ Load this skill whenever the task involves:
 - Doppler beaming, redshift, or g-factor computation
 - Anti-aliasing / mipmap LOD for the starmap
 - Point-star magnification, ray-bundle Jacobian, or star PSF (Formula 13)
+- Disk procedural turbulence / noise shear-advection (Formula CKS-12)
+- Derived config parameters — r_plus/r_isco/r_inner/T_0/orbital periods from base spin etc. (Formula CKS-13)
+- Volumetric disk radiative transfer / source-function march (Formula CKS-14)
+- Disk radial self-shadow / deep-shadow-map (Formula CKS-15 — VISUALIZATION)
+- Flared 3D disk scale height σ_θ(r) (Formula CKS-16 — GEOMETRY/TEXTURE)
+- Disk 3D inner-edge-ray self-shadow (radial + vertical) (Formula CKS-17 — VISUALIZATION)
+- Disk curl-flow domain warp / divergence-free noise-coordinate distortion (Formula CKS-18 — VISUALIZATION)
+- Multi-phase disk media — decoupled hot-emission / cold-absorption fields, dust lanes (Formula CKS-19 — PHYSICS)
+- Volumetric single-scattering + Henyey-Greenstein phase, cloud rim-light (Formula CKS-20 — PHYSICS)
+- Disk scale-dependent shear cascade / frequency-dependent shear transfer (Formula CKS-21 — VISUALIZATION)
+- Kelvin-Helmholtz threshold erosion of the outer disk edge (Formula CKS-22 — VISUALIZATION)
+- Distance-driven fractal LOD octave cascade for the disk noise (Formula CKS-23 — SAMPLING)
 - Any formula involving `r_isco`, `E_I`, `L_I`, `u^t`, `u^r`, `u^phi`, `g-factor`, `Carter Q`
 
 ---
@@ -343,6 +355,19 @@ Without the `g⁴` factor, both sides of the disk appear nearly symmetric.
 With it, the approaching limb is 10–100× brighter for a = 0.999.
 DNGR suppressed this intentionally for artistic reasons.
 This pipeline includes it; to suppress, clamp g to 1.0 in the intensity factor only.
+
+> **Display color grade (NOT physics — do not "fix" the chromaticity to chase it):**
+> the warm amber of the showcase renders does **not** come from Formula 9.
+> `blackbody_rgb` is chromaticity-only and trends sepia/white (the blue channel
+> never drops far enough for a saturated amber) — that is correct and must be left
+> alone. The amber is produced **downstream of all physics** by a post-process
+> color grade in `renderer.tonemap` (config `render.color_grade`: `saturation`
+> luma-based + `tint` per-channel linear gain), applied in linear HDR **before**
+> the Reinhard compressor `img/(1+img)`. It is a VISUALIZATION dial of the same
+> governance class as `disk.doppler_strength` (CKS-9) — it touches no `T`, `g`,
+> `g⁴`, or chromaticity quantity. Identity defaults (`saturation=1.0`,
+> `tint=[1,1,1]`) are bit-identical to the ungraded path. If a future "the disk
+> looks too sepia" request arrives, tune the grade — never recalibrate Formula 9.
 
 ---
 
@@ -796,6 +821,15 @@ Integrate the 8-vector `[t, x, y, z, p_t, p_x, p_y, p_z]` with RK4. `p_t` is con
 analytically — a free per-step error monitor. Recommended affine step: constant `dλ`
 far out, shrunk near the horizon, e.g. `h = dλ · max(step_floor, (r − r₊)/r)`.
 
+This step rule is numerical, not physics — size it however keeps the integrand
+resolved. In particular it knows only the horizon distance, so inside the Pipe-B
+disk slab (where the emission integrand has a thin vertical Gaussian of scale height
+`σ_z = r·θ_half·σ_frac`, Formula 9) it must additionally be capped so a steep
+equatorial crossing cannot step over the layer: bound the vertical displacement
+`|dz/dλ|·h ≤ vfrac·σ_z` (config `disk.max_step_vfrac`). It only bites for steep
+crossings — in-plane grazers keep the full step — so it never starves the
+`max_steps` budget. Under-resolving it aliases the disk into a concentric moiré.
+
 ---
 
 ## Formula CKS-6 — Horizon capture and escape
@@ -873,6 +907,15 @@ Then emission follows **Formula 9 verbatim** (chromaticity · g⁴, volumetric).
 Formula-8 "divide p_r by Δ" bug is impossible here: there is no Δ and `p_μ` is already
 covariant.
 
+> **Visualization dial (NOT physics — do not "fix"):** the GPU kernel applies
+> `g_eff = g^s` with `s = disk.doppler_strength` (default **1.0** = this formula
+> verbatim; the `s≠1` branch is skipped, bit-identical). `s<1` artistically mutes
+> the shift — `s=0` ⇒ `g_eff≡1`, the Interstellar/DNGR treatment that suppressed the
+> disk's Doppler asymmetry for the film. `g_eff` feeds **both** the Formula-9 g⁴ and
+> the chromaticity (single application — the g⁴-not-g⁸ rule is unaffected). It scales
+> the TOTAL g; splitting orbital Doppler from gravitational redshift would need a new
+> formula here first (static-observer redshift) — do not improvise one in code.
+
 ---
 
 ## Formula CKS-10 — Escaped-ray celestial direction (no spin-axis seam)
@@ -939,10 +982,1088 @@ Do not proceed to rendering until all four pass.
 - [ ] Circular orbit observer (more complex, marginally more accurate in-disk)
 
 **Decision B — Disk temperature model**
-- [x] Simple: `T = T_0 · (6/r)^{0.75}` — fast, already in original code
-- [ ] Novikov-Thorne (1973) flux profile — physically correct, more work
+- [x] Simple: `T = T_0 · (6/r)^{0.75}` — fast, already in original code (ACTIVE)
+- [x] Page-Thorne (1974) flux profile — physically correct (spec below, **source-VERIFIED 2026-06-12; WIRED 2026-06-12 behind `disk.temperature_model: page_thorne`, default `simple`**)
 
 Record the chosen options here once decided and reference them in `CLAUDE.md`.
+
+### Formula CKS-11 — Page-Thorne disk flux profile (VERIFIED; Decision-B upgrade)
+
+> **Status (2026-06-12):** Source-VERIFIED and **Wired 2026-06-12 behind
+> `disk.temperature_model` flag (default `simple`)** — CPU `f_PT(r)` LUT in
+> `src/renderer/disk_flux.py`, sampled by the GPU disk kernel. Supersedes the
+> earlier ⛔ PROVISIONAL transcription (which used a
+> different, unverified `Q/(B C^{1/2} D^{1/2})` parametrization — discarded).
+> **Source:** Page & Thorne (1974) ApJ 191:499, restated in Abramowicz & Fragile
+> (2013) Living Rev. Rel.; supplied as `paper/1104.5499v3.md`. **Verification:** the
+> §3 closed form below was numerically confirmed to reproduce the §1 conservation-law
+> flux integral `F = −Ṁ/(4π√−g)·Ω′/(Ẽ−ΩL̃)²·∫_{r_ms}^r(Ẽ−ΩL̃)L̃′dr` to 5 sig figs
+> across r∈[1.5,28] M for a=0.999, using SKILL.md Formula 3/4 for Ẽ,L̃,Ω; the two
+> forms differ only by the overall constant (`3/2` and √−g = r) that the closed form
+> drops by writing `F ∝ …`. The cubic roots satisfy `y³−3y+2a=0` to machine
+> precision; the bracket → 0 at `y=y₀` (zero-torque BC). This is the standard
+> Page-Thorne function, structure cross-checked. See `tests/test_disk_flux.py`.
+
+Use `y = √(r/M)`, `a_* = a/M`, `y₀ = √(r_ms/M)` with `r_ms = r_isco` (Formula 2).
+
+**Cubic roots** of `y³ − 3y + 2a_* = 0`:
+```
+y₁ = 2·cos[ (arccos(a_*) − π)/3 ]
+y₂ = 2·cos[ (arccos(a_*) + π)/3 ]
+y₃ = −2·cos[ arccos(a_*)/3 ]
+```
+
+**Correction functions** (only B, C needed for the closed form; D not required):
+```
+B = 1 + a_* y^{-3}
+C = 1 − 3 y^{-2} + 2 a_* y^{-3}        # note C = (y³ − 3y + 2a_*)/y³
+```
+
+**Closed-form flux** (proportionality — absolute amplitude is a free calibration,
+carried by `T_0` / `Ṁ`, exactly as in the simple model):
+```
+F(r) ∝ y^{-7} · C^{-1} · bracket(y)        # equivalently r^{-3}·B^{-1}·C^{-1/2}·Q
+
+bracket(y) = (y − y₀) − (3/2)·a_*·ln(y/y₀)
+           − [ 3(y₁−a_*)² / (y₁(y₁−y₂)(y₁−y₃)) ]·ln((y−y₁)/(y₀−y₁))
+           − [ 3(y₂−a_*)² / (y₂(y₂−y₁)(y₂−y₃)) ]·ln((y−y₂)/(y₀−y₂))
+           − [ 3(y₃−a_*)² / (y₃(y₃−y₁)(y₃−y₂)) ]·ln((y−y₃)/(y₀−y₃))
+```
+**Zero-torque inner BC:** `F(r_ms)=0` (bracket → 0 as `y → y₀`); emission ≡ 0 inside
+`r_ms` (gas plunges, does not radiate). **Implementation plan:** precompute the
+dimensionless shape `f_PT(r) = F(r)/F_max` as a 1-D CPU LUT indexed by `r` for fixed
+`a`; the GPU shader reads the LUT (no per-pixel integral or logs).
+
+**Piece 3 — Spectrum & g-bookkeeping** (SAFE — standard, already constrained by
+Formula 9): `T_eff(r) = (F(r)/σ)^{1/4}`, emit a physical Planck `B_ν(T_eff)`.
+**Critical interaction with Formula 9:** the active code multiplies by `pow(g,4)`
+*because* `blackbody_rgb` is chromaticity-only (no T⁴ amplitude). If a physical
+Planck `B_ν` with Stefan-Boltzmann T⁴ amplitude replaces it, the `g⁴` must be
+applied via the `T_obs = g·T_emit` substitution **OR** as an explicit factor —
+**never both** (that is the g⁸ double-count Formula 9 warns about). For the
+volumetric march the bolometric scaling is **g⁴** (Formula 9: 3D volume), not the
+g³ that applies only to a 2D monochromatic surface.
+
+---
+
+## Formula CKS-12 — Disk procedural turbulence: noise coordinates, Keplerian shear advection, modulation bookkeeping (VISUALIZATION)
+
+> **Status (2026-06-13): owner-approved; D2.1 (primitives) + D2.2 (static density
+> modulation) + D2.3 (§2 Keplerian shear advection) + D2.4 (§3 temperature / inner+outer
+> edge / scale-height modulation) ALL WIRED. Procedural noise is now ON in the shipped
+> `configs/render.yaml` (`disk.noise.enabled: true`, `modulation.enabled: true`).** The
+> GPU beauty path applies §3 on density AND on emission amplitudes: the four §3
+> envelopes (`n_T`, `n_e_in`, `n_e_out`, `n_h`) are advected with the SAME §2 dual-phase
+> reset blend + `dynamism` gain as the density field (`taichi_renderer._disk_noise_mod_fields`
+> ↔ CPU `noise.noise_modulation_fields`), then applied per CKS-12 §3 constraints:
+> `T_emit ← T_emit·(1+τ·(n_T−½))` BEFORE the g-shift (constraint 2, keeps g⁴-not-g⁸);
+> `r_in_eff = max(r_inner·(1+e_in·(n_e−½)), r_isco)` (constraint 3); `r_out_eff =
+> r_outer·(1+e_out·(n_e'−½))`; smoothstep edge windows replace the hard radial cutoffs;
+> `σ_θ ← σ_θ·(1+h·(n_h−½))` (lumpy scale height, with the Pipe-B step cap sized on the
+> worst-case `σ_z·(1−h/2)` — constraint 4). The envelopes are single [0,1] fBm decorrelated
+> by distinct seed offsets (`NSEED_MOD_T/EIN/EOUT/H`) and carry NO variance-preserve divide
+> (convex triangle weights keep them in range). CPU look-dev in `thumb.py`. Tests:
+> `tests/test_noise.py §3` (4: disabled-is-½, unit-range, decorrelation, advect+determinism),
+> `tests/test_disk_noise.py::test_mod_fields_match_cpu_reference` (GPU↔CPU), and
+> `tests/test_disk_step_convergence.py::test_disk_emission_resolves_lumpy_slab`
+> (constraint-4 worst-case-σ_z cap on a §3-lumpy thin slab). `t_disk` threaded through
+> `render_beauty_frame{,_mb}` and `export_exr.py` (`frame/fps · time_scale`). `disk.noise.enabled:
+> false` (and `modulation.enabled: false`) keep the legacy bit-identical branch (constraint 6);
+> the GR/calibration guards (`test_gpu_regression.py`, base `test_disk_step_convergence`) force
+> noise OFF so the global enable does not shift the pinned goldens. **Not new GR.**
+> The only physics input is Ω from **Formula 3, reused verbatim**. Everything else
+> is procedural texturing that multiplies *amplitude* quantities (density, emitted
+> temperature, edge/height windows). The noise primitives themselves (fBm, ridged
+> multifractal, Worley/Voronoi) are texturing functions, not physics — they live in
+> `src/renderer/noise.py` (CPU NumPy source of truth) with `@ti.func` twins in the
+> same file held to it by `tests/test_noise{,_gpu}.py` (CPU↔GPU agreement,
+> φ-periodicity, determinism). The hard constraints below (integer φ-period,
+> deterministic hashing, `enabled:false` bit-identity) are pinned by those tests.
+
+### 1. Noise coordinates (per disk sample, from CKS `(x, y, z)`)
+
+```
+r  = kerr_radius(x, y, z)            # CKS-1 (already computed in the disk kernel)
+φ  = atan2(y, x)
+u  = ln(r / r_inner)                 # log-radial: feature size scales with r (self-similar disk)
+ζ  = (θ − π/2) / (θ_half · σ_frac)   # vertical position in local Gaussian scale heights
+                                     #   (= the kernel's existing dz_ang / σ_theta)
+```
+
+- **Advection consistency:** under the CKS-8 gas field (`u^x = −Ωy·u^t`,
+  `u^y = +Ωx·u^t`), `d/dt atan2(y, x) = Ω` exactly — so advecting noise in this φ
+  is exactly co-moving with the same velocity field that drives the CKS-9 Doppler.
+- **φ is NOT the KS azimuth φ̃** (CKS-8: `x = r cosφ̃ + a sinφ̃ …` ⇒
+  `φ = φ̃ − arctan(a/r)`). The difference is a static, r-dependent twist of the
+  noise domain — visually harmless. Do not "fix" it by converting to φ̃.
+
+### 2. Keplerian shear advection with dual-phase reset
+
+```
+Ω(r) = 1 / (r^{3/2} + a)                        # Formula 3 — verbatim, prograde
+```
+
+Naive advection `φ′ = φ − Ω(r)·t` shears any pattern into infinitely thin spirals
+as t grows (relative shear rate dΩ/dr). Standard fix — two pattern phases with
+staggered resets, crossfaded (Neyret-style advected texture):
+
+```
+s    = t_disk / T                       # T = disk.dynamics.shear_period_M (DERIVED, CKS-13)
+a_k  = fract(s + k/2),  k ∈ {0, 1}      # each phase's age fraction ∈ [0, 1)
+c_k  = floor(s + k/2)                   # phase-k cycle index
+w_k  = 1 − |2·a_k − 1|                  # triangle weights; w_0 + w_1 ≡ 1
+
+φ′_k = φ − Ω(r) · (a_k · T)             # each phase sheared for at most T
+
+n(u, φ, ζ; t) = w_0·N(u, φ′_0, ζ; hash(seed, k=0, c_0))
+              + w_1·N(u, φ′_1, ζ; hash(seed, k=1, c_1))
+```
+
+- `t_disk` is the disk animation time in geometric units; callers compute it as
+  `frame_index / render.fps × disk.dynamics.time_scale` (`time_scale` is DERIVED
+  by the CKS-13 resolver from `disk.dynamics.inner_lap_seconds`).
+- **Per-cycle reseed** (the `c_k` term in the hash, or equivalently a hashed
+  per-cycle domain offset) is mandatory — without it the whole animation repeats
+  with period T.
+- **Optional variance preservation:** the crossfade lowers contrast mid-blend
+  (`w² sum < 1`); dividing the blend by `sqrt(w_0² + w_1²)` removes the periodic
+  contrast "breathing" (config `variance_preserve`).
+- T is a look dial: long T → long Interstellar-style filaments; short T → choppier.
+- **Non-physical viz dial — `disk.noise.dynamism` (default 1.0):** the renderer
+  multiplies the shear amount by this gain, `φ′_k = φ − dynamism·Ω(r)·(a_k·T)`.
+  `dynamism = 1` reproduces the formula above bit-for-bit (the default path is
+  unchanged); `> 1` exaggerates the per-frame differential winding (the swirl) for a
+  given `t_disk` **without** changing the reset cadence (the `c_k`/reseed structure is
+  unaffected, so C0-continuity at resets still holds — `w_k = 0` at each reset
+  regardless of the gain). This is artistic emphasis only — the same dial spirit as
+  `disk.doppler_strength` (Formula CKS-9) — and touches no metric/g/g⁴ quantity.
+
+### 3. Modulation bookkeeping — where noise MAY and MAY NOT enter
+
+With `m = Σ_i amp_i·(n_i − bias_i)` over the layer stack (spec §4):
+
+```
+density_mult = exp( clamp(m, −m_max, +m_max) )          # > 0 by construction
+ρ            = gauss(ζ) · density_mult                   # feeds BOTH emission and absorption
+emission     ∝ emis_c · ρ · [f_PT or 1] · g_eff⁴ · ds    # CKS-11 / Formula 9 unchanged
+dτ           = absb_c · ρ · ds                           # clumps self-shadow
+
+T_emit  ← T_emit · (1 + τ_amp·(n_T − ½))     # BEFORE the g shift: chroma(g_eff · T_emit)
+r_in_eff(φ,t)  = max( r_inner·(1 + e_in·(n_e − ½)),  r_isco )   # zero-torque BC kept
+r_out_eff(φ,t) = r_outer·(1 + e_out·(n_e' − ½))
+ρ ← ρ · smoothstep windows on [r_in_eff, r_out_eff]      # replaces the hard cutoffs
+σ_θ ← σ_θ · (1 + h_amp·(n_h − ½))                        # lumpy scale height
+```
+
+**Hard constraints (violating any of these is a physics bug, not a style choice):**
+
+1. Noise must NEVER touch `p_μ`, `u^μ` (CKS-8), `g` (CKS-9), the `g⁴` exponent
+   (Formula 9), the blackbody chromaticity form, or the `f_PT` radial shape
+   (CKS-11). Amplitude quantities only.
+2. Temperature modulation applies to the **emitted** `T_emit` before the `g_eff`
+   shift — the g⁴-not-g⁸ bookkeeping of Formula 9 / CKS-11 Piece 3 is unaffected.
+3. `r_in_eff ≥ r_isco` always (CKS-11 zero-torque BC; no emission from the plunge).
+4. The CKS-5 Pipe-B vertical step cap must use the **worst-case modulated** scale
+   height `σ_z·(1 − h_amp/2)`, or the face-on moiré that `disk.max_step_vfrac`
+   fixed returns.
+5. Every noise lattice is **integer-periodic in φ** (period 2π ⇒ `freq_phi ∈ ℤ`) —
+   no seam at φ = 0.
+6. `disk.noise.enabled: false` must take a branch **bit-identical** to the
+   pre-noise kernel (the `doppler_strength == 1.0` pattern) — golden frames stay
+   valid.
+7. Deterministic integer hashing only (seed from config); **no `ti.random`** —
+   same seed + same `t_disk` ⇒ identical frame.
+
+---
+
+## Formula CKS-13 — Derived disk/orbit parameters (the config resolver; owner-approved 2026-06-13)
+
+**Implemented in `src/renderer/kerr_params.py` (`resolve_config`), called by every
+config loader.** `configs/render.yaml` stores **base** parameters only (spin,
+disk extent, target peak temperature, `disk.dynamics` look targets); everything
+that is a function of them is derived at load time so no dependent literal can
+desync when a base parameter is edited (the old `r_isco: 1.182` failure mode).
+
+Nothing below is new physics — each line is a pinned formula or its trivial
+algebraic inverse:
+
+```
+r_plus  = 1 + sqrt(1 − a²)                       # Formula CKS-6, verbatim
+r_isco  = BPT closed form                        # Formula 2, verbatim (disk_flux.isco_radius)
+Ω(r)    = 1 / (r^{3/2} + a)                      # Formula 3, verbatim
+T_orb(r) = 2π/Ω = 2π·(r^{3/2} + a)               # Formula 3 inverse (geometric M)
+t_wrap  = 2π / (Ω(r_inner) − Ω(r_outer))         # one full differential 2π shear wrap
+
+# Derived config values:
+disk.r_inner          = r_isco            # 'auto'; numeric override clamped to ≥ r_isco
+                                          # (CKS-11 zero-torque BC / CKS-12 constraint 3)
+disk.T_0 (page_thorne) = T_peak           # f_PT LUT is max-normalized ⇒ max T_eff = T_0
+disk.T_0 (simple)      = T_peak·(r_inner/6)^{3/4}   # Decision-B law peaks at r_inner
+dynamics.time_scale    = T_orb(r_inner) / inner_lap_seconds    # M per footage second
+dynamics.shear_period_M = shear_wrap_budget · t_wrap           # CKS-12 §2 reset period T
+```
+
+**Closed forms, not lookup tables:** for Kerr orbital quantities the
+Bardeen–Press–Teukolsky (1972) expressions are exact — an external table would
+only add interpolation error on top of the same equations. Published values are
+pinned as **test anchors** instead (`tests/test_kerr_params.py`: a=0 → r_isco=6,
+r₊=2; a=1 → both 1; a=0.999 → 1.182/1.0447, the SKILL.md Formula-2 verified
+value). The one profile with no closed form, the Page–Thorne flux, is already a
+precomputed LUT (Formula CKS-11, `disk_flux.build_flux_lut`).
+
+**Override semantics:** an explicit numeric `disk.r_inner` (≥ r_isco) or a legacy
+`disk.T_0` key wins over derivation — artistic escape hatches, resolved at load,
+idempotent on re-resolve. `black_hole.r_isco` / `black_hole.r_plus` are ALWAYS
+overwritten and must not be stored in the YAML.
+
+**Addendum (V2, 2026-06-14) — flared θ-band coverage `theta_half_bound`.** When the
+CKS-16 flare is on, the disk envelope is thicker at `r_outer`, so the photon trace
+band must widen to avoid hard-clipping the outer Gaussian. The resolver derives a
+SEPARATE key `theta_half_bound` (the *bounding* half-angle the kernels test
+`|θ−π/2|` against) and `flare_beta`, leaving the base `theta_half_width` untouched:
+
+```
+σ0           = theta_half_width · vertical_sigma_frac      # r=r_inner angular width
+flare_beta   = β  if flare.enabled else 0                  # CKS-16 exponent
+theta_half_bound = max(theta_half_width,                   # ≥ band_sigma·σ_θ(r_outer)
+                       band_sigma · σ0 · (r_outer/r_inner)^β)   if (enabled and β>0)
+                 = theta_half_width                            otherwise
+```
+
+`band_sigma` (`disk.volumetric.flare.band_sigma`, default 3.0 ≈ ±3σ) is the coverage
+factor. **`theta_half_width` is the σ0 anchor and is NEVER mutated** — deriving a
+separate `theta_half_bound` is what keeps `σ0` pinned to the base and makes the
+resolver idempotent for free (re-resolving recomputes the same bound). `flare.enabled
+false` OR `β=0` ⇒ `theta_half_bound == theta_half_width` and `flare_beta == 0`
+(bit-identical, no widening). Validation: `β < 0` and `band_sigma ≤ 0` are rejected
+(disks flare OUTWARD; the band factor is positive). Patch BOTH loaders
+(`taichi_renderer`, `thumb.py`) per the dual-loader rule.
+
+---
+
+## Formula CKS-14 — Volumetric RTE source-function march (owner-approved 2026-06-13; NO new GR)
+
+> **Status:** standard emission/absorption radiative transfer, NOT a metric or
+> geodesic change. Assembled entirely from already-verified terms — CKS-9 `g_eff`,
+> CKS-11 `f_PT`, Formula-9 chromaticity·g⁴. Gated behind `disk.volumetric.
+> source_function` (default `false` ⇒ the legacy emission-only sum, golden frames
+> intact). Spec: `docs/specs/2026-06-13-V1-self-shadow-source-function.md`.
+
+The Pipe-B disk march integrates the radiative transfer equation along the photon
+path. In optical-depth form, per step:
+
+```
+dI = (S − I) dτ            S = j/κ   (source function = emissivity / absorption)
+```
+
+`_disk_emit_cks` already returns the two quantities this needs: the emission RGB
+`= j·ds` and `dτ = κ·ds`. The source function is therefore their **ratio**, in
+which the mass density ρ and the step length `ds` cancel **exactly**:
+
+```
+S = (j·ds)/(κ·ds) = emission / dτ
+  = (emis_c · ρ · [f_PT] · g_eff⁴ · chroma · ds) / (absb_c · ρ · ds)
+  = (emis_c / absb_c) · [f_PT] · g_eff⁴ · chroma          ← ρ and ds gone
+```
+
+`S` is density-independent: the colour/brightness a *fully opaque* parcel of gas
+would show. The analytic front-to-back update of `dI=(S−I)dτ` over one step is
+
+```
+w         = 1 − exp(−dτ)
+disk_col += transm · w · S
+transm   *= exp(−dτ)
+```
+
+**Back-compatibility (thin limit).** As `dτ→0`, `w = 1−e^{−dτ} → dτ`, so
+`transm·w·S → transm·dτ·(j/κ) = transm·(κ·ds)·(j/κ) = transm·j·ds = transm·emission`
+— **exactly** the legacy `disk_col += transm·emission` (Formula 9), to first order
+in `dτ`. The two differ only at O(dτ²), so this is flag-gated, not bit-identical;
+goldens stay on the legacy branch. The implementation falls back to the legacy term
+when `dτ ≤ _RTE_TAU_EPS` (≈1e-6), so there is no divide blow-up and no discontinuity.
+
+**Thick limit & what CKS-14 actually buys (be precise — verified 2026-06-13).** The
+legacy emission march and the CKS-14 source-function march integrate the **same
+continuum quantity** `I = ∫ S e^{−τ} dτ` — because `transm·j·ds = transm·S·(κ·ds) =
+transm·S·dτ`. They differ **only in quadrature**: legacy is the left-endpoint
+rectangle rule (`transm·S·dτ` per step), CKS-14 is the exact per-step solution for
+piecewise-constant `S` (`transm·S·(1−e^{−dτ})`). In the thin limit they agree
+(`1−e^{−dτ}→dτ`); in the **thick** limit (`dτ` per step ≫ 1) the legacy rule
+**over-counts** each opaque step by `dτ/(1−e^{−dτ}) > 1`, so CKS-14 is *dimmer and
+more accurate* there (empirically ≈10% on the edge-on disk at `absorption=8`). CKS-14
+does **not** by itself turn a black disk bright — the standalone gains are (i)
+removing that thick-step over-count, and (ii) **materialising `S`** (the opaque-
+parcel colour), which is exactly the object CKS-15 self-shadow attenuates
+(`emission *= e^{−τ_shadow}` ⇒ `S·e^{−τ_shadow}`) to carve the dark voids. The
+glowing-gas-with-voids look therefore needs **CKS-14 + CKS-15 together**, not CKS-14
+alone. (Guarded by `tests/test_disk_source_function.py`:
+`test_source_function_changes_thick_disk`.)
+
+**g-bookkeeping unchanged.** `S` carries `g_eff⁴·chroma` exactly once — the same
+single application as Formula 9 / CKS-11 Piece 3 (`_blackbody_rgb` is chromaticity-
+only; no g⁸ double-count). CKS-14 does NOT touch p_μ, u^μ, g, g⁴, or f_PT.
+
+**Implementation:** march-loop reinterpretation in `render_beauty_physics` only;
+`_disk_emit_cks` is unchanged (still returns `vec4(emission_rgb, dτ)`). Guard:
+`tests/test_disk_source_function.py` (optically-thin equivalence to the legacy
+frame) + the unchanged `test_gpu_regression.py` (flag-off ⇒ goldens bit-identical).
+
+---
+
+## Formula CKS-15 — Radial deep-shadow-map self-shadow (owner-approved 2026-06-13; VISUALIZATION, NOT a metric)
+
+> **Status:** a VISUALIZATION occlusion model, flagged exactly like
+> `disk.doppler_strength` (CKS-12 constraint 1) — it multiplies the emission
+> *amplitude* only and never touches `p_μ`, `u^μ`, `g`, `g⁴`, `f_PT`, or the
+> chromaticity form. The shadow ray is a **straight radial line in CKS, not a
+> geodesic**. Gated behind `disk.volumetric.self_shadow.enabled` (default `false` ⇒
+> no bake, no lookup, golden frames bit-identical). If a *physical* shadow transport
+> (geodesic shadow rays, multi-scatter) is ever wanted, STOP and extend this skill
+> first (CLAUDE.md policy). Spec: `docs/specs/2026-06-13-V1-self-shadow-source-function.md`.
+
+The dominant illuminator of the disk is its own **hot inner edge** (peak
+`T_eff = T_0·f_PT^¼` near `r_inner`, strongest `g⁴` beaming). Gas at larger `r` is
+shadowed by all the gas between it and the inner edge at the same `(φ, ζ)`. CKS-15
+captures this **in-plane (radial) self-shadowing** — clumps casting dark wakes
+*outward* — the dominant void mechanism for the 2.5D slab. (Vertical self-shadowing,
+top gas shadowing the midplane, needs the V2 3D bulk and is out of V1 scope — it is
+now provided by **Formula CKS-17**, which generalises this radial column scan to a
+3D inner-edge ray and *supersedes the bake below* when `self_shadow` is on. CKS-15
+remains the ζ=0 midplane limit of CKS-17.)
+
+**The deep-shadow-map (baked once per frame).** A 3-D cumulative absorption optical
+depth `τ_shadow[NU, NPHI, NZ]` on the CKS-12 noise coordinates
+`(u = ln r/r_inner, φ = atan2(y,x), ζ = Δθ/σ_θ)` — dense where the gas is. For each
+`(φ, ζ)` column, march `u` **outward from u=0**:
+
+```
+τ_shadow(u, φ, ζ) = Σ_{u'=0..u}  absb_c · ρ(u', φ, ζ; t_disk) · (r' · Δu)
+```
+
+with `dr = r·du` (since `u = ln r/r_inner`) and `ρ` the **identical** density the
+emission march uses — the shared `@ti.func _disk_density_cks` (CKS-14 V1.0
+extraction) is called by BOTH the bake and the emit so they can never drift,
+including the §2 shear advection and §3 modulation at the current `t_disk`. `κ` here
+is the same `absb_c` as `dτ`. Each cell stores τ from gas **strictly inward** of it
+(the running sum *before* its own contribution) so a cell never shadows itself; the
+total is clamped to `max_tau` (overflow / caustic safety). Re-baked per frame (it
+tracks `t_disk`).
+
+**The lookup (per primary sample).** Trilinear-sample `τ_shadow` at the sample's
+`(u, φ, ζ)` (φ periodic — no φ=0 seam; u, ζ clamp at the grid edges) and dim the
+**emissivity `j`** before it becomes the source function:
+
+```
+τ_s        = trilinear(τ_shadow; u, φ, ζ)
+emission  *= exp(−shadow_strength · τ_s)        # j → j·e^{−τ_s};  κ/dτ UNCHANGED
+```
+
+Only `j` is attenuated; the absorption `κ`/`dτ` is **not** (the gas still occludes
+behind it regardless of how lit it is). Composes exactly with CKS-14:
+`S = emission/dτ` inherits the `e^{−τ_s}` factor, so a shadowed thick parcel reads
+**dark** (the deep void), not merely dim. Works with the legacy march too (it just
+dims `emission`), but the glowing-gas-**with-voids** look needs **CKS-14 + CKS-15
+together** — CKS-14 materialises `S`, CKS-15 carves it.
+
+**Governance (why this is a viz approximation, not GR).** Straight radial CKS shadow
+ray (not a geodesic — the inner-to-sample bending is small at close-up scale, accepted
+like `doppler_strength`'s non-physical shift); single illuminator direction (radially
+inward); single-scatter; no emission along the shadow march — occlusion bookkeeping,
+not a transport solve. It multiplies the emission amplitude only (CKS-12 constraint 1).
+
+**Implementation:** module field `disk_shadow_tau[NU,NPHI,NZ]` (always allocated by
+`_setup_disk_shadow`; extents `u_max`, `ζ_max` baked as module globals so the lookup
+needs no extra args); `@ti.kernel bake_disk_shadow` (radial scan off `_disk_density_cks`);
+`@ti.func _sample_shadow_tau` (trilinear, φ-periodic); the lookup + `emission *=
+exp(−strength·τ_s)` in `_disk_emit_cks` behind the `self_shadow`/`shadow_strength`
+kernel args of `render_beauty_physics`, threaded from `disk.volumetric.self_shadow`.
+Guards: `tests/test_disk_self_shadow.py` (flag-off bit-identity; GPU bake vs the
+analytic Gaussian column; outward-steepening dimming; noise-on contrast rise) + the
+unchanged `test_gpu_regression.py` (flag-off ⇒ goldens bit-identical).
+
+---
+
+## Formula CKS-16 — Flared disk scale height σ_θ(r) (owner-approved 2026-06-14; GEOMETRY/TEXTURE, NOT GR)
+
+> **Status:** a GEOMETRY/TEXTURE shape, NOT a metric, geodesic, or emission-physics
+> change — it sets *where the gas is*, exactly like the CKS-12 §3 scale-height term it
+> extends. It modulates the density **envelope** only and never touches `p_μ`, `u^μ`,
+> `g`, `g⁴`, `f_PT`, or the chromaticity form. Gated behind `disk.volumetric.flare.
+> enabled` (default `false` ⇒ constant-σ slab, golden frames bit-identical). Spec:
+> `docs/specs/2026-06-14-V2-flared-3d-density.md`. If review finds this implies a new
+> GR derivation, STOP and ask the human (CLAUDE.md policy).
+
+The V1 disk uses a **constant** angular scale height `σ_θ = theta_half_width ·
+vertical_sigma_frac`, which squashes the noise stack's `ζ = Δθ/σ_θ` coordinate into a
+thin sheet. CKS-16 gives the slab radius-varying vertical bulk:
+
+```
+σ_θ(r) = σ0 · (r / r_inner)^β          σ0 ≡ theta_half_width · vertical_sigma_frac
+```
+
+- `β = 0` ⇒ `σ_θ(r) ≡ σ0` ⇒ **exactly the V1 constant slab, bit-for-bit** (the
+  implementation skips `ti.pow` when `flare_beta == 0`, so it is the same instruction
+  stream, not just numerically close).
+- `σ0` is the `r = r_inner` value — the **inner edge keeps today's thickness**; `β > 0`
+  thickens the disk **outward** (astrophysical flare, H/r growing with radius). `β < 0`
+  is rejected at config-resolve (disks flare outward).
+- **Why the angular envelope is the right object to flare:** near the equator
+  `z = r cosθ ≈ −r·dz_ang`, so a *constant* angular `σ_θ` already means a *constant
+  H/r* (physical height ∝ r) disk; `β > 0` makes H/r itself grow outward.
+
+**Composition with CKS-12 §3 (order preserved).** The §3 lumpy-scale-height envelope
+multiplies on top of the flared base — `σ_θ(r)` replaces the constant `σ0` as the base
+that the `(1 + h_amp·(n_h−½))` factor perturbs:
+
+```
+σ_eff = σ_θ(r) · (1 + h_amp·(n_h − ½))          # §3 constraint 4, unchanged form
+```
+
+The Gaussian density `exp(−½(dz_ang/σ_eff)²)` and the noise coordinate `ζ = dz_ang/σ_eff`
+both use `σ_eff`, so **genuine 3D falls out for free**: the existing `ridged3`/`fbm3`
+stack already consumes `ζ`, and a real radius-varying thickness simply un-squashes it.
+No new noise primitive is added (the V1.5 simplex basis stays unwired, reserved for V3
+curl-flow).
+
+**Single source of truth.** The flare lives once in the shared `@ti.func
+_disk_density_cks` (signature gained `flare_beta`, `r_inner`); the emission march
+(`_disk_emit_cks`) and the CKS-15 shadow bake (`bake_disk_shadow`) both call it, so they
+inherit the same `σ_θ(r)` automatically — the V1.0 "extract shared density" refactor is
+what makes this a one-point change.
+
+**Two knock-on fixes.**
+
+1. **θ bounding band** — a flared envelope is thicker at `r_outer` and would be
+   hard-clipped by the V1 `theta_half_width` cutoff. Handled by the CKS-13 resolver
+   addendum above: a separate derived `theta_half_bound ≥ band_sigma·σ_θ(r_outer)` is
+   what the kernels test `|θ−π/2|` against, while `theta_half_width` stays the σ0 anchor.
+2. **Pipe-B vertical step cap** (`max_step_vfrac`) — flare only thickens *outward*, so
+   the thinnest slab is the inner edge `σ0`, today's worst case, which the existing cap
+   already sizes for (`sigma_z = r·σ0`). **No cap change**; verified (not assumed) by the
+   flared-slab convergence test.
+
+**Implementation:** `flare_beta` + `theta_half_bound` + `sigma_theta0` threaded through
+`render_beauty_physics` / `render_beauty_frame` (host computes `σ0` and reads the derived
+keys); `_disk_density_cks` applies `σ_eff = σ_θ·ti.pow(r/r_inner, flare_beta)` (skipped at
+β=0); bound checks use `theta_half_bound`, the step cap uses `σ0`. CPU twin in
+`scripts/thumb.py::_march_disk`. Gated by `disk.volumetric.flare.enabled` (default
+`false`). Guards: `tests/test_disk_flare.py` (resolver no-op/widen/monotone/idempotent/
+validation + GPU flag-off bit-identity vs the no-flare march + a β>0 disk that is
+NaN-free, differs, and thickens — a *wider emitting silhouette*, NOT higher total
+luminance: see the note below) + the unchanged `test_gpu_regression.py` /
+`test_disk_step_convergence.py` (default-off ⇒ goldens bit-identical).
+
+**Flare is geometry, not a brightness boost (verified 2026-06-14).** The GPU test
+measured a flared disk reading marginally *dimmer* in total (~1.6% on the inclined
+showcase view), not brighter. This is physically correct and worth recording: the hot
+inner edge — where peak emission lives — sits at `r_inner`, whose σ is the *anchored*
+σ0 and **does not change** under flare; flare only adds **cold** outer gas at larger
+`|z|`. Under the absorbing march (`transm *= e^{−dτ}`) that extra bulk self-absorbs the
+bright inner edge slightly more than the dim cold gas it contributes. So the honest,
+inclination-robust signature of the added vertical bulk is a **larger emitting
+silhouette** (gas spreading into previously-dark off-plane pixels), which is what the
+test asserts — not integrated luminance. (Trust-the-math: the look emerges from the
+correct envelope + absorption, it is not tuned for brightness.)
+
+---
+
+## Formula CKS-17 — 3D inner-edge-ray self-shadow (radial + vertical) (owner-approved 2026-06-14; VISUALIZATION, NOT a metric)
+
+> **Status:** the SAME VISUALIZATION occlusion class as CKS-15 — it multiplies the
+> emission *amplitude* only and never touches `p_μ`, `u^μ`, `g`, `g⁴`, `f_PT`, or the
+> chromaticity form. The shadow ray is a **straight line in CKS, not a geodesic**;
+> single illuminator (the hot inner edge), single-scatter, no emission along the
+> shadow march — occlusion bookkeeping, not a transport solve. It stays inside the
+> CKS-15 governance envelope (straight ray / single-scatter / amplitude-only), so it
+> is an *extension of CKS-15*, not the "physical shadow transport" that section says
+> to stop for. Gated by the SAME flag `disk.volumetric.self_shadow.enabled` (default
+> `false` ⇒ no bake, no lookup, golden frames bit-identical). Owner picked the 3D-ray
+> model over a separable top-down column on 2026-06-14. Spec:
+> `docs/specs/2026-06-14-V2-vertical-self-shadow.md`.
+
+CKS-15 shadows each sample along a **radial** ray at constant `(φ, ζ)` — it captures
+gas casting wakes *outward* but cannot capture the **vertical** occlusion the V2 3D
+bulk makes physical: an off-midplane parcel is shadowed by the dense midplane gas
+lying between it and the hot inner edge. CKS-17 unifies both by making the shadow ray
+**3D**: from the illuminator at the inner edge **in the midplane** `(u=0, ζ=0)` to the
+sample `(u_s, φ, ζ_s)`, at fixed `φ` (azimuthal bending ignored, as in CKS-15).
+
+**The ray (fixed `φ`, parameterised by `u ∈ [0, u_s]`).** The vertical coordinate
+interpolates linearly from the midplane illuminator to the sample:
+
+```
+ζ(u) = (u / u_s) · ζ_s          # ζ(0)=0 at the inner edge, ζ(u_s)=ζ_s at the sample
+r(u) = r_inner · e^u
+Z(u) = r(u) · ζ(u) · σ_θ(r(u))  # near-equator physical height; σ_θ = CKS-16 flared σ
+```
+
+**The baked optical depth** (still `τ_shadow[NU, NPHI, NZ]`, same field/grid/lookup as
+CKS-15). For target cell `(i_u, φ, i_z)` march the strictly-inner radial cells
+`j = 0 … i_u−1` (a cell never shadows itself — the inner-edge accumulation rule is
+unchanged) and accumulate the SAME absorption the emission march uses, `κ·ρ·ds`, but
+now along the tilted ray:
+
+```
+ζ_j   = (u_j / u_s) · ζ_s          u_j = (j+½)·du,  u_s = (i_u+½)·du
+ρ_j   = _disk_density_cks(φ, r_j, dz_ang = ζ_j·σ_θ(r_j))     # tilted sample, shared ρ
+ds_j  = sqrt( (r_j·du)² + (ΔZ_j)² )                          # 3D arc length
+ΔZ_j  = Z(u_j+½du) − Z(u_j−½du)                              # ray height change over the cell
+τ_shadow(i_u,φ,i_z) = min( Σ_{j<i_u} absb_c · ρ_j · ds_j , max_tau )
+```
+
+- **Exact CKS-15 reduction on the midplane.** At `ζ_s = 0` the ray is flat: `ζ_j ≡ 0`,
+  `ΔZ_j ≡ 0`, so `ds_j = r_j·du` and `ρ_j = ρ(u_j, φ, 0)` — the integrand becomes
+  CKS-15's radial column **term for term**. The radial element keeps the `dr = r·du`
+  convention (NOT an endpoint `ΔR`) precisely so this reduction is bit-exact, and the
+  vertical leg `ΔZ` is added in quadrature (zero on the midplane). CKS-15 is the
+  `ζ→0` limit of CKS-17, not a separate code path.
+- **Why off-midplane changes.** For `ζ_s ≠ 0` the ray tilts toward the midplane going
+  inward (`ζ_j < ζ_s`), so it traverses **denser** gas than CKS-15's constant-`ζ_s`
+  column — an off-plane parcel is now correctly shadowed by the bright midplane slab
+  between it and the inner edge. This is the entire point: vertical self-shadow.
+- **`σ_θ(r)` is the CKS-16 flared base** (`σ0·(r/r_inner)^β`, `β=0 ⇒ σ0` with no
+  `ti.pow`), so on a flared disk the ray height `Z` follows the real envelope.
+
+**The lookup and application are UNCHANGED from CKS-15.** Trilinear (φ-periodic) sample
+of `τ_shadow` at the primary sample's `(u, φ, ζ)`, then `emission *= exp(−shadow_strength
+· τ_s)` on the EMISSIVITY only (`κ`/`dτ` untouched; composes with CKS-14 so `S` inherits
+`e^{−τ_s}`). Only `bake_disk_shadow`'s *ray geometry* changed — the field shape,
+`_sample_shadow_tau`, and the `_disk_emit_cks` application are identical.
+
+**Cost.** The 3D ray is not a prefix sum (each target `ζ_s` tilts its own ray), so the
+bake is `O(NU)` per cell ⇒ `O(NU²·NPHI·NZ)` overall vs CKS-15's `O(NU·NPHI·NZ)` — ~`NU/2`×
+more density evals per frame, parallelised over all cells on the GPU. Accepted for the
+offline bake (owner chose the 3D ray knowing it is the heavier model).
+
+**Governance (why this is still a viz approximation, not GR).** Straight CKS shadow ray
+(not a geodesic — the inner-to-sample bending is small at close-up scale, accepted like
+`doppler_strength`); single illuminator (the inner edge, midplane); single-scatter; no
+re-emission along the shadow march. It multiplies the emission amplitude only (CKS-12
+constraint 1). If a *physical* shadow transport (geodesic shadow rays, multi-scatter,
+an anisotropic phase function) is ever wanted, STOP and extend this skill first
+(CLAUDE.md policy).
+
+**Implementation:** `bake_disk_shadow` in `taichi_renderer.py` rewritten from the radial
+column scan to the per-cell 3D ray march (same signature — it already takes `r_inner`,
+`r_outer`, `sigma_theta0`, `flare_beta`, `zeta_max`, `max_tau`, `absb_c`); no new config,
+no new field, no kernel-arg change in `render_beauty_physics`. Guards: the CKS-15
+`tests/test_disk_self_shadow.py` carries over — flag-off bit-identity, outward-steepening
+dimming, and noise-on contrast-rise are unchanged relational checks; only
+`test_bake_matches_analytic_gaussian_column` is re-derived to the 3D-ray line integral
+(the constant-`ζ` radial closed form was the CKS-15 model and is now superseded
+off-midplane). `test_gpu_regression.py` (default-off ⇒ goldens bit-identical) unchanged.
+
+---
+
+## Formula CKS-18 — Curl-flow domain warp (owner-approved 2026-06-14; VISUALIZATION, NOT a metric)
+
+> **Status:** the SAME VISUALIZATION class as CKS-12 §2/§3 — it relocates the noise
+> **sample coordinate** only (texturing), never a metric/transport quantity. Owner
+> decisions 2026-06-14: (1) stage as **V3.0 static warp** first, then V3.1 curl-flow
+> *advection* (the D2.2→D2.3 split); (2) V3.0 displacement is **in-plane `(u,φ)`** only
+> (ζ untouched). Spec: `docs/specs/2026-06-14-V3-curl-domain-warp.md`.
+
+CKS-12 §2 winds the noise azimuthally at `Ω(r)` — *laminar* shear, no eddies. CKS-18
+adds divergence-free turbulent structure by warping the noise coordinate with the curl
+of a scalar potential built on the **V1.5 isotropic simplex basis** (§3.6), which has no
+axis-aligned grid bias (a curl field on the square-lattice `gnoise` would show directional
+streaks) and, sampled on the cylinder embedding of the φ-axis, is **seamless across φ=0**
+— the "exact φ-seamlessness at the V3 integration point" §3.6 promised.
+
+### Potential and in-plane curl (V3.0 static)
+
+```
+P(u,φ) = ( cos φ · ρ_c , sin φ · ρ_c , u · k_u )         # ρ_c, k_u = angular / radial freq
+ψ(u,φ) = sfbm3( P ; octaves, lacunarity, gain, curl_seed )
+
+∂ψ/∂u ≈ (ψ(u+ε,φ) − ψ(u−ε,φ)) / 2ε      ∂ψ/∂φ ≈ (ψ(u,φ+ε) − ψ(u,φ−ε)) / 2ε   # central FD, simplex has no analytic grad here
+δu = +∂ψ/∂φ        δφ = −∂ψ/∂u           # ∇·(δu, δφ) ≡ 0 by construction (curl of a scalar)
+u' = u + A·δu       φ' = φ + A·δφ          # A = curl amp; ε = curl_fd_eps (chart step)
+```
+
+- **Divergence-free** is the defining property: the displacement is the 2D curl of a
+  scalar potential, so the warp neither piles up nor evacuates the texture (the
+  incompressible-flow look). Pinned by a numeric `∇·(δu,δφ) ≈ 0` test.
+- **Seamless in φ (CKS-12 constraint 5 preserved).** `δu`, `δφ` are built on `cos φ`,
+  `sin φ` ⇒ exactly 2π-periodic in φ ⇒ `φ'` is continuous across the seam, even though
+  classic simplex is *not* lattice-periodic. Seamlessness comes from the **embedding**,
+  not a lattice period, so `ρ_c`, `k_u` may be **any real** (no integer-period restriction
+  the φ-periodic density stack has).
+
+### Integration — material-frame warp, two entry points
+
+Apply the warp at the entry of `_disk_noise_m` (density layer stack) and `_mod_fbm4`
+(§3 modulation envelopes) — the two evaluators that receive the **already-sheared**
+per-phase `φ′_k` from CKS-12 §2. The eddies are thus frozen into the gas's *material*
+frame and the Keplerian shear winds them into filaments (the physically-sensible
+composition — eddies advect with the gas, not the lab frame); density and modulation
+share one warp so they swirl coherently. The warp uses a **fixed `curl_seed`** (NOT the
+per-cycle reseed `c_k` the density draws), so V3.0 is genuinely static — only the §2
+winding animates over `t_disk`. In the static `T ≤ 0` path the warp acts on `φ` directly
+(material = lab when there is no shear). V3.1 will make `ψ` itself time-dependent.
+
+### Governance — VISUALIZATION, not GR
+
+The warp moves only the noise sample coordinate; `ρ = gauss(ζ)·exp(clamp(m))`,
+`emission ∝ ρ·g⁴·…`, `dτ = absb·ρ·ds`, the CKS-9 `g`, the CKS-11 `f_PT` shape, and the
+CKS-14/15/17 source-function / self-shadow machinery are all **identical**. It must NEVER
+touch `p_μ`, `u^μ` (CKS-8), `g` (CKS-9), the `g⁴` exponent (Formula 9), the chromaticity
+form, or `f_PT` (CKS-11) — amplitude/texture only (CKS-12 constraint 1). The
+divergence-free construction is the principled choice but it is still texturing, not
+transport of a conserved field; a genuine fluid solve (advecting a real density with a
+continuity equation) would STOP for skill extension (CLAUDE.md policy).
+
+### Implementation / guards
+
+`src/renderer/noise.py`: `curl_warp` (CPU NumPy source of truth, `sfbm3`-based) +
+`@ti.func` twin `curl_warp_ti`. `src/renderer/taichi_renderer.py`: the warp is called at
+the entry of `_disk_noise_m` / `_mod_fbm4` behind the curl-enabled param slot; new
+`disk.noise.curl` config dials flow through the `_setup_disk_noise` param buffer (grows
+past `_NOISE_N = 43`). **No CKS-13 resolver change** (all base look dials, nothing
+derived). Cost: central-diff gradient = 4 `sfbm3` evals × octaves, per phase, for density
+AND modulation — heavier than §2 but parallel and offline (analytic-gradient or 3-eval
+forward-diff is the deferred fallback). Gated by `disk.noise.curl.enabled` (default
+`false`, and `amp = 0` ⇒ identity) ⇒ bit-identical to V2 (constraint 6). Guards:
+`tests/test_noise.py` (divergence-free, seamlessness, determinism) +
+`tests/test_noise_gpu.py` (`curl_warp_ti` CPU↔GPU twin parity) +
+`tests/test_disk_noise.py` (default-off wiring, curl-on finite/NaN-free) + unchanged
+`test_gpu_regression.py` (default-off ⇒ goldens bit-identical). **GPU-verified 2026-06-14**
+(noise_gpu 15, disk_noise + gpu_regression, noise 44 CPU). NOTE the twin tolerance is NOT
+`_SATOL`=1e-5 but a derived `amp·_SATOL/fd_eps`: the warp is a *derivative*
+(`amp·(ψ₊−ψ₋)/(2ε)`), so the ~1e-5 `sfbm3` twin gap is amplified ×1/(2ε) (obs ~6.5e-5) —
+same f32 FD-amplification family as the divergence/seam test tolerances.
+
+### §2 — Curl-flow advection (V3.1: time-dependent ψ; owner-approved 2026-06-14 — Option A + clock B1)
+
+V3.0 (§1) freezes ψ (fixed `curl_seed`): the eddies are static in the gas's material
+frame and only the CKS-12 §2 Keplerian shear winds them. V3.1 makes **ψ itself evolve over
+`t_disk`** so the eddies boil (form / stretch / merge / dissipate), composed *additively* on
+top of the §2 shear — §2 is the laminar bulk-orbit winding, V3.1 is the in-place turbulent
+evolution. **Mechanism = Option A: mirror the CKS-12 §2 dual-phase reset blend, applied to
+the curl potential ψ** (not the density domain):
+
+```
+T_c  = disk.noise.curl.flow_period_M          # curl-flow clock (geometric M); ≤ 0 ⇒ V3.0 static
+s_c  = t_disk / T_c
+α_k  = fract(s_c + k/2),  k ∈ {0,1}           # phase age
+γ_k  = floor(s_c + k/2)                        # phase cycle index (→ reseed)
+ω_k  = 1 − |2·α_k − 1|                         # triangle weights, ω_0 + ω_1 ≡ 1
+ψ_k(u,φ) = sfbm3( P(u,φ) ; curl_seed + k·NCYC_PHASE + γ_k·NCYC_CYCLE )   # P = §1 cylinder embedding
+ψ(u,φ;t) = ω_0·ψ_0 + ω_1·ψ_1
+δu = +∂ψ/∂φ,  δφ = −∂ψ/∂u                      # central FD of the BLENDED ψ, exactly as §1
+```
+
+- **Divergence-free survives the blend.** Curl is linear ⇒ `curl(ω_0ψ_0+ω_1ψ_1) =
+  ω_0·curl(ψ_0)+ω_1·curl(ψ_1)` — a convex combination of divergence-free fields is
+  divergence-free. (Equivalently: blend ψ first, then central-difference — the
+  implementation does this, one FD stencil over the blended potential, so the §1 4-eval
+  cost becomes 2·4 = 8 `sfbm3` evals at `T_c>0`.)
+- **Seamless in φ** is inherited per-phase from the cylinder embedding (§1), unchanged.
+- **C0-continuous through reseeds.** `ω_k → 0` *exactly* at its own reset (`α_k = 0`), so the
+  warp is continuous as `γ_k` steps and the potential reseeds — the proven §2 property, now
+  on the time axis. **Reuses the §2 reseed strides `NCYC_PHASE`/`NCYC_CYCLE`** so each cycle
+  draws a decorrelated ψ (no period-`T_c` repeat).
+- **Static fallback = the V3.0 warp bit-for-bit.** `T_c ≤ 0` ⇒ a single fixed-`curl_seed`
+  phase ≡ §1 — the exact mirror of §2's "`shear_period ≤ 0` ⇒ static path bit-identical".
+  This is the regression hook: V3.0 / default-off goldens stay valid, and the curl-on V3.0
+  look is preserved exactly when the clock is off.
+- **Clock B1 — `T_c` is a NEW independent base dial** `disk.noise.curl.flow_period_M`, NOT
+  derived from `disk.dynamics.shear_period_M` (eddy turnover and bulk-orbit winding are
+  physically independent timescales) ⇒ **no CKS-13 resolver change** (V3.0's
+  no-resolver-touch property preserved; the value flows straight through `_setup_disk_noise`).
+
+**Composition with §2 (unchanged from V3.0):** the warp is still applied at the entry of
+`_disk_noise_m` / `_mod_fbm4` on the already-sheared per-phase `φ′_k`, so the now-time-varying
+eddies live in the material frame and the shear winds them; density and modulation share one
+warp. Only the `(δu,δφ)` displacement gained a `t_disk` dependence.
+
+> **⚠ No `flow_dynamism` gain (deferred — flagged, not silently substituted).** The CKS-12
+> §2 `dynamism` works because it scales a *continuous* shear displacement `Ω·a_k·T`
+> independently of the weights `ω_k(α_k)` and the reseed cadence. A pure reset-blend
+> potential has **no** analogous continuous displacement term — its only rate is `1/T_c`,
+> which sets boil speed and reseed cadence *together* — so a C0-preserving per-frame
+> boil-emphasis decoupled from the reseed cadence is **not separable** in Option A. A boil
+> rate independent of reseed cadence requires the **Option B** continuous 4-D time axis
+> (`sfbm4(cosφ·ρ_c, sinφ·ρ_c, u·k_u, t·k_t·dynamism)`, the deferred basis), where `t·k_t` is
+> a genuine separable scale. `flow_period_M` alone is V3.1; `flow_dynamism` is **not** added.
+
+**Governance (identical to §1):** texturing only — moves the noise sample coordinate, never
+`p_μ`/`u^μ` (CKS-8), `g` (CKS-9), the `g⁴` exponent, the chroma form, or `f_PT` (CKS-11). The
+divergence-free blend is the principled choice but is still a time-varying *texture-coordinate*
+displacement (the Neyret advected-texture sense, exactly as §2), NOT a semi-Lagrangian
+continuity solve of a conserved density — a genuine fluid transport STOPs for skill extension.
+
+**Implementation / guards (extend the §1 suite):** `curl_warp` / `curl_warp_ti` gain
+`(t_disk, flow_period)` (default `0.0` ⇒ the §1 static path bit-for-bit); the dual-phase blend
+wraps the `_psi` stencil. New dial `disk.noise.curl.flow_period_M` through `_setup_disk_noise`
+(buffer grows past `_NOISE_N = 52`). Tests: `tests/test_noise.py` (§2 curl — divergence-free
+**at several `t_disk`**, seamless at each `t`, reset C0-continuity in time, `flow_period ≤ 0`
+static-fallback **bit-identity**, determinism, evolution-smoke) + `tests/test_noise_gpu.py`
+(`curl_warp_ti` time-blend twin parity to the same derived `amp·_SATOL/fd_eps` bound) +
+`tests/test_disk_noise.py` (default-off wiring, flow-on finite/NaN-free) + unchanged
+`test_gpu_regression.py` (default-off ⇒ goldens bit-identical). Spec:
+`docs/specs/2026-06-14-V3.1-curl-flow-advection.md`.
+
+---
+
+## Formula CKS-19 — Multi-phase disk media: decoupled hot-emission / cold-absorption (ACTIVE — wired 2026-06-16; PHYSICS, owner planning-approved)
+
+> **Status (2026-06-16): ACTIVE — wired into the CPU twin (`noise.dust_density_mult`) and
+> the GPU march (`_disk_density_cks → vec3(ρ_hot, ρ_cold, temp_factor)`; emission←ρ_hot,
+> absorption + the CKS-15 shadow bake←ρ_cold).** **Task 7 (chromatic `dτ⃗`) wired
+> 2026-06-18:** the beauty march now carries a per-channel transmittance `T⃗` (vec3) and
+> `dτ⃗ = absb_c·extinction_rgb·ρ_cold·ds`, with `extinction_rgb` (`disk.extinction_rgb`,
+> default `[1,1,1]`) the κ⃗ multiplier. Grey `[1,1,1]` ⇒ `T⃗` stays equal across channels
+> ⇒ scalar-march bit-identical (goldens unshifted); `κ_B>κ_R` reddens the cold-dust lanes.
+> `disk_buf` widened (H,W,4)→(H,W,6) so `T⃗` reaches the composite (background reddens too).
+> The self-shadow bake stays grey (scalar τ_s — chromatic τ_s is not required by the formula).
+> Source brief `tip.md` Pillar 2; full design
+> `docs/specs/2026-06-16-cinematic-volumetric-multiphase-scattering-design.md` §B. This IS a
+> physics change (it splits the emissivity `j` from the absorption `κ`), so it is a
+> PHYSICS-class formula — but it touches NO geodesic/Doppler quantity
+> (`p_μ`/`u^μ`/`g`/`g⁴`/`f_PT`/chroma-form are untouched). It changes only which density
+> drives which radiative-transfer coefficient. Gated behind `disk.multiphase.enabled`
+> (default `false` ⇒ ρ_cold≡ρ_hot, single-phase march, golden frames bit-identical).
+> Implementation note: the dust branch is emitted only when enabled (`ti.static`
+> `_MP_COMPILE` gate), so toggling `enabled` forces a one-time kernel recompile while the
+> OFF default keeps its original fast JIT.
+
+**The problem.** The single-phase march (CKS-12 §3 / CKS-14) feeds ONE mass density ρ into
+BOTH coefficients — `emission ∝ emis_c·ρ` and `dτ = absb_c·ρ`. Linear coupling means high
+density mathematically *forces* high luminosity: optically-thick **non-luminous** matter
+(dark dust lanes) is impossible.
+
+**The fix — two decoupled fields.** Split ρ into an emitting (ionized-plasma) phase and an
+absorbing (cold dust/neutral-gas) phase:
+
+```
+ρ_hot   → emission   (the existing density field, renamed; ionized plasma)
+ρ_cold  → absorption (NEW decoupled field; a PURE absorber — never emits)
+
+emission = emis_c · ρ_hot · [f_PT] · g_eff⁴ · chroma · ds        # CKS-11 / Formula 9, ρ→ρ_hot
+dτ⃗      = κ⃗ · ρ_cold · ds                                        # κ⃗ a 3-vector (grey: R=G=B today)
+```
+
+The front-to-back update (CKS-14) becomes **per-channel** (componentwise ⊙):
+
+```
+w        = 1 − exp(−dτ⃗)
+disk_col += T⃗ ⊙ (w · S)            # S = (emis_c/absb_c)·[f_PT]·g_eff⁴·chroma  (CKS-14, density-free)
+T⃗        *= exp(−dτ⃗)               # T⃗ = vec3 transmittance
+```
+
+**Hybrid tunable correlation (owner decision).** ρ_cold's log-density modulator is tied to
+the hot one by a single coefficient `χ = disk.multiphase.dust_correlation ∈ [−1, 1]`:
+
+```
+m_hot   = Σ_i amp_i·(n_i − bias_i)                       # the existing CKS-12 §4 layer-stack sum
+m_dust  = independent fBm modulator                      # NEW; own seed offset NSEED_DUST
+m_cold  = χ · m_hot + √(1 − χ²) · m_dust                  # Pearson-correlation construction
+ρ_cold  = gauss(ζ; σ_cold) · exp(clamp(a_cold·m_cold, ±m_max)) · edge_window
+ρ_hot   = gauss(ζ; σ_hot)  · exp(clamp(m_hot,        ±m_max)) · edge_window     # today's ρ
+```
+
+- `χ = −1` ⇒ dust dense where plasma is thin (clean anti-correlated lanes; default look ≈ −0.6).
+- `χ =  0` ⇒ fully independent dust (chaotic; can occlude bright regions).
+- `χ = +1` ⇒ dust tracks plasma (completeness; rarely useful).
+- **Variance preservation:** because `χ² + (√(1−χ²))² = 1`, `Var(m_cold)` is constant for all
+  χ (when `m_hot`, `m_dust` are unit-variance and independent) — sweeping the dial does not
+  breathe contrast. This is the same variance-stability spirit as CKS-12 §2 `variance_preserve`.
+
+**Chromatic extinction (Task 7, wired 2026-06-18).** κ⃗ is a 3-vector `κ⃗ = absb_c·extinction_rgb`
+(`disk.extinction_rgb`, default grey `[1,1,1]` ⇒ neutral darkening). Setting `κ_R < κ_G < κ_B`
+makes the cold medium absorb blue more than red, so light surviving through it is reddened —
+dust lanes go warm/brown like real astrophysical dust. The march carries the per-channel optical
+depth `dτ⃗` and a vec3 transmittance `T⃗`; with R=G=B every channel stays equal and the scalar
+single-phase march is reproduced **bit-for-bit** (golden frames unshifted, constraint 6).
+Implementation note: Task 5 left the march scalar, so Task 7 also promoted the running `transm`
+to vec3 and widened `disk_buf` (H,W,4)→(H,W,6) so `T⃗` survives into the background composite
+(`col = disk_col + T⃗ ⊙ bg`); `extinction_rgb` is a runtime kernel arg (no `_MP_COMPILE`-style
+gate), so it tunes per render with no extra recompile beyond this one-time march-structure change.
+
+**Hard constraints (violating any is a physics bug, not a style choice):**
+1. **ρ_cold never emits.** It enters ONLY `dτ⃗`, never `j`. (This decoupling IS the formula.)
+2. **The self-shadow deep-shadow-map (CKS-15/17) measures ABSORPTION**, so when multiphase is
+   ON it bakes τ from `ρ_cold` (the absorber), not `ρ_hot`. (Correctness coupling — τ ≡ ∫κ·ρ_cold ds.)
+3. **The Pipe-B vertical step cap (CKS-16 / step-convergence guard) resolves the THINNER of
+   σ_hot, σ_cold** (worst case) so neither slab aliases.
+4. **g-bookkeeping unchanged:** emission carries `g_eff⁴·chroma` exactly once (no g⁸ double-count);
+   ρ_cold/κ⃗ touch no `p_μ`/`u^μ`/`g`/`g⁴`/`f_PT`.
+5. **κ⃗ is a 3-vector** at the type level even in grey mode (the chromatic-ready structure).
+
+**Back-compatibility (bit-identical when OFF).** `disk.multiphase.enabled=false` (or an absent
+block) ⇒ `ρ_cold ≡ ρ_hot`, `σ_cold = σ_hot`, `κ⃗` grey ⇒ `dτ⃗` is three equal components ⇒ `T⃗`
+stays equal across channels ⇒ the march reproduces the scalar single-phase result **exactly**.
+The shadow bake and step cap also read ρ_hot as today. Golden frames untouched (constraint 6).
+
+**Config (additions to `disk:`):** `multiphase.{enabled, dust_correlation χ, dust_amp a_cold,
+dust_sigma_frac (σ_cold/σ_hot)}`; `absorption_coeff` becomes the grey κ (broadcast to κ⃗, and
+accepts a future `[kR,kG,kB]` list). **Implementation plan / guards:** CPU twin `m_dust`+χ-mix
+in `noise.py` (new `NSEED_DUST`) with a Pearson-correlation parity test
+(`tests/test_noise.py`); GPU `_disk_density_cks` returns `vec3(ρ_hot, ρ_cold, temp_factor)` and
+the march carries vec3 dτ/transmittance; silhouette acceptance
+(`tests/test_disk_multiphase.py::test_dust_carves_silhouette`); unchanged
+`test_gpu_regression.py` (flag-off ⇒ goldens bit-identical). **Depends on:** CKS-12 (density
+stack), CKS-14 (march). **Unblocks:** CKS-20 (needs ρ_cold/κ).
+
+---
+
+## Formula CKS-20 — Volumetric single-scattering + Henyey-Greenstein phase (ACTIVE — wired & validated 2026-06-19; PHYSICS)
+
+> **Status (2026-06-19): ACTIVE — wired & validated; default OFF (bit-identical).** Source brief
+> `tip.md` Pillar 3; design `docs/specs/2026-06-16-cinematic-volumetric-multiphase-scattering-design.md`
+> §C.1; plan `docs/plans/2026-06-19-pillar3-scattering-implementation.md`. PHYSICS (it adds the
+> scattering coefficient `σ_s` to the extinction and an in-scatter source), but — like CKS-14 — it is
+> an **assembly of already-verified machinery** (the CKS-17 inner-edge-ray τ + direction, the CKS-19
+> ρ_cold/κ, the standard HG phase). It touches NO geodesic/Doppler quantity. Gated behind
+> `disk.scatter.enabled` (default `false` ⇒ CKS-19/14 march bit-identical; `test_scatter_albedo_zero_identical`
+> pins it at atol 1e-6). **Code:** `src/renderer/taichi_renderer.py` `_hg_phase` / `_disk_scatter_cks`
+> + the beauty march (behind the `_SCATTER_COMPILE` `ti.static` gate); CPU twin `renderer.disk.hg_phase`.
+> **Tests:** `tests/test_disk_scatter.py` (6 — HG normalisation/forward-dominance, GPU↔CPU parity,
+> analytic assembly, albedo-0 identity, end-to-end rim-light). All decisions below ratified
+> 2026-06-19 (owner-approved). **Compile note:** the scatter-ON beauty mega-kernel is at LLVM's
+> super-linear optimisation ceiling — `_disk_scatter_cks` REUSES the emission march's `grey_dtau`
+> (does NOT re-inline `_disk_density_cks`; `σ_s·ρ_cold·ds = albedo·grey_dtau` byte-for-byte), and the
+> new `render.advanced_optimization` / `render.cfg_optimization` knobs (both default `true` =
+> Taichi's defaults) skip the IR/CFG passes for tests/look-dev (`--fast-compile` in `showcase_disk.py`).
+
+**The full transport equation** (`tip.md` Pillar 3):
+
+```
+dI/ds = j − (κ + σ_s) I + σ_s ∫_{4π} I(ŝ′) P(ŝ′, ŝ) dΩ′
+```
+
+The 4π in-scatter integral is intractable in a single front-to-back march. We adopt
+**single-scattering from the dominant illuminant** — the hot inner edge — reusing the CKS-17
+inner-edge-ray geometry. The integral collapses to one evaluated direction:
+
+```
+σ_s         = ϖ · κ                                      # single-scatter albedo ϖ = σ_s/(σ_s+κ) ∈ [0,1)
+dτ_ext⃗      = (κ⃗ + σ_s⃗) · ρ_cold · ds                    # scattering ALSO removes forward light
+J_scat(x,ŝ) = σ_s · P(cosθ_s) · I_src(x) · e^{−τ_src(x)}  # in-scattered radiance toward the camera
+cosθ_s      = ŝ_src · ŝ_view                              # illuminant direction · view direction
+P(cosθ)     = (1 − g_HG²) / [ 4π (1 + g_HG² − 2 g_HG cosθ)^{3/2} ]      # Henyey-Greenstein
+```
+
+- **`τ_src(x)` is ALREADY BAKED:** it is the CKS-15/17 deep-shadow-map (absorption optical depth
+  from the inner-edge illuminant to x). `e^{−τ_src}` is exactly today's `shadow_atten`.
+- **`ŝ_src(x)`** = the inner-edge ray direction at x (the CKS-17 tilted ray); store/derive at bake.
+- **`I_src(x)`** = the inner-edge illuminant radiance (its own CKS-11 inner-edge T color/brightness).
+- **March term:** `disk_col += T⃗ ⊙ (J_scat · ds)`, attenuated by the running `T⃗` like emission;
+  extinction uses `dτ_ext⃗` (κ+σ_s) so energy leaving the forward path is conserved.
+- **`g_HG > 0.5` (forward)** deflects inner-edge light through optically-thin cloud edges toward
+  the camera — the rim-light / "silver-lining" of `tip.md` §3.2. `g_HG = 0` ⇒ isotropic; `< 0` back.
+- **Aggregate vs limb (scene-dependent) — empirical, 2026-06-19.** Whether the forward (`g>0`) or
+  backward (`g<0`) lobe dominates the *aggregate* rim brightening depends on the camera/illuminant
+  geometry, NOT on the kernel. For a sample that is genuinely BACK-lit (the inner edge sits behind
+  it from the camera, `cosθ_s→+1`) the forward lobe delivers the silver-lining limb. But for the
+  canonical frame-0 EDGE-ON camera most visible dust is FRONT-lit (camera and inner edge on the
+  same side of the sample ⇒ `cosθ_s<0`), so the broad back-scatter haze dominates the total while
+  the forward silver-lining is a smaller *localized* limb — measured: `g=−0.6` brightens ≈25× more
+  area than `g=+0.6` on that camera, and scatter-ON *net-darkens* the frame (σ_s adds opacity on top
+  of κ; single-scatter re-injects only the inner-glow bounce, not the disk's own lost forward
+  emission). The `cosθ_s`/HG code matches this spec exactly (`test_disk_scatter_cks_analytic` pins
+  the assembly); `test_scatter_rim_light` therefore asserts the *true* observables — rim light lands
+  on dim edges + the lobe is directional + σ_s removes forward light — not a (false) net-brighten.
+  To showcase the forward silver-lining specifically, frame a genuinely back-lit limb.
+
+**Reduction / back-compatibility.** `disk.scatter.enabled=false` ⇒ `σ_s = 0` ⇒ `dτ_ext⃗ = κ⃗·ρ_cold·ds`
+and no `J_scat` term ⇒ **exactly CKS-19** (and with multiphase also off, exactly the legacy
+single-phase march). Default OFF ⇒ goldens bit-identical (constraint 6).
+
+**Hard constraints:**
+1. **Single-scatter is a flagged approximation** of the physical in-scatter (one illuminant,
+   single bounce) — same governance posture as CKS-15 (a viz approximation), but it DOES modify
+   the RTE, so it is PHYSICS-class and authored here, not a free art dial.
+2. **Energy bookkeeping:** light removed by `σ_s` from the forward beam is the light re-injected
+   by `J_scat` (to single-scatter order); do not also leave `σ_s` out of the extinction (that
+   would create energy from nothing).
+3. **No geodesic/Doppler contamination:** `J_scat`, `P`, `g_HG`, `ϖ` touch no
+   `p_μ`/`u^μ`/`g`/`g⁴`/`f_PT`. The inner-edge illuminant color may carry the CKS-11 inner-edge
+   emission spectrum, but the scattering kernel itself adds no new g factor.
+4. **Depends on CKS-19** (ρ_cold, κ⃗) **and CKS-17** (τ_src, ŝ_src). Not buildable before P2.
+
+**Decisions (ratified 2026-06-19, owner-approved):**
+- **`I_src` model:** physical inner-edge ring radiance — `I_src = blackbody_chroma(T_inner)·inner_glow`,
+  `T_inner = T_0·(6/r_inner)^0.75` (the SIMPLE model at r_inner, used regardless of
+  `disk.temperature_model`; the Page-Thorne f_PT(r_inner)→0 at the ISCO edge would blacken the
+  illuminant). `inner_glow` is a free amplitude dial; the COLOR is tied to the disk's own inner edge.
+- **`σ_s` parametrization:** `σ_s = ϖ·κ` (grey), one albedo dial `ϖ = disk.scatter.albedo ∈ [0,1)`.
+  `κ` is the grey `absorption_coeff`. The scattered light is colored by `I_src`, not `σ_s`.
+- **`g_HG`:** a SINGLE forward HG lobe, default `g_HG = 0.6`. No two-term (forward+back) lobe — the
+  single lobe delivers the rim-light; a second lobe is deferred (revisit only if back-scatter haze
+  is wanted).
+
+**Geometry (straight CKS rays, derived in-march — NOT baked):**
+- `ŝ_src(x) = normalize(x − x_inner)`, `x_inner = (r_inner·cosφ, r_inner·sinφ, 0)`, `φ = atan2(y,x)` —
+  the midplane inner-edge illuminant at the sample's azimuth.
+- `ŝ_view(x) = normalize(x_cam − x)` — the camera direction (camera position is a kernel arg).
+- `cosθ_s = ŝ_src·ŝ_view`. Both are STRAIGHT CKS rays (not geodesics), the same VISUALIZATION
+  posture as the CKS-17 shadow ray, so the scattering angle is a pure geometric dot product — no
+  metric, no p_μ (constraint 3).
+
+**March assembly (single extinction; ρ_cold in J_scat — energy-consistent):**
+- `dτ_ext⃗ = (κ⃗ + σ_s)·ρ_cold·ds` is the SINGLE per-step extinction, used for both the running
+  transmittance T⃗ AND the CKS-14 emission source-function factor f = (1−e^{−dτ})/dτ.
+- `J_scat·ds = σ_s·ρ_cold·P(cosθ_s)·I_src·e^{−τ_src}·ds` carries an EXPLICIT ρ_cold (constraint 2:
+  re-inject exactly the σ_s·ρ_cold·ds removed from the forward beam). Added as its own source —
+  `disk_col += T⃗ ⊙ (J_scat·ds)` — NOT through the emission f factor.
+
+**Config (additions to `disk:`):** `scatter.{enabled, albedo ϖ, hg_g, inner_glow}` (default OFF).
+**Implementation plan / guards:** reuse the baked `disk_shadow_tau` for `τ_src`; add `ŝ_src`
+storage to the CKS-17 bake; HG phase `@ti.func` (CPU twin + parity); the march adds the
+`J_scat·ds` term and switches extinction to `κ+σ_s`; `tests/test_disk_scatter.py`
+(forward-scatter rim-light brighter than isotropic; energy sanity) + unchanged
+`test_gpu_regression.py` (flag-off ⇒ goldens bit-identical).
+
+---
+
+## Formula CKS-21 — Scale-dependent shear cascade (owner-approved 2026-06-20; VISUALIZATION, NOT a metric)
+
+> **Status:** same VISUALIZATION class as CKS-12 §2 / CKS-18 — it warps the disk-noise
+> **coordinate** only (a per-octave azimuthal offset). It may not touch `p_μ`, `u^μ` (CKS-8),
+> `g` (CKS-9), `g⁴` (Formula 9), `f_PT` (CKS-11), or the chroma form. Spec:
+> `docs/specs/2026-06-20-P1-shear-cascade-design.md`.
+
+CKS-12 §2 applies the Keplerian shear `φ′_k = φ − Ω(r)·a_k·T` **uniformly to the whole fBm**,
+so every octave winds at the same rate and fine detail laminarizes into the same spiral as the
+coarse structure. CKS-21 makes the shear **frequency-dependent**: per octave `o` of frequency
+`f_o = f_base·lac^o`,
+
+```
+S(f)     = 1 / (1 + (f / f_c)^p)                       # transfer: low f → 1, high f → 0
+shear_k  = dynamism · Ω(r) · (a_k · T)                 # the CKS-12 §2 shear amount, unchanged
+φ′_{o,k} = φ − S(f_o) · shear_k                         # intuitive form (no curl)
+```
+
+**Composition with the CKS-18 curl warp (the implementation form).** The curl warp is nonlinear
+and is applied to the already-sheared `φ_k` (CKS-18 §2). To keep that order (and bit-identity
+when `S≡1`), the cascade is a per-octave **de-shear add-back** applied *after* curl:
+
+```
+φ_k       = φ − shear_k                                 # full §2 shear, before curl (UNCHANGED)
+φ_c       = curl_φ(u, φ_k)                              # CKS-18 warp on φ_k (UNCHANGED order)
+φ′_{o,k}  = φ_c + (1 − S(f_o)) · shear_k                # per-octave correction (the cascade)
+```
+
+`S(f_o) ≡ 1` (cascade off / `f_c → ∞`) ⇒ correction `0` ⇒ CKS-12 §2 uniform shear bit-for-bit.
+C0-continuity at resets is preserved (the `w_k → 0` reset weight is independent of `S`).
+
+**Scope:** the density octave stacks L0 (`fbm2`), L2 (`fbm2`), and L1's `ridged3`. The L1
+Voronoi (single-frequency cellular — no octaves) and the L1 coverage mask + the §3 modulation
+envelopes keep uniform shear. Density φ is linear-Perlin (`gnoise`, integer-period wrap) — the
+constant-in-φ correction preserves the seam (constraint 5); no trig added.
+
+Config `disk.noise.shear_cascade`: `enabled` (default false), `shear_cutoff` = `f_c` (0 ⇒ a
+large sentinel ⇒ `S≡1`), `shear_falloff` = `p`. Base dials — no CKS-13 resolver change.
+
+---
+
+## Formula CKS-22 — Kelvin-Helmholtz edge erosion (VISUALIZATION)
+
+**Class:** VISUALIZATION (amplitude only). Amends CKS-12 §3. Never touches
+`p_μ`, `u^μ` (CKS-8), `g` (CKS-9), `g⁴` (Formula 9), `f_PT` (CKS-11), or chroma.
+
+Replaces the CKS-12 §3 *outer* multiplicative smoothstep envelope with a
+noise-thresholded soft-Heaviside clip, shredding the outer rim into vacuum
+(tearing/fraying instead of a clean falloff). The inner edge (`r_in_eff ≥ r_isco`,
+zero-torque BC, CKS-12 constraint 3) is NOT eroded.
+
+The CKS-12 §3 ragged-edge windows exist ONLY inside the §3 modulation branch
+(`disk.noise.modulation.enabled`): there `win_in = smoothstep(r_in_eff, r_in_eff+soft, r)`
+and `win_out(r) = 1 − smoothstep(r_out_eff − soft, r_out_eff, r) ∈ [0,1]` replace the
+hard radial cutoffs. Erosion therefore lives in that same assembly and clips `win_out`.
+With erosion ON:
+
+```
+N_KH(u,φ,ζ;t) ∈ [0,1]   = high-freq simplex (own seed NSEED_KH), advected by the
+                          CKS-12 §2 dual-phase shear (material frame), convex
+                          triangle weights ⇒ stays in [0,1].
+win_out' = smoothstep( 0, w_soft,  win_out − τ_KH·N_KH )      # the clip REPLACES win_out
+win      = win_in · win_out'                                   # win_in unchanged (inner edge)
+ρ        = gauss · density_mult · win                         # both ρ_hot and ρ_cold share win
+```
+
+- `τ_KH ∈ [0, 1 − w_soft]` (clamped). This bound guarantees **interior immunity**:
+  where `win_out = 1`, `win_out − τ_KH·N_KH ≥ w_soft ⇒ smoothstep = 1` (untouched);
+  only the transition band (`win_out < 1`) tears.
+- `w_soft` (soft-Heaviside half-width on the [0,1] envelope) has a step-cap floor
+  (constraint 4): the resulting spatial edge width `≈ w_soft·soft` must span ≥ one
+  capped vertical step (k_soft = 1):
+  `w_soft ≥ max_step_vfrac · σ_θ(r_outer) / soft`,  σ_θ(r_outer) = r_outer·σ0.
+- **Shared envelope (with CKS-19):** the clip multiplies the SHARED `win` BEFORE the
+  hot/cold split, so a torn finger removes emission AND absorption together
+  (silhouette-correct frayed dust lanes). When multiphase is off this is the single ρ.
+- **Coupling note:** erosion clips the §3 `win_out`, so it requires
+  `disk.noise.modulation.enabled` (the only producer of a soft outer edge); with
+  modulation off the outer cutoff is hard and there is nothing to erode (the clip
+  branch is skipped). v1 scope — decoupling erosion from §3 would duplicate the
+  edge-window machinery and is deferred.
+- **Bit-identity (constraint 6):** the clip is emitted only under a `ti.static`
+  `_EROS_COMPILE` gate (like `_MP_COMPILE`/`_SCATTER_COMPILE`) so an off-default render
+  keeps the original mega-kernel JIT (the `_kh_field` 2× simplex is never inlined when
+  off). `edge_erosion.enabled = false` (or block absent) ⇒ `_EROS_COMPILE = False` ⇒ the
+  clip vanishes, `win_out` is the unmodified CKS-12 §3 smoothstep ⇒ golden frames
+  unchanged. Toggling `enabled` recompiles; once compiled, the runtime `strength`/`enabled`
+  slots tune per render.
+
+**Config:** `disk.edge_erosion {enabled, strength=τ_KH, freq_u, freq_phi(int), freq_z,
+octaves, soft_width(0⇒auto floor), seed}`. Base dials only — no CKS-13 resolver change.
+
+---
+
+## Formula CKS-23 — Fractal LOD octave cascade (SAMPLING)
+
+**Class:** SAMPLING (sampling-rate only). Extends Formula 10 (screen-space LOD) to the
+disk-noise octave loop. Never touches `p_μ/u^μ/g/g⁴/f_PT`/chroma — it only chooses how
+many noise octaves a sample evaluates.
+
+Per disk sample at camera distance `d` (isotropic scalar footprint, matching Formula 10's
+`J = max(Jx,Jy)` philosophy):
+
+```
+ε        = fov_y / HEIGHT                         # pixel cone half-angle (rad)
+J        = ε · d                                  # world-space footprint at the sample
+n_oct    = clamp( N_max − log₂(J / J₀),  N_min,  N_max )    # fractional target octave count
+g_o      = clamp( n_oct − o,  0,  1 )             # per-octave weight: 1 below cutoff,
+                                                  #   fractional at the top (anti-pop), 0 above
+fBm:  total = Σ_{o<N_max} g_o·gain^o·noise(coord·lac^o),   norm = Σ_{o<N_max} g_o·gain^o
+```
+
+Gating BOTH `total` and `norm` by `g_o` keeps normalization exact, so the disabled/full
+path is bit-identical (constraint 6): with `n_oct ≥ N_max` every `g_o = 1` and the loop
+reproduces the ungated fBm exactly (`x·1.0 == x` in IEEE float). The top partial octave
+crossfades via the fractional `g_o ∈ (0,1)` ⇒ no integer popping as `n_oct` varies with
+distance.
+
+- The gated fBm reuses the EXISTING `fbm2` primitive (Perlin gradient `gnoise2`, NOT simplex)
+  via the shared octave loop, so the `g_o ≡ 1` path is the present `fbm2_ti` byte-for-byte.
+- `J₀` is a **base dial** (no CKS-13 resolver change): the footprint at which `n_oct = N_max`.
+- `N_max` is the anchor octave count at `J = J₀` and should satisfy `N_max ≥ disk.noise.layers.*.octaves`
+  so close-ups keep the FULL native stack. v1 does NOT inject octaves beyond a layer's native
+  `octaves` (the loop bound is the layer's own `octaves`; `n_oct` only *gates down* from it) —
+  the cascade is anti-aliasing (drop sub-pixel octaves far away), not detail synthesis.
+- **Bit-identity:** the loop bound is always the layer's OWN native octave count (the existing
+  `octaves` dial); `lod.enabled = false` ⇒ the march feeds the sentinel `n_oct = _LOD_OFF`
+  (`1e9`, ≥ every layer's native octaves) ⇒ every `g_o = clamp(1e9−o,0,1) = 1` over exactly
+  those native octaves ⇒ `fbm2_lod_ti == fbm2_ti` bit-for-bit (×`1.0` is an exact f32 op, in
+  BOTH the numerator and the denominator). Because that equality is exact, the gated primitive
+  is ALWAYS compiled — there is **no** `ti.static` recompile gate (unlike CKS-19/20/22) and the
+  goldens are unshifted. The shadow bake always passes `_LOD_OFF` (full detail, distance-
+  independent — there is no camera in the bake), as do the per-primitive parity-test callers,
+  via the `n_oct = _LOD_OFF` default on every threaded hop.
+- **v1 scope (logged cap):** gates only the fBm density layers (L0 base streaks, L2 patch, and
+  the L1 coverage mask) — the dominant high-freq aliasing source. The L1 ridged-MF/Voronoi
+  clump octaves and the §3 modulation/curl noise are NOT gated (lower-frequency structural
+  fields). Octaves-only (no `dλ` step coarsening, which couples to the Pipe-B step cap +
+  self-shadow bake); isotropic scalar `J`. Anisotropic per-axis `J` and `dλ` deferred.
+  Prerequisite for the V4 free camera (kills macro-view shimmer, resolves close-up wisps).
+
+**Config:** `disk.lod {enabled, n_max, n_min, j0}` (defaults `6.0 / 2.0 / 0.02`; set
+`n_max ≥` the largest gated layer's `octaves` — L0 = 5 — so close-ups keep full detail).
+`ε = vertical_fov / HEIGHT` is NOT stored: `_setup_disk_noise` seeds it from the config
+camera/resolution and `render_beauty_frame` refreshes `_NI_LOD_EPS` per frame from the actual
+cam fov / render height. Base dials only — no CKS-13 resolver change.
 
 ---
 
@@ -952,11 +2073,20 @@ Record the chosen options here once decided and reference them in `CLAUDE.md`.
 skills/kerr-physics/SKILL.md     ← this file
 src/renderer/geodesic.py         ← Formulas 1, 6, 7
 src/renderer/disk.py             ← Formulas 2, 3, 4, 5, 8, 9
+src/renderer/noise.py            ← (D2.1–D2.4, 2026-06-13) CKS-12 noise primitives + noise_density_mult stack (§2 shear advection) + noise_modulation_fields (§3 T/edge/height envelopes) — CPU source of truth + @ti.func twins; (V1.5) §3.6 isotropic simplex basis snoise2/3 + sfbm2/3 (Perlin/Gustavson; non-periodic; the V3 curl potential basis); (V3.0, CKS-18) curl_warp + curl_warp_ti — in-plane divergence-free domain warp of the noise coordinate (sfbm3 scalar potential on the (cosφ,sinφ,u) cylinder embedding, central-FD curl), applied at the entry of _disk_noise_m / _mod_fbm4 behind disk.noise.curl.enabled; (V3.1, CKS-18 §2) curl_warp/curl_warp_ti gain (t_disk, flow_period) + _curl_psi_ti — time-dependent ψ via the §2 dual-phase reset blend (disk.noise.curl.flow_period_M; ≤0 ⇒ static V3.0)
+src/renderer/taichi_renderer.py  ← (D2.3+D2.4) _disk_noise_density_mult (§2 density advection) + _disk_noise_mod_fields (§3 vec4 envelopes) + _smoothstep_ti edge windows + _setup_disk_noise param buffer (_NOISE_N=43); _disk_emit_cks / render_beauty_physics gained r_isco; t_disk threaded through render_beauty_frame{,_mb}; (V3.1, CKS-18 §2) t_disk threaded into _disk_noise_m / _mod_fbm4 → _disk_curl_warp + _NI_CURL_FLOWP slot (_NOISE_N=53) for curl-flow advection
+src/renderer/kerr_params.py      ← Formula CKS-13 config resolver (derived r_plus/r_isco/r_inner/T_0/dynamics; V2 CKS-16 derives flare_beta + theta_half_bound)
+src/renderer/taichi_renderer.py  ← (CKS-20, 2026-06-19) _hg_phase (Henyey-Greenstein @ti.func; CPU twin renderer.disk.hg_phase) + _disk_scatter_cks (single-scatter source vec4(J_rgb, σ_s·ρ_cold·ds), reuses the march's grey_dtau) + the beauty march's σ_s extinction & J_scat injection, behind the _SCATTER_COMPILE ti.static gate (disk.scatter.enabled, default OFF ⇒ CKS-19 bit-identical); setup_renderer reads render.advanced_optimization/cfg_optimization JIT knobs
+src/renderer/noise.py            ← (CKS-23, 2026-06-20) lod_noct + lod_octave_weight + fbm2_lod (CPU) / fbm2_lod_ti (@ti.func gated fBm — gates total AND norm by g_o=clamp(n_oct−o,0,1); n_oct≥n_max ⇒ fbm2 bit-for-bit) — fractal LOD octave cascade
+src/renderer/taichi_renderer.py  ← (CKS-23, 2026-06-20) per-sample J=ε·d_cam → n_oct in render_beauty_physics, threaded through _disk_emit_cks → _disk_density_cks → _disk_blended_m/_disk_cold_mult_from_hot → _disk_noise_m's L0/L2/L1-mask fbm2 calls (gated to fbm2_lod_ti); _NI_LOD_{EN,NMAX,NMIN,J0,EPS} slots, behind disk.lod.enabled (default OFF ⇒ n_oct≡native octaves ⇒ bit-identical); bake passes the native sentinel
+src/renderer/taichi_renderer.py  ← (CKS-22, 2026-06-20) _kh_field (high-freq simplex N_KH, §2-advected twin of noise.kh_field) + the win_out soft-Heaviside clip H_soft(win_out − τ_KH·N_KH) inside _disk_density_cks's §3 modulation branch (shared envelope — erodes ρ_hot & ρ_cold together), behind the _EROS_COMPILE ti.static gate (disk.edge_erosion.enabled, default OFF ⇒ CKS-12 §3 smoothstep bit-identical, JIT unchanged); φ via the CKS-18 cylinder embedding (seamless); noise.py kh_field + kh_erode_winout CPU twins + NSEED_KH
+src/renderer/taichi_renderer.py  ← (V2, CKS-16) flared σ_θ(r)=σ0·(r/r_inner)^β in the shared _disk_density_cks (skipped at β=0); sigma_theta0/flare_beta/theta_half_bound threaded through _disk_emit_cks / bake_disk_shadow / render_beauty_physics / render_beauty_frame; behind disk.volumetric.flare.enabled
+src/renderer/taichi_renderer.py  ← (V1.0) shared @ti.func _disk_density_cks (Gaussian×§3 noise×edge window — single source for the emit march AND the CKS-15 shadow bake); (V1.1, CKS-14) source-function march in render_beauty_physics behind disk.volumetric.source_function (_RTE_TAU_EPS divide guard); (V1.2, CKS-15) disk_shadow_tau field + bake_disk_shadow kernel + _sample_shadow_tau trilinear lookup behind disk.volumetric.self_shadow.enabled (_setup_disk_shadow allocates; _SHADOW_U_MAX/_SHADOW_ZETA_MAX baked extents); (V2, CKS-17) bake_disk_shadow rewritten to a 3D inner-edge-ray march (radial+vertical self-shadow; CKS-15 is its ζ=0 limit) — same field/lookup/application, same flag
 src/renderer/starmap.py          ← Formula 10
 src/renderer/taichi_renderer.py  ← Formulas 10, 13 (screen-space Jacobian, μ, star splat)
 scripts/ingest_stars.py          ← Formula 13 catalog pre-processing (HYG/ATHYG csv or BSC5 → {θ′, φ′, flux_rgb}.npy; I_base·chroma folded into flux)
 tests/test_geodesic.py           ← Conservation tests (Formula 6 conserved quantities)
-configs/render.yaml              ← a, r_isco, WIDTH, HEIGHT, step counts, stars:*
+configs/render.yaml              ← BASE params only: a, WIDTH, HEIGHT, step counts, stars:* (r_isco/r_plus/r_inner/T_0 derived at load — CKS-13)
 ```
 
 ---
@@ -966,6 +2096,18 @@ configs/render.yaml              ← a, r_isco, WIDTH, HEIGHT, step counts, star
 | Version | Change |
 |---|---|
 | v1.0 | Initial release |
+| v1.35 | **Formula CKS-21 authored (2026-06-20) — scale-dependent shear cascade / frequency-dependent shear transfer (VISUALIZATION), extends CKS-12 §2.** Makes the §2 Keplerian shear frequency-dependent so coarse disk-noise octaves wind into filaments while high-frequency octaves are protected from laminarizing into the same spiral (Kolmogorov-like). Per octave `o` of frequency `f_o = f_base·lac^o`, the transfer `S(f)=1/(1+(f/f_c)^p)` (low f→1, high f→0); implemented as a per-octave **de-shear add-back** `φ′_{o,k} = curl_φ(φ−shear_k) + (1−S(f_o))·shear_k` (`shear_k = dynamism·Ω(r)·a_k·T`) so the CKS-18 shear→curl order is UNCHANGED and `S≡1` reproduces the CKS-12 §2 uniform shear bit-for-bit. Threads through the shared CPU `_octaves` generator (`fbm2`/`fbm2_lod`/`ridged3`) + the GPU `fbm2_lod_ti`/`ridged3_ti` twins; scope = density octave stacks L0/L2/L1-`ridged3` (L1 Voronoi/mask + the §3 modulation envelopes keep uniform shear). Density φ is linear-Perlin (integer-period wrap), so the constant-in-φ correction preserves the φ-seam (constraint 5; no trig added). Config `disk.noise.shear_cascade {enabled, shear_cutoff=f_c, shear_falloff=p}` — base dials, no CKS-13 resolver change; `_NI_SC_{EN,FC,P}` slots (`_NOISE_N` 69→72). **Bit-identity:** `enabled:false` (or absent) ⇒ `shear_k=0` sentinel default ⇒ `(1−S)·0=0` ⇒ always-compiled, goldens bit-identical (constraint 6; the CKS-23 no-`ti.static`-gate precedent), and `f_c ≥ SHEAR_FC_OFF=1e9` short-circuits `S≡1` (skips the `pow`). Spec: `docs/specs/2026-06-20-P1-shear-cascade-design.md`; plan `docs/specs/2026-06-20-P1-shear-cascade-plan.md`. |
+| v1.34 | **Formula CKS-23 authored (2026-06-20) — fractal LOD octave cascade (SAMPLING), extends Formula 10.** Per disk sample, `n_oct = clamp(N_max − log₂(ε·d/J₀), N_min, N_max)` (ε=fov_y/HEIGHT, d=camera distance) gates the fBm density octaves by a smooth per-octave weight `g_o = clamp(n_oct−o, 0, 1)` — far views drop shimmering sub-pixel octaves, close-ups keep the full native stack, with no integer popping (the top partial octave crossfades). New gated primitive `fbm2_lod_ti`/`noise.fbm2_lod` gates BOTH `total` and `norm` so normalization is exact ⇒ the `g_o≡1` path is `fbm2` byte-for-byte. `J₀`/`N_max`/`N_min` are base dials (`disk.lod`, no CKS-13 change). Threaded `n_oct` through `render_beauty_physics → _disk_emit_cks → _disk_density_cks → _disk_blended_m/_disk_cold_mult_from_hot → _disk_noise_m` (L0/L2/L1-mask only — v1 scope); `_NI_LOD_{EN,NMAX,NMIN,J0,EPS}` slots (`_NOISE_N` 64→69). **Bit-identity:** `lod.enabled:false` ⇒ each layer gates over its OWN native octave count with `n_oct=native` ⇒ every `g_o=1` ⇒ ungated (constraint 6); the shadow bake always passes the native sentinel (no camera). Octaves-only (no `dλ`), isotropic scalar `J`; anisotropic/`dλ` deferred. Prerequisite for the V4 free camera. | **Formula CKS-22 authored (2026-06-20) — KH outer-edge threshold erosion (VISUALIZATION), amends CKS-12 §3.** Replaces the §3 outer smoothstep envelope with a soft-Heaviside clip `win_out' = H_soft(win_out − τ_KH·N_KH, w_soft)`, where `N_KH ∈ [0,1]` is a high-freq simplex advected by the SAME §2 dual-phase shear as the density (own seed `NSEED_KH`). The outer rim tears into vacuum (fingers/holes) instead of a clean falloff. **Interior immunity** via the clamp `τ_KH ≤ 1−w_soft` (where `win_out=1` the clip stays 1); **step-cap floor** `w_soft ≥ max_step_vfrac·σ_θ(r_outer)/soft` (k_soft=1) keeps the torn edge resolved. Clips the **shared** `win` before the hot/cold split, so under CKS-19 emission AND absorption fray together (silhouette-correct lanes). Lives inside the §3 modulation branch (the only producer of a soft `win_out`), so requires `disk.noise.modulation.enabled`; decoupling deferred. Config `disk.edge_erosion` (base dials, no CKS-13 change); default OFF ⇒ the §3 smoothstep is bit-identical (constraint 6). |
+| v1.32 | **Formula CKS-20 WIRED & validated (2026-06-19) — volumetric single-scattering + Henyey-Greenstein rim-light.** The beauty march now (behind `disk.scatter.enabled`, default OFF) adds the scattering coefficient to the extinction (`dτ_ext⃗ = (κ⃗+σ_s)·ρ_cold·ds`, `σ_s = ϖ·κ`) and a single-scatter source from the hot inner edge `J_scat·ds = σ_s·ρ_cold·P(cosθ_s)·I_src·e^{−τ_src}·ds` with a forward Henyey-Greenstein phase (`g_HG`, default 0.6). New `@ti.func` `_hg_phase` (GPU) + `renderer.disk.hg_phase` (CPU twin, parity-tested); new `@ti.func` `_disk_scatter_cks` returning `vec4(J_rgb, σ_s·ρ_cold·ds)`; both behind the `_SCATTER_COMPILE` `ti.static` gate so OFF ⇒ the CKS-19 march is bit-identical (constraint 6; `test_scatter_albedo_zero_identical` atol 1e-6). `I_src = blackbody_chroma(T_inner)·inner_glow`, `T_inner = T_0·(6/r_inner)^0.75` (SIMPLE model regardless of `temperature_model`); straight-CKS-ray geometry (no geodesic/Doppler contamination). **Compile:** `_disk_scatter_cks` reuses the emission march's `grey_dtau` rather than re-inlining `_disk_density_cks` (the double-inline exploded LLVM compile to 15 h / >50 GB; `σ_s·ρ_cold·ds = albedo·grey_dtau` byte-for-byte); plus new `render.advanced_optimization` / `render.cfg_optimization` JIT knobs (default `true`, skip the super-linear IR/CFG passes when `false` for tests/look-dev — `showcase_disk.py --fast-compile`; the offline cache keys on these flags). **Scene note (empirical):** for the canonical edge-on camera the visible dust is mostly front-lit (`cosθ_s<0`), so back-scatter (`g<0`) dominates the *aggregate* rim brightening ≈25× over forward, and scatter-ON net-darkens the frame (σ_s adds opacity; single-scatter re-injects only the inner-glow bounce); the forward silver-lining is a localized limb — see the CKS-20 'Aggregate vs limb' note. `test_scatter_rim_light` asserts the true observables (rim light on dim edges + directional lobe + σ_s removes forward light), not a net-brighten. Look-dev: `scripts/showcase_disk.py --scatter/--albedo/--hg-g/--inner-glow`. |
+| v1.31 | **Formula CKS-19 Task 7 WIRED (2026-06-18) — chromatic per-channel extinction.** The beauty march now carries a vec3 transmittance `T⃗` and per-channel optical depth `dτ⃗ = absb_c·extinction_rgb·ρ_cold·ds`; `extinction_rgb` (`disk.extinction_rgb`, default grey `[1,1,1]`) is the κ⃗ multiplier (`κ_B>κ_R` reddens cold-dust lanes like astrophysical dust). Task 5 left the march scalar, so this promoted `transm`→vec3 and widened `disk_buf` (H,W,4)→(H,W,6) so `T⃗` reaches the composite (`col = disk_col + T⃗ ⊙ bg` — the background reddens through dust too); the depth proxy keeps `transm[0]·Σadded` form so grey is bit-exact. `extinction_rgb` is a runtime kernel arg (3 new floats `ext_r/g/b` to `render_beauty_physics`), NOT a `_MP_COMPILE`-style compile gate, so it tunes per render. Self-shadow bake stays grey (scalar τ_s — chromatic τ_s not required). **Grey `[1,1,1]` ⇒ `T⃗` equal across channels ⇒ scalar-march bit-identical** (goldens unshifted, constraint 6); works on the MP-off path too (extinction is orthogonal to the ρ_hot/ρ_cold split). Guard: `tests/test_disk_multiphase.py::test_chromatic_extinction_reddens` (blue-weighted κ⃗ lets proportionally more red than blue survive), unchanged `test_gpu_regression.py` goldens. Look-dev: `scripts/showcase_disk.py` (config `disk.extinction_rgb`). |
+| v1.30 | **Formula CKS-19 WIRED (2026-06-16, owner planning-approved) — DESIGN→ACTIVE.** Multi-phase media now drives the production march: `_disk_density_cks` returns `vec3(ρ_hot, ρ_cold, temp_factor)`; **emission←ρ_hot**, **absorption (`dτ`) + the CKS-15 self-shadow bake←ρ_cold**. CPU twin `noise.dust_density_mult` (variance-preserving Pearson mix `m_cold = χ·m_hot + √(1−χ²)·m_dust`, dust field at `seed+NSEED_DUST=911`) ↔ GPU `_disk_cold_mult_from_hot` (shares the precomputed `m_hot`, one extra `_disk_blended_m` for `m_dust`). Vertical step cap resolves the thinner cold slab (`σ_cold = σ_hot·dust_sigma_frac`). **Grey scalar κ** (κ_R=κ_G=κ_B); the per-channel `dτ⃗` transmittance is the chromatic-ready extension, DEFERRED (Task 7). **`disk.multiphase.enabled: false` (default) ⇒ ρ_cold≡ρ_hot, σ_frac=1 ⇒ legacy single-phase march, golden frames bit-identical** (constraint 6). **JIT note:** the dust branch is emitted only when enabled (`ti.static` `_MP_COMPILE` gate added beside `disk_noise_params`), so toggling `enabled` forces a one-time kernel recompile while the OFF default keeps its original fast JIT (the alternative — a runtime `if` — inlined the noise stack 6× unconditionally and blew compile past 2 h). New GPU param slots `_NI_MP_{EN,CHI,AMP,SIGFRAC}` (`_NOISE_N` 53→57). Guards: `tests/test_noise.py` (CPU `dust_density_mult` correlation/variance parity), `tests/test_disk_noise.py::test_rho_cold_gpu_matches_cpu` (GPU `[1]`==CPU `dust_density_mult`) + `::test_multiphase_off_bit_identical` (OFF beauty frame bit-identical with a non-default `dust_sigma_frac`), `tests/test_disk_multiphase.py::test_dust_carves_silhouette` (B.1 acceptance — anti-correlated dust darkens a region + makes a new darkest pixel), unchanged `test_gpu_regression.py` (default-off goldens bit-identical). Config: `disk.multiphase` block (sibling of `disk.noise`). Plan `docs/plans/2026-06-16-pillar2-multiphase-implementation.md`. |
+| v1.29 | **Formulas CKS-19 + CKS-20 ADDED (DESIGN, owner planning-approved 2026-06-16; PHYSICS; NOT yet wired).** Foundation for the `tip.md` cinematic-volumetric roadmap (full plan `docs/specs/2026-06-16-cinematic-volumetric-multiphase-scattering-design.md`). **CKS-19 — multi-phase media:** split the single mass density into `ρ_hot` (emission `j`) and a decoupled pure-absorber `ρ_cold` (absorption `κ⃗`), making optically-thick non-luminous dust lanes possible (impossible under the j∝ρ, κ∝ρ coupling). Owner decisions: **hybrid tunable correlation** `m_cold = χ·m_hot + √(1−χ²)·m_dust`, χ∈[−1,1] (variance-preserving), and **grey-now/chromatic-ready** κ⃗ as a 3-vector (R=G=B today). Self-shadow bakes from ρ_cold; step cap resolves the thinner slab; g⁴-not-g⁸ unchanged. **CKS-20 — single-scattering + Henyey-Greenstein:** add `σ_s=ϖ·κ` to the extinction and an in-scatter source `J_scat = σ_s·P(cosθ)·I_src·e^{−τ_src}` from the inner-edge illuminant, REUSING the CKS-17 deep-shadow τ as `τ_src` and the CKS-11 inner-edge color — forward-scatter (g_HG>0.5) gives cloud rim-light. Both gated OFF by default (bit-identical goldens — constraint 6); CKS-19 unblocks CKS-20; CKS-20 depends on CKS-17. CKS-21/22/23 (shear cascade, KH erosion, LOD octaves — VISUALIZATION/SAMPLING) reserved with formal equations in the design doc, to be promoted when spec'd. |
+| v1.28 | **Formula CKS-18 §2 ADDED + WIRED — curl-flow advection (owner-approved 2026-06-14, V epoch V3.1). NOT a physics revision — VISUALIZATION, same governance class as CKS-18 §1 / CKS-12 §2.** Makes the V3.0 static curl potential ψ **time-dependent** so the eddies boil over `t_disk`, composed additively on the §2 Keplerian shear. **Owner decisions: Option A** (mirror the CKS-12 §2 dual-phase reset blend, applied to ψ) **+ clock B1** (new independent base dial `disk.noise.curl.flow_period_M = T_c`, no CKS-13 resolver change). Mechanism: `ψ = ω_0ψ_0 + ω_1ψ_1`, `ω_k = 1−|2α_k−1|`, `α_k = frac(s_c+k/2)`, `s_c = t_disk/T_c`, per-cycle reseed `seed + k·NCYC_PHASE + γ_k·NCYC_CYCLE` (reusing the §2 strides); the central difference runs over the blended ψ. **All three V3.0 invariants survive:** divergence-free (curl linear ⇒ convex combo of div-free fields), seamless per phase (cylinder embedding), C0-continuous through reseeds (`ω_k → 0` at each reset — the §2 property on the time axis). **`flow_period_M ≤ 0` (default/absent) ⇒ the V3.0 static warp bit-for-bit** (regression hook; mirror of §2's `shear_period ≤ 0`), and `T_c` decoupled from the shear clock ⇒ the curl boils even on the static-shear path. **No `flow_dynamism` gain (flagged, NOT shipped):** a pure reset-blend has no continuous displacement to scale C0-safely independent of the reseed cadence (unlike §2's separable `Ω·a_k·T`); a boil-rate-vs-cadence dial needs the deferred Option-B 4-D `sfbm4` time axis. Texturing only — never `p_μ`/`u^μ`/`g`/`g⁴`/`f_PT`/chroma-form; a continuity-equation fluid solve still STOPs for skill extension. New code: `noise.py` `curl_warp`/`curl_warp_ti` gain `(t_disk, flow_period)` + `_curl_psi_ti` (the dual-phase potential); `taichi_renderer.py` threads `t_disk` through `_disk_noise_m`/`_mod_fbm4` → `_disk_curl_warp` + new `_NI_CURL_FLOWP` slot (`_NOISE_N` 52→53). Gated by `disk.noise.curl.enabled` + `flow_period_M > 0` ⇒ bit-identical to V3.0 when off. Guards: `tests/test_noise.py` §2 (div-free at several t, seamless at each t, C0 through resets, static-fallback bit-identity, evolution+determinism — 5 new, CPU 49) + `tests/test_noise_gpu.py` `test_curl_flow_twin_matches_reference` (time-blend twin parity to `amp·_SATOL/fd_eps`) + `tests/test_disk_noise.py` `test_curl_flow_advection_matches_cpu_and_animates` (end-to-end `t_disk → _disk_curl_warp` threading + animates) + unchanged `test_gpu_regression.py` (default-off ⇒ goldens bit-identical). Spec: `docs/specs/2026-06-14-V3.1-curl-flow-advection.md`. |
+| v1.27 | **`render.color_grade` display color grade documented (2026-06-14) — NOT a physics revision.** The warm-amber showcase look is a post-process grade in `renderer.tonemap`, **downstream of all physics**, NOT a Formula-9 chromaticity change. `tonemap` gained `saturation` (luma-based, `luma=Rec.709·img`, `img=luma+s·(img−luma)` clamped ≥0) and `tint` (per-channel linear gain), applied in linear HDR **before** the Reinhard compressor `img/(1+img)`. Config `render.color_grade.{saturation,tint}`; CLI `--saturation/--tint/--amber` in `scripts/showcase_disk.py` (`--amber` ⇒ `saturation=1.6, tint=[1.18,1.0,0.74]`). Same VISUALIZATION governance class as `disk.doppler_strength` (v1.12) — touches no `T`/`g`/`g⁴`/`f_PT`/chroma-form. **Identity defaults (`saturation=1.0`, `tint=[1,1,1]`) are bit-identical** to the ungraded path (`np.array_equal` verified; both the `saturation!=1.0` and `tint!=(1,1,1)` branches skipped). Rationale captured in the Formula-9 dial note: `blackbody_rgb` trends sepia/white by design (blue channel never drops far enough for saturated amber) and must NOT be recalibrated to chase the look — tune the grade instead. No GR formula, kernel, or golden frame touched (display-space only). |
+| v1.26 | **Formula CKS-18 ADDED — curl-flow domain warp, owner-approved 2026-06-14, V epoch V3.0. NOT a physics revision — VISUALIZATION, same governance class as CKS-12 §2/§3.** Adds divergence-free turbulent structure to the disk noise by warping the **sample coordinate** with the in-plane curl of a scalar potential `ψ = sfbm3(cosφ·ρ_c, sinφ·ρ_c, u·k_u)` built on the V1.5 isotropic simplex basis: `δu=+∂ψ/∂φ`, `δφ=−∂ψ/∂u` (central FD, simplex has no analytic gradient here), `u'=u+A·δu`, `φ'=φ+A·δφ`. **Divergence-free by construction** (curl of a scalar ⇒ incompressible look); **seamless across φ=0** because `δu`/`δφ` are built on `cos φ`/`sin φ` (CKS-12 constraint 5 preserved even though classic simplex is not lattice-periodic — seamlessness from the cylinder *embedding*, not a lattice period, so `ρ_c`/`k_u` may be any real). Owner decisions: stage V3 as **static warp (V3.0) → curl-flow advection (V3.1)** (the D2.2→D2.3 split); V3.0 displacement is **in-plane `(u,φ)`** only (ζ untouched). Integration: warp applied at the entry of `_disk_noise_m` / `_mod_fbm4` on the already-sheared per-phase `φ′_k` (material-frame — eddies freeze into the gas and §2 winds them into filaments; density + modulation share one warp), using a **fixed `curl_seed`** (not the per-cycle reseed) so V3.0 is genuinely static — only the §2 winding animates. Texturing only — never touches `p_μ`/`u^μ`/`g`/`g⁴`/`f_PT`/chroma-form (a real continuity-equation fluid solve would STOP for skill extension). New code: `noise.py` `curl_warp`/`curl_warp_ti`; `taichi_renderer.py` warp at `_disk_noise_m`/`_mod_fbm4` entry + `disk.noise.curl` dials through `_setup_disk_noise` (buffer grows past `_NOISE_N=43`); **no CKS-13 resolver change** (all base look dials). Gated by `disk.noise.curl.enabled` (default `false`, `amp=0` ⇒ identity) ⇒ bit-identical to V2. Guards: `tests/test_noise.py` (divergence-free, seamlessness, determinism) + `tests/test_noise_gpu.py` (`curl_warp_ti` CPU↔GPU twin parity to a derived `amp·_SATOL/fd_eps` bound — the warp is a derivative so the ~1e-5 `sfbm3` twin gap is amplified ×1/(2ε), obs ~6.5e-5) + `tests/test_disk_noise.py` (default-off wiring, curl-on finite) + unchanged `test_gpu_regression.py`. **GPU-verified 2026-06-14:** noise_gpu 15, disk_noise + gpu_regression pass, noise 44 (CPU). Spec: `docs/specs/2026-06-14-V3-curl-domain-warp.md`. |
+| v1.25 | **Formula CKS-17 ADDED + WIRED — 3D inner-edge-ray self-shadow (radial + vertical), owner-approved 2026-06-14, V epoch vertical-self-shadow. NOT a physics revision — VISUALIZATION, same governance class as CKS-15.** Generalises the CKS-15 radial column scan to a 3D shadow ray from the inner edge **in the midplane** `(u=0, ζ=0)` to the sample `(u_s, φ, ζ_s)` at fixed φ, so an off-midplane parcel is shadowed by the dense midplane gas between it and the hot inner edge (the vertical self-shadow that V2's 3D bulk makes physical). Ray: `ζ(u)=(u/u_s)·ζ_s`, `Z(u)=r·ζ(u)·σ_θ(r)` (CKS-16 flared σ); bake accumulates `Σ_{j<i_u} absb_c·ρ_j·ds_j` with the **tilted** sample `ρ_j=ρ(u_j,φ,ζ_j)` and 3D arc length `ds_j=√((r_j·du)²+ΔZ_j²)`. **Exact CKS-15 reduction at ζ=0** (`ΔZ≡0 ⇒ ds=r·du`, `ρ` at the midplane) — the radial element keeps the `dr=r·du` convention precisely so the midplane limit is bit-exact; CKS-15 is the `ζ→0` limit, not a separate path. **Lookup + application UNCHANGED** (same `disk_shadow_tau` field, same `_sample_shadow_tau` trilinear lookup, same `emission *= exp(−strength·τ_s)` on emissivity only — κ/dτ untouched, composes with CKS-14). Only `bake_disk_shadow`'s ray geometry changed; same kernel signature, **no new config / field / flag** — still `disk.volumetric.self_shadow.enabled` (default `false` ⇒ no bake, golden frames bit-identical). Cost: `O(NU²·NPHI·NZ)` (each ζ_s tilts its own ray ⇒ no prefix sum), ~NU/2× the CKS-15 evals, parallelised over cells (owner chose the 3D ray knowing it is heavier). Straight CKS ray / single inner-edge illuminator / single-scatter / amplitude-only — never p_μ/u^μ/g/g⁴/f_PT/chroma-form; a physical transport (geodesic rays, multi-scatter) still STOPs for skill extension. Guards: `tests/test_disk_self_shadow.py` — flag-off bit-identity / outward-steepening dimming / noise-on contrast-rise carry over unchanged; `test_bake_matches_analytic_gaussian_column` re-derived to the 3D-ray line integral (the constant-ζ radial closed form was the CKS-15 model, superseded off-midplane); `test_gpu_regression.py` unchanged. Spec: `docs/specs/2026-06-14-V2-vertical-self-shadow.md`. |
+| v1.24 | **Formula CKS-16 ADDED + WIRED — flared 3D disk scale height (owner-approved 2026-06-14, V epoch V2). NOT a physics revision — GEOMETRY/TEXTURE, flagged like CKS-12 §3.** The constant angular scale height becomes radius-flared `σ_θ(r) = σ0·(r/r_inner)^β` (`σ0 ≡ theta_half_width·vertical_sigma_frac`, the r_inner width): `β=0` ⇒ today's constant-H/r slab bit-for-bit (the kernel skips `ti.pow` at `flare_beta==0`), `β>0` thickens the disk OUTWARD (H/r grows with radius); the §3 `(1+h_amp·(n_h−½))` lumpy term multiplies on top, order preserved. Genuine 3D for free: the `ridged3`/`fbm3` stack already consumes `ζ=dz_ang/σ_eff`, so a real radius-varying thickness un-squashes it — no new noise primitive (V1.5 simplex stays unwired). Single source of truth: the flare lives in the shared `@ti.func _disk_density_cks` (gained `flare_beta`, `r_inner`), so the emission march AND the CKS-15 shadow bake inherit it. Two knock-on fixes: (A) the CKS-13 resolver derives a SEPARATE `theta_half_bound ≥ band_sigma·σ_θ(r_outer)` (default `band_sigma=3.0`) as the photon trace band so the flared outer envelope is not hard-clipped, leaving `theta_half_width` as the un-mutated σ0 anchor (⇒ idempotent); (B) the Pipe-B vertical step cap is unchanged — flare only thickens outward so the thinnest slab is still the inner edge σ0 (`sigma_z=r·σ0`), verified (not assumed) by the flared-slab convergence test. Resolver also adds `flare_beta` and rejects `β<0` / `band_sigma≤0`. Gated by `disk.volumetric.flare.enabled` (default `false` ⇒ `theta_half_bound==theta_half_width`, `flare_beta==0`, golden frames bit-identical); `enabled:true,β=0` is also bit-identical. Amplitude/geometry-only — no p_μ/u^μ/g/g⁴/f_PT/chroma-form touched. New code: `kerr_params.resolve_config` CKS-16 block; `taichi_renderer.py` (`_disk_density_cks`/`_disk_emit_cks`/`bake_disk_shadow`/`render_beauty_physics`/`render_beauty_frame` signatures); `scripts/thumb.py` CPU twin. Guards: `tests/test_disk_flare.py` (7 resolver/CPU + 2 GPU) + unchanged `test_gpu_regression.py` / `test_disk_step_convergence.py`. Spec: `docs/specs/2026-06-14-V2-flared-3d-density.md`. |
+| v1.19 | **`disk.noise.dynamism` visualization dial ADDED (2026-06-13) — NOT a physics revision.** A non-physical gain on the CKS-12 §2 shear amount: `φ′_k = φ − dynamism·Ω(r)·(a_k·T)` in BOTH twins (`noise.noise_density_mult` reads `nz["dynamism"]`; GPU `_disk_noise_density_mult` reads param slot `_NI_DYNAMISM=31`, buffer grew 31→32). Motivation: in the first reset cycle the visible winding reduces to `Ω·t_disk` (T cancels), so per-frame swirl was only tunable via the *physical* `inner_lap_seconds` (which also speeds reseeding) — this dial emphasises the differential winding for a given frame without touching the reset cadence or C0-continuity (`w_k=0` at each reset regardless of gain). `dynamism=1.0` (and an omitted key) is **bit-identical** to v1.18 — guarded by `tests/test_noise.py::test_dynamism_unit_gain_is_bit_identical` + the unchanged advected agreement test; effect + GPU↔CPU agreement at gain≠1 by `test_dynamism_gain_emphasises_winding` (CPU) and `test_disk_noise.py::test_dynamism_gain_matches_cpu_and_changes_shear` (CUDA). Amplitude/φ-only, no GR/g/g⁴ touched. Same dial spirit as `disk.doppler_strength` (v1.12). |
 | v1.1 | **F6:** Corrected Carter constant to null geodesic form (−a²E², not a²(1−E²)). **F7:** Corrected lapse α to exact form using A = (r²+a²)²−a²Δsin²θ. **F9:** Documented that blackbody_rgb returns chromaticity only; clarified g⁴ is not double-counted, but will be if a physical Planck spectrum is substituted. |
 | v1.2 | **F6:** Removed the leftover massive-particle `μ²r²` term from the radial potential `R(r)`; the null (μ=0) form drops it. The previous form gave `g^{μν}p_μp_ν = −r²/Σ`, breaking the null-condition conservation test. |
 | v1.3 | **F10:** Added 2π normalization to the LOD formula — φ spans 2π radians across the 16384-texel starmap width, so dividing by 2π correctly maps the angular footprint to a texel footprint. Also switched to raw per-pixel exit deltas (δθ, δφ) rather than dividing by δu=1/WIDTH. The missing factor caused LOD to saturate at max mip for all background pixels, collapsing the LOD-on render to near-black. |
@@ -974,6 +2116,20 @@ configs/render.yaml              ← a, r_isco, WIDTH, HEIGHT, step counts, star
 | v1.6 | **F13 guards APPROVED (owner, 2026-06-05)** and the DNGR render path landed (PROJECT.md §8 Phases 2–5): (a) μ normalized by the FD undeflected-reference footprint so μ→1 in flat space; (b) boundary clamp μ=1 on non-ESCAPED neighbours / `J>j_fold`, plus `δ⁻<caustic_delta_min ⇒ μ=min(μ,mag_clip)`; (c) volumetric g⁴ as a `starfield.g_beaming` hook (default g≡1). Two decoupled sky layers in `taichi_renderer.py`: Layer A point-star energy gather (`flux·μ·g⁴·PSF`, cell-grid candidate query) and Layer B anisotropic-EWA diffuse Milky-Way fetch; gated by `starfield.mode: texture\|dngr` (texture default reproduces v1.4 golden frames bit-for-bit). |
 | v1.8 | **PART II — Cartesian Kerr-Schild (CKS) ADDED + APPROVED (owner, 2026-06-06):** the renderer geodesic path migrates BL → CKS to remove the spin-axis (1/sin²θ) and horizon (Δ→0) *coordinate* singularities at the source (the root cause of the user-reported gray polar line and the whole seam-band-aid lineage). New Formulas CKS-1…CKS-10: implicit radius `r(x,y,z)`; metric `g=η+f l⊗l`; **exact** inverse `g=η−f l⊗l` (l is η-null); analytic ∂r/∂f/∂l; Hamiltonian geodesic EOM (`dx=g·p`, `dp=−½∂g·pp`); ZAMO-from-`g^{αβ}` + projected-ray photon init (preserves Decision A); equatorial disk gas velocity `u^x=−Ωy u^t, u^y=Ωx u^t` (no BL→KS Jacobian); CKS g-factor (Δ-bug impossible); seam-free escaped-ray celestial direction. BL Formulas 1/6/7/11/12 marked SUPERSEDED-for-renderer; 2/3/4/8/9/10/13 reused. Verified against GRay2 (arXiv:1706.07062), SpECTRE, Visser (arXiv:0706.0622). |
 | v1.7 | **F13 guard (b′) ADDED + APPROVED (owner, 2026-06-06):** Layer-A splat *placement* rule when `det J` is invalid (spin-axis seam / non-ESCAPED neighbour). The shipped code positioned the splat with the degenerate `J⁻¹`, collapsing all polar-cell stars onto the meridian (the "Artifact B" seam pileup, ≈15× the off-seam jump). (b′) places the splat by the star's true proper angular separation `d² = (Δθ′²+sin²θ′·Δφ′²)/dΩ` under the undeflected footprint `dΩ=|det J₀·sinθ′₀|` (the guard-(a) quantity), so seam stars keep real angular spacing at μ=1. Resolves the dngr-default seam (`test_no_spin_axis_seam`, `test_background_has_no_vertical_seam_stripe`). The matching Formula-10 `texture`-LOD regularization is a separate follow-up (spec §7.2), **not** part of this revision. |
+| v1.9 | **Decision B — physical disk upgrade DRAFTED (PROVISIONAL, owner review pending, 2026-06-11):** added a flagged spec for moving off the simple `(6/r)^0.75` law to the NT/Page-Thorne flux. Piece 1 (NT correction functions B/C/D/F/G) and Piece 3 (physical Planck `B_ν(T_eff)` + the g⁴-not-g⁸ bookkeeping vs Formula 9) are standard/safe; **Piece 2 — the time-averaged flux `F(r)` and `Q(r)` integral — is ⛔ BLOCKED on source verification** (local Page-Thorne `1974ApJ...191.md` is image-dropped, 59 formula-not-decoded; NT `II-48.md` is OCR-garbled), so it is transcribed from SYNTHESIS §4 only and **must not be implemented until confirmed against a clean Page-Thorne 1974 source + owner sign-off** (recalled-formula caution, cf. the GRay coefficient correction same day). No code path changed; ACTIVE disk remains Decision-B-simple. |
+| v1.10 | **Decision B Piece 2 — Page-Thorne flux VERIFIED & UNBLOCKED (2026-06-12).** Owner supplied a clean equation-intact source (`paper/1104.5499v3.md`, Page-Thorne 1974 via Abramowicz-Fragile 2013). The ⛔ PROVISIONAL `Q/(B C^{1/2} D^{1/2})` transcription was **discarded** (different, unverified parametrization) and replaced by the canonical closed-form **Formula CKS-11**: cubic roots `y₁,y₂,y₃` of `y³−3y+2a=0`, correction functions B/C, and the three-log `bracket(y)`. **Verified numerically:** the closed form reproduces the §1 conservation-law flux integral (using Formula 3/4 Ẽ,L̃,Ω) to 5 sig figs over r∈[1.5,28] M at a=0.999, differing only by the overall `3/2·√−g` constant the closed form drops; roots satisfy the cubic to machine precision; zero-torque BC `F(r_ms)=0` holds. Regression guard added: `tests/test_disk_flux.py`. D function not needed (folded into the closed form). Owner-approved to implement behind a config flag; **ACTIVE disk still Decision-B-simple — kernel not yet wired.** |
+| v1.11 | **Decision B Piece 2 — Page-Thorne flux WIRED (2026-06-12, D1).** The verified CKS-11 closed form is now live behind the runtime flag `disk.temperature_model` (default `simple`, so golden frames / the pinned GPU regression are unchanged). Path: `src/renderer/disk_flux.py` precomputes the normalized dimensionless shape `f_PT(r)=F/F_max` as a 1-D CPU LUT over `[r_isco, r_outer]` (`flux_lut_samples`, default 256; `lut[0]=0` zero-torque BC); `taichi_renderer._setup_disk_flux` always builds+uploads it (tiny → flag toggles per-render with no re-JIT); the disk kernel linear-interpolates it and sets `T_eff=T₀·f_PT^{1/4}` with emission amplitude ×`f_PT`. **g-bookkeeping preserved:** the explicit `g⁴` is kept and NOT doubled (`_blackbody_rgb` is chromaticity-only — the g⁸ error Formula 9 / CKS-11 Piece 3 warns about is avoided in both branches). Guards: `tests/test_disk_flux.py` (module vs pinned transcription + LUT properties) and a gpu-marked `tests/test_gpu_regression.py` page_thorne render check. `T₀` stays the amplitude knob. |
+| v1.12 | **`disk.doppler_strength` visualization dial documented (2026-06-12) — NOT a physics revision.** The kernel applies `g_eff = g^s` to the CKS-9 g-factor before Formula 9 (`s=1` default = formulas verbatim, branch skipped, bit-identical — verified Doppler 4.317×/peak 6.1665 vs goldens 4.32×/6.1667; `s=0` ⇒ shift fully off, the Interstellar/DNGR artistic treatment). Single application feeding both g⁴ and the chromaticity — the g⁴-not-g⁸ rule is unaffected. Scales the TOTAL g; an orbital-vs-gravitational split would require a new verified static-observer redshift formula first. GPU guard: `test_doppler_strength_zero_symmetrizes_disk` (s=0 ⇒ disk-only L/R ratio < 1.5). See the dial note under Formula CKS-9. |
+| v1.13 | **Formula CKS-12 ADDED — disk procedural turbulence (owner-approved 2026-06-13; NOT YET WIRED, backlog D2).** Visualization math for the layered-noise disk: disk-natural noise coordinates `(u=ln r/r_inner, φ=atan2(y,x), ζ=Δθ/σ_θ)` with the proof that this φ is advected at exactly Ω by the CKS-8 gas field (and is a static `arctan(a/r)` twist away from the KS azimuth — do not "fix"); Keplerian shear advection `φ′ = φ − Ω(r)·t_disk` (Ω = Formula 3 verbatim) with dual-phase triangle-weight reset blending, mandatory per-cycle reseed, optional variance-preserving normalization; and the modulation bookkeeping (noise multiplies density/T_emit/edge/height **amplitudes only** — never p_μ, u^μ, g, g⁴, chroma form, or f_PT; T-modulation pre-g so g⁴-not-g⁸ holds; `r_in_eff ≥ r_isco`; step-cap uses worst-case σ_z; integer φ-periodicity; `enabled:false` bit-identical; deterministic hash, no `ti.random`). Noise primitives (fBm/ridged/Voronoi) are texturing, not physics — specified in `docs/specs/2026-06-13-disk-noise-turbulence.md` with `src/renderer/noise.py` (planned) as the CPU source of truth. |
+| v1.15 | **CKS-12 D2.1 noise primitive library SHIPPED (2026-06-13; still NOT wired into the renderer — backlog D2.2+).** Doc-only change to the CKS-12 status block + file-locations: `src/renderer/noise.py` now exists as the CPU NumPy source of truth for the §3 primitives (PCG-hash, Perlin gradient noise, fBm, billow/turbulence, Musgrave ridged-MF, Worley F1/F2, voronoi-billow, cell-wall) plus their `@ti.func` twins (same file, `_ti` suffix). Held to the reference by `tests/test_noise.py` (16 CPU tests) + `tests/test_noise_gpu.py` (10 CUDA agreement tests, ~1e-6) — pins the CKS-12 hard constraints (integer φ-periodicity ⇒ no φ=0 seam, deterministic integer hashing / no `ti.random`, f32-exact CPU↔GPU). No GR formula touched; no renderer/golden-frame impact (module is standalone until D2.2). |
+| v1.18 | **CKS-12 D2.3 — Keplerian shear advection WIRED (2026-06-13). NOT a physics revision.** The §2 dual-phase reset blend now advects the density-modulation field: `noise.noise_density_mult` gained `(t_disk, omega, shear_period)` and wraps the log-density `m`-stack twice — `φ′_k = φ − Ω(r)·(a_k·T)`, triangle weights `w_k=1−|2a_k−1|`, per-cycle integer reseed `seed + k·NCYC_PHASE + c_k·NCYC_CYCLE`, optional `variance_preserve` ÷√(Σw²). GPU twin `taichi_renderer._disk_noise_density_mult` wraps `_disk_noise_m` identically (held to CPU by `tests/test_disk_noise.py::test_advected_stack_matches_cpu_reference`, rtol 1e-3). `Ω` is **Formula 3 verbatim** (`1/(r^{3/2}+a)`), computed per disk sample in `_disk_emit_cks`; `t_disk = frame/fps·time_scale` threaded through `render_beauty_frame{,_mb}`, `export_exr.py`, and `thumb.py --frame/--t-disk`. **`shear_period ≤ 0` (no `disk.dynamics`) ⇒ the static D2.2 path, bit-identical** — so existing goldens and the GPU stack-agreement test are untouched (each phase's `w_k=0` exactly at its own reset ⇒ C0-continuous reseed). New CPU tests: `tests/test_noise.py §2` (5: static-fallback, evolution, determinism, reset-continuity, variance-preserve). Amplitude-only (density), so no GR/g/g⁴ touched. D2.4 (T/edge/height modulation) still pending. |
+| v1.17 | **CKS-12 D2.2 — static density modulation WIRED (2026-06-13). NOT a physics revision.** The §3 layer stack now multiplies the disk Gaussian density in the GPU beauty path: `noise.noise_density_mult` (CPU source of truth, combined L0/L1/L2) + its GPU twin `taichi_renderer._disk_noise_density_mult` (held to the CPU by `tests/test_disk_noise.py`), fed by the `disk.noise` config block via the `_setup_disk_noise` param buffer (look-dev re-tunes by re-upload, no re-JIT). `thumb.py` uses the same CPU reference for look-dev. **Static only** (`t_disk = 0`, density only — no §2 shear advection, no T/edge/height; those are D2.3+). `disk.noise.enabled: false` verified bit-identical (constraint 6): the re-anchored GPU regression (v1.16) still passes unchanged with the noise code present. Amplitude-only, so no GR formula, g-factor, or g⁴ bookkeeping is touched. |
+| v1.20 | **CKS-12 D2.4 — §3 temperature / inner+outer edge / scale-height modulation WIRED + noise enabled globally (2026-06-13). NOT a physics revision.** The disk emission amplitudes are now modulated by four advected [0,1] fBm envelopes (`n_T, n_e_in, n_e_out, n_h`), co-moving via the SAME §2 dual-phase reset blend + `dynamism` gain as the density field: CPU source of truth `noise.noise_modulation_fields` + GPU twin `taichi_renderer._disk_noise_mod_fields` (vec4; held to CPU by `tests/test_disk_noise.py::test_mod_fields_match_cpu_reference`, rtol 1e-3). Applied per the CKS-12 §3 constraints: `T_emit ← T_emit·(1+τ_amp·(n_T−½))` **before** the CKS-9 g-shift (constraint 2 — preserves g⁴-not-g⁸); `r_in_eff = max(r_inner·(1+e_in·(n_e_in−½)), r_isco)` (constraint 3, zero-torque BC floor); `r_out_eff = r_outer·(1+e_out·(n_e_out−½))`; hard radial cutoffs replaced by `_smoothstep_ti` edge windows; `σ_θ ← σ_θ·(1+h_amp·(n_h−½))` lumpy scale height, with the Pipe-B vertical step cap sized on the **worst-case** `σ_z·(1−h_amp/2)` (constraint 4) — guarded against returning face-on moiré by `tests/test_disk_step_convergence.py::test_disk_emission_resolves_lumpy_slab` (≤0.06 rel divergence). To avoid a σ→σ circular dependency the noise/mod fields sample at the UNMODULATED σ, then the Gaussian is re-evaluated at σ_m. The four envelopes are single fBm in [0,1] decorrelated by distinct seed offsets (`NSEED_MOD_T/EIN/EOUT/H = 503/601/701/809`) and carry **NO** variance-preserve divide (convex triangle weights `w_0+w_1≡1` keep a [0,1] fBm in range). `_setup_disk_noise` param buffer grew 32→43 (`_NI_MOD_*` slots 32-42); `_disk_emit_cks` + `render_beauty_physics` gained an `r_isco` arg (CKS-13-derived) and the trace band widened to `[r_isco, r_outer·(1+½·e_out)+soft]` when modulation is on. **Applied globally:** shipped `configs/render.yaml` now has `disk.noise.enabled: true` + `disk.noise.modulation.enabled: true`; because that would shift the pinned goldens, the GR/calibration guards (`test_gpu_regression.py`, the base smooth-slab `test_disk_step_convergence`) force `disk.noise.enabled=False` so they stay pure physics guards (noise is art, not the GR check). `enabled:false` / `modulation.enabled:false` remain bit-identical to the D2.3 density-only path (constraint 6). New CPU tests `tests/test_noise.py §3` (disabled-is-½, unit-range, decorrelation, advect+determinism). Amplitude-only — no p_μ/u^μ/g/g⁴/chroma-form/f_PT touched; the only physics input is Ω (Formula 3 verbatim). Completes the D2 turbulence backlog. |
+| v1.16 | **GPU regression goldens RE-ANCHORED + made dynamic in `doppler_strength` (2026-06-13) — NOT a physics revision.** `tests/test_gpu_regression.py`: the Doppler / disk-peak guards no longer pin a single s=1.0 band (silently invalidated by the v1.14 CKS-13 peak-temperature re-keying — see that row's correction). They now render frame 0 at forced s ∈ {0, 0.5, 1.0} (simple model, disk-only `disk_buf` metrics) and assert the g_eff=g^s beaming RESPONSE: near-symmetric at s=0 (< 1.5), monotone non-decreasing in s, and matching the re-measured s=1.0 goldens (Doppler 5.15× ±10%, disk peak 14.45 ±8%). `test_page_thorne_disk_model_renders` forces s=1.0 so the YAML's s=0.1 can't suppress the > 2× beaming check. No GR formula, kernel, or config touched — test-only re-anchor against the existing render. |
+| v1.14 | **Formula CKS-13 ADDED + WIRED — derived-parameter config resolver (owner-approved 2026-06-13).** `src/renderer/kerr_params.resolve_config` (called by every config loader: `taichi_renderer.load_config`, `scripts/thumb.py`) derives all spin/extent-dependent parameters at load: `r_plus` (CKS-6), `r_isco` (Formula 2), `disk.r_inner` (`auto` → r_isco; numeric override clamped ≥ r_isco), `disk.T_0` from the new base `disk.target_peak_temperature` (page_thorne: T_0=T_peak, LUT max-normalized; simple: T_0=T_peak·(r_inner/6)^¾), and the `disk.dynamics` time mapping (`T_orb=2π(r^{3/2}+a)` Formula-3 inverse; `t_wrap=2π/ΔΩ`; `time_scale=T_orb(r_in)/inner_lap_seconds`; `shear_period_M=budget·t_wrap` — the CKS-12 §2 reset period). No new physics: every line is a pinned formula or its trivial inverse. The YAML `r_isco`/`r_plus`/`r_inner`/`T_0` literals were REMOVED (the desync failure mode is gone); literature anchors (a=0→6/2, a=1→1/1, a=0.999→1.182/1.0447) pinned in `tests/test_kerr_params.py` instead of an external LUT — BPT closed forms are exact, only CKS-11 f_PT needs tabulation. Render-path impact: r_inner 1.182→1.181765 (exact ISCO). ⚠️ **CORRECTION (2026-06-13):** the original claim here — "GPU regression metrics bit-identical except Doppler ratio Δ5e-6" — was **wrong**. Re-keying `T_0: 5500` (old simple-model *inner-reference* temperature, peak T_eff ≈ 18,600 K) to `target_peak_temperature: 5500` (peak T_eff = **5500 K**) shifted the blackbody chroma magnitude and therefore the disk emission peak (6.17→14.45) and the chroma-weighted half-frame Doppler ratio (4.32→5.15) at simple/s=1.0. This is an intended warm-peak look change, not a physics-formula error, but the `test_gpu_regression.py` goldens were never re-pinned — which is why the disk-peak / Doppler-band guards failed until v1.16. |
+| v1.22 | **Formula CKS-15 ADDED + WIRED — radial deep-shadow-map self-shadow (owner-approved 2026-06-13, V epoch V1.2). NOT a physics revision — VISUALIZATION, flagged like `doppler_strength`.** A per-frame baked 3-D cumulative absorption optical depth `τ_shadow[NU,NPHI,NZ]` on the CKS-12 noise coords `(u=ln r/r_inner, φ, ζ=Δθ/σ_θ)`: each `(φ,ζ)` column integrates `Σ absb_c·ρ·(r·du)` OUTWARD from `r_inner` (`dr=r·du`), `ρ` the SHARED `_disk_density_cks` (so shadow ρ ≡ emission ρ, incl. §2 shear + §3 modulation at `t_disk`), each cell storing τ from STRICTLY-inner gas (no self-shadow within a cell), clamped to `max_tau`. Per primary sample the trilinear (φ-periodic) lookup dims the EMISSIVITY only: `emission *= exp(−strength·τ_s)` — `κ`/`dτ` untouched (gas still occludes); composes with CKS-14 so `S=emission/dτ` inherits `e^{−τ_s}` ⇒ shadowed thick parcels read DARK (the voids). **The glowing-gas-with-voids look needs CKS-14 + CKS-15 together.** Straight radial CKS shadow ray (not a geodesic), single inward illuminator, single-scatter — occlusion bookkeeping, not a transport solve; multiplies amplitude only (never p_μ/u^μ/g/g⁴/f_PT/chroma-form — CKS-12 constraint 1). Gated by `disk.volumetric.self_shadow.enabled` (default `false` ⇒ no bake, no lookup, golden frames bit-identical). New code in `taichi_renderer.py`: `disk_shadow_tau` field + `_setup_disk_shadow` (always allocates from the grid config; bakes `u_max=ln(r_outer/r_inner)`, `ζ_max` into module globals so the lookup needs no extra kernel args), `@ti.kernel bake_disk_shadow`, `@ti.func _sample_shadow_tau`, `self_shadow`/`shadow_strength` kernel args threaded through `render_beauty_physics` + `render_beauty_frame`. Guards: `tests/test_disk_self_shadow.py` (flag-off bit-identity; GPU bake vs the analytic Gaussian column ρ=exp(−½ζ²) at rtol 2e-4; outward-steepening dimming; noise-on disk-contrast rise) + unchanged `test_gpu_regression.py`. Spec: `docs/specs/2026-06-13-V1-self-shadow-source-function.md`. Completes the V1 self-shadow + source-function pair (V1.3 showcase flags / V1.4 PROJECT+golden / V1.5 Simplex follow). |
+| v1.23 | **CKS-12 §3.6 isotropic simplex basis SHIPPED (2026-06-14, V epoch V1.5; NOT wired into the renderer — library addition only). NOT a physics revision — texturing, not GR.** `src/renderer/noise.py` gained the Perlin/Gustavson skewed-simplex basis: `snoise2`/`snoise3` (CPU NumPy source of truth) + `sfbm2`/`sfbm3` (reusing the shared `_octaves` machinery) + their `@ti.func` twins (`snoise2_ti`/`snoise3_ti`/`sfbm2_ti`/`sfbm3_ti`), reusing this file's PCG corner hash and the Perlin-2002 12-gradient `_grad3` (which already returns grad·d); the radial kernel is `(r₀²−|d|²)₊⁴·grad·d` (r₀²=0.5/0.6, 70/32 normalizers), float32, no transcendentals on the lattice path. **Motivation:** the square-lattice `gnoise*` basis leaks a faint axis-aligned grid bias (a 4-fold-symmetric power spectrum); the hexagonal simplex lattice does not — `tests/test_noise.py::test_simplex_more_isotropic_than_perlin` measures the m=4 angular anisotropy and finds simplex ~12× smaller (Perlin ≈0.52, simplex ≈0.04). **Scope (volumetric spec §1a / V3 step 7, decision D-V4 → "add Simplex"):** this is the basis for the V3 **curl-flow potential**, NOT a drop-in for the φ-periodic disk density stack — classic simplex is **not** lattice-periodic (the input skew couples the axes ⇒ a 2π φ-period is not a lattice period; CKS-12 constraint 5), so it carries no φ-periodicity guard and is not wired into any render path. **Every golden frame is therefore bit-identical** (pure library addition, exactly as the D2.1 primitives preceded D2.2). Tests: `tests/test_noise.py` (8 CPU: range, determinism, seed-sensitivity, fBm-single-octave≡base, C2-continuity, the isotropy guard) + `tests/test_noise_gpu.py` (4 CUDA twin-parity/determinism, atol 1e-5). No GR formula, g-factor, or g⁴ bookkeeping touched. |
+| v1.21 | **Formula CKS-14 ADDED + WIRED — volumetric RTE source-function march (owner-approved 2026-06-13, V epoch V1.1). NOT a physics revision — no new GR.** The Pipe-B disk march can now integrate `dI=(S−I)dτ` with the source function `S = j/κ = emission/dτ = (emis_c/absb_c)·[f_PT]·g_eff⁴·chroma` reconstructed from the values `_disk_emit_cks` already returns (ρ and ds cancel exactly). Update: `w=1−e^{−dτ}; disk_col += transm·w·S; transm *= e^{−dτ}`. Reduces to the legacy `disk_col += transm·emission` (Formula 9) in the optically-thin limit (`w→dτ`, differs only at O(dτ²)). **Same continuum integral as legacy** (`∫S e^{−τ}dτ`); CKS-14 is its exact per-step quadrature, so in the thick regime it is *dimmer & more accurate* (legacy left-endpoint rectangle over-counts opaque steps by `dτ/(1−e^{−dτ})`) — NOT a brightness boost. Standalone value: removes that over-count and **materialises `S`** for CKS-15 self-shadow (`S·e^{−τ_shadow}`); the void look needs CKS-14+CKS-15 together. Gated by `disk.volumetric.source_function` (default `false` ⇒ legacy branch, golden frames bit-identical); falls back to the legacy term when `dτ ≤ _RTE_TAU_EPS≈1e-6` (divide guard, no discontinuity). **g-bookkeeping unchanged:** `S` carries `g_eff⁴·chroma` exactly once (no g⁸). March-loop reinterpretation in `render_beauty_physics` only — `_disk_emit_cks` untouched (still returns `vec4(emission, dτ)`); the V1.0 prerequisite extracted the density stack into the shared `@ti.func _disk_density_cks` (bit-identical, golden-guarded). Spec: `docs/specs/2026-06-13-V1-self-shadow-source-function.md`. CKS-15 (radial deep-shadow self-shadow) is the V1.2 follow-up. |
 
 *Last verified: 2026-06-06 (F13 guard (b′) Layer-A splat-placement rule approved +
 landed; (b′) is a placement regularization derived from the already-verified guard-(a)
