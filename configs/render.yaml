@@ -321,7 +321,7 @@ starfield:
                            # so the catalog now extends to ~11 to repopulate the faint field as sharp,
                            # correctly-lensed point sources (Interstellar/DNGR approach). Re-run
                            # scripts/ingest_stars.py after changing this (mag_limit is applied at ingest).
-  mag_zero_point: 6      # linear flux = 10^(-0.4*(Vmag - mag_zero_point)); sets overall Layer-A
+  mag_zero_point: 4      # linear flux = 10^(-0.4*(Vmag - mag_zero_point)); sets overall Layer-A
                            # star brightness. APPLIED AT INGEST (baked into assets/stars.npy by
                            # scripts/ingest_stars.py) — the renderer never reads this, so you MUST
                            # re-run ingest_stars.py after changing it. 3.5 => ~25x flux vs the old
